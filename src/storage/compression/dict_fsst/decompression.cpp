@@ -1,9 +1,29 @@
 #include "duckdb/storage/compression/dict_fsst/decompression.hpp"
 #include "fsst.h"
 #include "duckdb/common/fsst.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 namespace duckdb {
 namespace dict_fsst {
+
+class MaterializedDictionaryEntry : public ObjectCacheEntry {
+public:
+	MaterializedDictionaryEntry(buffer_ptr<VectorChildBuffer> dictionary_p, idx_t bytes_p)
+	    : dictionary(std::move(dictionary_p)), bytes(bytes_p) {
+	}
+	static string ObjectType() {
+		return "dict_fsst_materialized_dictionary";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return bytes;
+	}
+
+	buffer_ptr<VectorChildBuffer> dictionary;
+	const idx_t bytes;
+};
 
 CompressedStringScanState::~CompressedStringScanState() {
 	delete reinterpret_cast<duckdb_fsst_decoder_t *>(decoder);
@@ -77,6 +97,16 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	dictionary_indices_ptr = data_ptr_cast(baseptr + dictionary_indices_dest);
 	string_lengths_ptr = data_ptr_cast(baseptr + string_lengths_dest);
 
+	const bool cache_dictionary = initialize_dictionary && mode == DictFSSTMode::DICT_FSST &&
+	                              segment.segment_type == ColumnSegmentType::PERSISTENT;
+	if (cache_dictionary) {
+		auto cached = segment.db.GetObjectCache().Get<MaterializedDictionaryEntry>(segment.GetDictionaryCacheKey());
+		if (cached) {
+			dictionary = cached->dictionary;
+			return;
+		}
+	}
+
 	switch (mode) {
 	case DictFSSTMode::FSST_ONLY:
 	case DictFSSTMode::DICT_FSST: {
@@ -111,6 +141,20 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 		auto string_len = string_lengths[i];
 		dict_child_data[i] = FetchStringFromDict(dict_data, offset, i);
 		offset += string_len;
+	}
+	if (cache_dictionary) {
+		// The string slots and arena are immutable after publication. GetCachedHashes
+		// synchronizes the only lazy shared metadata with cached_hashes_lock. Reserve
+		// its full potential hash allocation up front so cache weight cannot grow later.
+		const auto bytes = sizeof(MaterializedDictionaryEntry) + sizeof(VectorChildBuffer) +
+		                   sizeof(VectorStringBuffer) + dict_count * (sizeof(string_t) + sizeof(hash_t)) +
+		                   ValidityMask::ValidityMaskSize(dict_count) +
+		                   StringVector::GetStringBuffer(dict_data).GetStringAllocator().AllocationSize();
+		auto cached = segment.db.GetObjectCache().GetOrCreate<MaterializedDictionaryEntry>(
+		    segment.GetDictionaryCacheKey(), dictionary, bytes);
+		if (cached) {
+			dictionary = cached->dictionary;
+		}
 	}
 }
 
@@ -158,6 +202,8 @@ void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_of
 	const idx_t start_offset = mode == DictFSSTMode::FSST_ONLY ? start + 1 : 0;
 
 	if (dictionary) {
+		// Flat results can outlive this scan or cache entry (including eviction).
+		StringVector::AddHeapReference(result, dictionary->data);
 		// We have prepared the full dictionary, we can reference these strings directly
 		auto dictionary_values = FlatVector::GetData<string_t>(dictionary->data);
 		for (idx_t i = 0; i < scan_count; i++) {

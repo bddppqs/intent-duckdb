@@ -14,6 +14,9 @@
 #include "duckdb/planner/filter/bloom_filter.hpp"
 #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 
+#include "duckdb/common/types/uuid.hpp"
+#include "duckdb/storage/object_cache.hpp"
+
 #include <cstring>
 
 namespace duckdb {
@@ -66,6 +69,9 @@ ColumnSegment::ColumnSegment(DatabaseInstance &db, shared_ptr<BlockHandle> block
     : SegmentBase<ColumnSegment>(count), db(db), type(type), type_size(GetTypeIdSize(type.InternalType())),
       segment_type(segment_type), stats(std::move(statistics)), block(std::move(block_p)), function(function_p),
       block_id(block_id_p), offset(offset), segment_size(segment_size_p) {
+	if (function.get().type == CompressionType::COMPRESSION_DICT_FSST) {
+		dictionary_cache_key = "dict_fsst-" + UUID::ToString(UUID::GenerateRandomUUID());
+	}
 	if (function.get().init_segment) {
 		segment_state = function.get().init_segment(*this, block_id, segment_state_p.get());
 	}
@@ -79,11 +85,23 @@ ColumnSegment::ColumnSegment(ColumnSegment &other)
       type_size(other.type_size), segment_type(other.segment_type), stats(std::move(other.stats)),
       block(std::move(other.block)), function(other.function), block_id(other.block_id), offset(other.offset),
       segment_size(other.segment_size), segment_state(std::move(other.segment_state)) {
+	dictionary_cache_key = std::move(other.dictionary_cache_key);
+	other.dictionary_cache_key.clear();
 	// For constant segments (CompressionType::COMPRESSION_CONSTANT) the block is a nullptr.
 	D_ASSERT(!block || segment_size <= GetBlockSize());
 }
 
 ColumnSegment::~ColumnSegment() {
+	if (!dictionary_cache_key.empty()) {
+		db.GetObjectCache().Delete(dictionary_cache_key);
+	}
+}
+
+void ColumnSegment::InvalidateDictionaryCache() {
+	if (!dictionary_cache_key.empty()) {
+		db.GetObjectCache().Delete(dictionary_cache_key);
+		dictionary_cache_key = "dict_fsst-" + UUID::ToString(UUID::GenerateRandomUUID());
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -219,6 +237,7 @@ void ColumnSegment::RevertAppend(idx_t new_count) {
 void ColumnSegment::ConvertToPersistent(QueryContext context, optional_ptr<BlockManager> block_manager,
                                         const block_id_t block_id_p) {
 	D_ASSERT(segment_type == ColumnSegmentType::TRANSIENT);
+	InvalidateDictionaryCache();
 	segment_type = ColumnSegmentType::PERSISTENT;
 	block_id = block_id_p;
 	offset = 0;
@@ -248,6 +267,7 @@ void ColumnSegment::MarkAsPersistent(shared_ptr<BlockHandle> block_p, uint32_t o
 }
 
 void ColumnSegment::SetBlock(shared_ptr<BlockHandle> block_p, uint32_t offset_p) {
+	InvalidateDictionaryCache();
 	segment_type = ColumnSegmentType::PERSISTENT;
 	offset = offset_p;
 	block = std::move(block_p);

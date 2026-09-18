@@ -126,7 +126,14 @@ public:
 
 	void VisitBlockIds(BlockIdVisitor &visitor) const;
 
+	//! Unique identity of this DICT_FSST segment binding, never a reusable address/block id.
+	const string &GetDictionaryCacheKey() const {
+		return dictionary_cache_key;
+	}
+
 private:
+	void InvalidateDictionaryCache();
+	string dictionary_cache_key;
 	void Scan(ColumnScanState &state, idx_t scan_count, Vector &result);
 	void ScanPartial(ColumnScanState &state, idx_t scan_count, Vector &result, idx_t result_offset);
 
