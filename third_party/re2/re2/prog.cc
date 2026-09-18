@@ -18,6 +18,9 @@
 #include <algorithm>
 #include <memory>
 #include <utility>
+#if defined(RE2_CLAB_STATS)
+#include <stdio.h>
+#endif
 
 #include "util/util.h"
 #include "util/logging.h"
@@ -649,6 +652,86 @@ void Prog::Flatten() {
   // for tracking pairs of possibilities that it has already explored.
   const size_t kBitStateBitmapMaxSize = 256*1024;  // max size in bits
   bit_state_text_max_size_ = kBitStateBitmapMaxSize / list_count_ - 1;
+  BuildCharClassRuns();
+}
+
+// A byte is eligible only if the original list walk reaches a self-loop before
+// any other matching instruction or observable operation. In particular, never
+// skip captures, assertions, or Nops to find a later byte range.
+bool Prog::BuildCharClassRunTable(int head, uint16_t* table) {
+  memset(table, 0, 256*sizeof table[0]);
+  bool any = false;
+  for (int c = 0; c < 256; ++c) {
+    for (int id = head; ; ++id) {
+      Inst* ip = inst(id);
+      if (ip->opcode() != kInstByteRange)
+        break;
+      if (ip->Matches(c)) {
+        if (ip->out() == head) {
+          table[c] = static_cast<uint16_t>(id);
+          any = true;
+        }
+        break;
+      }
+      if (ip->last())
+        break;
+    }
+  }
+  return any;
+}
+
+void Prog::BuildCharClassRuns() {
+  if (!CanBitState())
+    return;
+  // Include the sparse index and owning fields in the per-Prog 16KiB cap.
+  // Count first: no partial acceleration survives a cap miss, and no oversized
+  // temporary vector is allocated while compiling a pattern.
+  const size_t max_bytes = 16*1024;
+  const size_t fixed_bytes = size_*sizeof(uint16_t) +
+      sizeof(charclass_run_index_) + sizeof(charclass_run_tables_);
+  uint16_t table[256];
+  int count = 0;
+  for (int head = 0; head < size_; ++head) {
+    if (list_heads_[head] != 0xFFFF && BuildCharClassRunTable(head, table)) {
+      ++count;
+      if (fixed_bytes + count*sizeof table > max_bytes)
+        return;
+    }
+  }
+  if (count == 0)
+    return;
+  charclass_run_index_ = PODArray<uint16_t>(size_);
+  memset(charclass_run_index_.data(), 0xFF, size_*sizeof(uint16_t));
+  charclass_run_tables_ = PODArray<uint16_t>(count*256);
+  count = 0;
+  for (int head = 0; head < size_; ++head) {
+    if (list_heads_[head] != 0xFFFF && BuildCharClassRunTable(head, table)) {
+      charclass_run_index_[head] = static_cast<uint16_t>(count);
+      memcpy(charclass_run_tables_.data() + 256*count++, table, sizeof table);
+    }
+  }
+}
+
+// Compiler::Finish calls this before publication, after accounting for Prog
+// itself, instructions, and list_heads_. Charge the optional heap arrays too;
+// a tiny existing max_mem budget keeps the generic engine, never a new error.
+void Prog::set_dfa_mem(int64_t dfa_mem) {
+  const int64_t bytes = (charclass_run_index_.size() + charclass_run_tables_.size())*
+      static_cast<int64_t>(sizeof(uint16_t));
+  if (bytes > dfa_mem) {
+    charclass_run_index_ = PODArray<uint16_t>();
+    charclass_run_tables_ = PODArray<uint16_t>();
+  } else {
+    dfa_mem -= bytes;
+  }
+  dfa_mem_ = dfa_mem;
+#if defined(RE2_CLAB_STATS)
+  fprintf(stderr, "RE2_CLAB_PROG runnable_lists=%d analysis_bytes=%zu text_max=%zu dfa_bytes=%lld\n%s\n",
+          charclass_run_tables_.size()/256,
+          (charclass_run_index_.size() + charclass_run_tables_.size())*sizeof(uint16_t)
+              + sizeof(charclass_run_index_) + sizeof(charclass_run_tables_),
+          bit_state_text_max_size_, static_cast<long long>(dfa_mem_), Dump().c_str());
+#endif
 }
 
 void Prog::MarkSuccessors(SparseArray<int>* rootmap,

@@ -207,9 +207,16 @@ class Prog {
   int list_count() { return list_count_; }
   int inst_count(InstOp op) { return inst_count_[op]; }
   uint16_t* list_heads() { return list_heads_.data(); }
+  // Immutable after Flatten. Zero entries are not deterministic byte loops.
+  const uint16_t* charclass_run(int head) const {
+    if (charclass_run_index_.data() == NULL ||
+        charclass_run_index_[head] == 0xFFFF)
+      return NULL;
+    return charclass_run_tables_.data() + 256*charclass_run_index_[head];
+  }
   size_t bit_state_text_max_size() { return bit_state_text_max_size_; }
   int64_t dfa_mem() { return dfa_mem_; }
-  void set_dfa_mem(int64_t dfa_mem) { dfa_mem_ = dfa_mem; }
+  void set_dfa_mem(int64_t dfa_mem);
   bool anchor_start() { return anchor_start_; }
   void set_anchor_start(bool b) { anchor_start_ = b; }
   bool anchor_end() { return anchor_end_; }
@@ -407,6 +414,8 @@ class Prog {
 
   DFA* GetDFA(MatchKind kind);
   void DeleteDFA(DFA* dfa);
+  bool BuildCharClassRunTable(int head, uint16_t* table);
+  void BuildCharClassRuns();
 
   bool anchor_start_;       // regexp has explicit start anchor
   bool anchor_end_;         // regexp has explicit end anchor
@@ -434,6 +443,8 @@ class Prog {
   PODArray<uint16_t> list_heads_;   // sparse array enumerating list heads
                                     // not populated if size_ is overly large
   size_t bit_state_text_max_size_;  // upper bound (inclusive) on text.size()
+  PODArray<uint16_t> charclass_run_index_;
+  PODArray<uint16_t> charclass_run_tables_;
 
   PODArray<Inst> inst_;              // pointer to instruction array
   PODArray<uint8_t> onepass_nodes_;  // data for OnePass nodes

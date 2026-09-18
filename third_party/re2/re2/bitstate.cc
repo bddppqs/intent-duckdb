@@ -21,7 +21,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <limits>
+#include <algorithm>
 #include <utility>
+#if defined(RE2_CLAB_STATS) || defined(RE2_CLAB_SHADOW)
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 #include "util/logging.h"
 #include "re2/pod_array.h"
@@ -29,6 +34,36 @@
 #include "re2/regexp.h"
 
 namespace duckdb_re2 {
+
+#if defined(RE2_CLAB_STATS)
+struct ClabByteStats {
+  uint64_t fast = 0, total = 0, calls = 0, stripped_calls = 0, prefix_bytes = 0, input_bytes = 0;
+  ~ClabByteStats() {
+    fprintf(stderr, "RE2_CLAB_STATS fast_bytes=%llu total_bytes=%llu calls=%llu stripped_calls=%llu prefix_bytes=%llu input_bytes=%llu\n",
+            static_cast<unsigned long long>(fast), static_cast<unsigned long long>(total),
+            static_cast<unsigned long long>(calls), static_cast<unsigned long long>(stripped_calls),
+            static_cast<unsigned long long>(prefix_bytes), static_cast<unsigned long long>(input_bytes));
+  }
+};
+static thread_local ClabByteStats clab_byte_stats;
+#endif
+
+#if defined(RE2_CLAB_SHADOW)
+struct ClabShadowStats {
+  uint64_t searches = 0, batches = 0;
+  ~ClabShadowStats() {
+    fprintf(stderr, "RE2_CLAB_SHADOW searches=%llu batches=%llu divergences=0\n",
+            static_cast<unsigned long long>(searches), static_cast<unsigned long long>(batches));
+  }
+};
+static thread_local ClabShadowStats clab_shadow_stats;
+static void ClabRequire(bool same) {
+  if (!same) {
+    fprintf(stderr, "RE2_CLAB_SHADOW divergences=1\n");
+    abort();
+  }
+}
+#endif
 
 struct Job {
   int id;
@@ -45,12 +80,18 @@ class BitState {
   bool Search(const StringPiece& text, const StringPiece& context,
               bool anchored, bool longest,
               StringPiece* submatch, int nsubmatch);
+#if defined(RE2_CLAB_SHADOW)
+  void DisableRuns() { use_runs_ = false; }
+  bool SameState(const BitState& other) const;
+#endif
 
  private:
   inline bool ShouldVisit(int id, const char* p);
   void Push(int id, const char* p);
   void GrowStack();
   bool TrySearch(int id, const char* p);
+  const char* RunCharClass(int id, const char* p, const char* end,
+                           const uint16_t* table);
 
   // Search parameters
   Prog* prog_;              // program being run
@@ -68,6 +109,9 @@ class BitState {
   PODArray<const char*> cap_;   // capture registers
   PODArray<Job> job_;           // stack of text positions to explore
   int njob_;                    // stack size
+#if defined(RE2_CLAB_SHADOW)
+  bool use_runs_ = true;
+#endif
 
   BitState(const BitState&) = delete;
   BitState& operator=(const BitState&) = delete;
@@ -133,6 +177,107 @@ void BitState::Push(int id, const char* p) {
   top->p = p;
 }
 
+// Consume exactly the steps whose successor visit succeeds. A previously
+// visited successor is left to the generic path, which must still push its
+// deferred alternative before failing that visit. Bitmap writes are amortized
+// per word, and the original Push RLE representation is emitted once per run.
+const char* BitState::RunCharClass(int id, const char* p, const char* end,
+                                  const uint16_t* table) {
+  Prog::Inst* ip = prog_->inst(id);
+  const int head = ip->out();
+  const int list_base = prog_->list_heads()[head]*static_cast<int>(text_.size()+1);
+  const char* next = p;
+#if defined(RE2_CLAB_SHADOW)
+  std::vector<uint64_t> expected_visited(visited_.data(), visited_.data()+visited_.size());
+  std::vector<Job> expected_jobs(job_.data(), job_.data()+njob_);
+  std::vector<const char*> expected_cap(cap_.data(), cap_.data()+cap_.size());
+#endif
+  while (next < end) {
+    const int n = list_base + static_cast<int>(next-text_.data()) + 1;
+    const int offset = n & (kVisitedBits-1);
+    const int limit = std::min(kVisitedBits-offset, static_cast<int>(end-next));
+    const uint64_t old = visited_[n/kVisitedBits];
+    int count = 0;
+    while (count < limit && table[static_cast<unsigned char>(next[count])] == id &&
+           !(old & (uint64_t{1} << (offset+count))))
+      ++count;
+    if (count == 0)
+      break;
+    // count is in [1,64], offset+count <= 64: no shift by 64.
+    visited_[n/kVisitedBits] = old | ((~uint64_t{0} >> (64-count)) << offset);
+    next += count;
+    if (count != limit)
+      break;
+  }
+  const int count = static_cast<int>(next-p);
+  if (count == 0)
+    return p;
+  if (ip->hint() != 0) {
+    Push(id+ip->hint(), p);
+    // All positions lie in a BitState text (at most 256KiB), so this cannot
+    // overflow the int RLE count, including a contiguous existing top job.
+    job_[njob_-1].rle += count-1;
+  }
+#if defined(RE2_CLAB_STATS)
+  clab_byte_stats.fast += count;
+  clab_byte_stats.total += count;
+#endif
+#if defined(RE2_CLAB_SHADOW)
+  for (const char* q = p; q < next; ++q) {
+    // Reconstruct the original list walk, independently of the analysis table.
+    int chosen = head;
+    while (true) {
+      Prog::Inst* original = prog_->inst(chosen);
+      ClabRequire(original->opcode() == kInstByteRange);
+      if (original->Matches(static_cast<unsigned char>(*q)))
+        break;
+      ClabRequire(!original->last());
+      ++chosen;
+    }
+    ClabRequire(chosen == id);
+    if (ip->hint() != 0) {
+      const int deferred = id+ip->hint();
+      if (!expected_jobs.empty() && expected_jobs.back().id == deferred &&
+          q == expected_jobs.back().p + expected_jobs.back().rle + 1 &&
+          expected_jobs.back().rle < std::numeric_limits<int>::max())
+        ++expected_jobs.back().rle;
+      else
+        expected_jobs.push_back(Job{deferred, 0, q});
+    }
+    const int n = list_base + static_cast<int>(q-text_.data()) + 1;
+    const uint64_t bit = uint64_t{1} << (n & (kVisitedBits-1));
+    ClabRequire((expected_visited[n/kVisitedBits] & bit) == 0);
+    expected_visited[n/kVisitedBits] |= bit;
+  }
+  ClabRequire(expected_jobs.size() == static_cast<size_t>(njob_));
+  for (int i = 0; i < njob_; ++i)
+    ClabRequire(expected_jobs[i].id == job_[i].id && expected_jobs[i].rle == job_[i].rle &&
+                expected_jobs[i].p == job_[i].p);
+  for (int i = 0; i < visited_.size(); ++i)
+    ClabRequire(expected_visited[i] == visited_[i]);
+  for (int i = 0; i < cap_.size(); ++i)
+    ClabRequire(expected_cap[i] == cap_[i]);
+  ++clab_shadow_stats.batches;
+#endif
+  return next;
+}
+
+#if defined(RE2_CLAB_SHADOW)
+bool BitState::SameState(const BitState& other) const {
+  if (visited_.size() != other.visited_.size() || cap_.size() != other.cap_.size() ||
+      njob_ != other.njob_)
+    return false;
+  for (int i = 0; i < visited_.size(); ++i)
+    if (visited_[i] != other.visited_[i]) return false;
+  for (int i = 0; i < cap_.size(); ++i)
+    if (cap_[i] != other.cap_[i]) return false;
+  for (int i = 0; i < njob_; ++i)
+    if (job_[i].id != other.job_[i].id || job_[i].rle != other.job_[i].rle ||
+        job_[i].p != other.job_[i].p) return false;
+  return true;
+}
+#endif
+
 // Try a search from instruction id0 in state p0.
 // Return whether it succeeded.
 bool BitState::TrySearch(int id0, const char* p0) {
@@ -197,6 +342,26 @@ bool BitState::TrySearch(int id0, const char* p0) {
         if (!ip->Matches(c))
           goto Next;
 
+#if defined(RE2_CLAB_SHADOW)
+        if (use_runs_)
+#endif
+        {
+          const uint16_t* table = prog_->charclass_run(ip->out());
+          if (table != NULL && table[c] == id) {
+            const char* next = RunCharClass(id, p, end, table);
+            if (next != p) {
+              p = next;
+              id = ip->out();
+              goto Loop;  // the final successor's visited bit is already set
+            }
+          }
+        }
+#if defined(RE2_CLAB_STATS)
+#if defined(RE2_CLAB_SHADOW)
+        if (use_runs_)
+#endif
+          ++clab_byte_stats.total;
+#endif
         if (ip->hint() != 0)
           Push(id+ip->hint(), p);  // try the next when we're done
         id = ip->out();
@@ -293,6 +458,20 @@ bool BitState::Search(const StringPiece& text, const StringPiece& context,
   context_ = context;
   if (context_.data() == NULL)
     context_ = text;
+#if defined(RE2_CLAB_STATS)
+#if defined(RE2_CLAB_SHADOW)
+  if (use_runs_)
+#endif
+  {
+    ++clab_byte_stats.calls;
+    clab_byte_stats.input_bytes += text.size();
+    if (text.data() != NULL && context_.data() != NULL &&
+        text.data() != context_.data()) {
+      ++clab_byte_stats.stripped_calls;
+      clab_byte_stats.prefix_bytes += text.data()-context_.data();
+    }
+  }
+#endif
   if (prog_->anchor_start() && BeginPtr(context_) != BeginPtr(text))
     return false;
   if (prog_->anchor_end() && EndPtr(context_) != EndPtr(text))
@@ -375,7 +554,24 @@ bool Prog::SearchBitState(const StringPiece& text,
   BitState b(this);
   bool anchored = anchor == kAnchored;
   bool longest = kind != kFirstMatch;
-  if (!b.Search(text, context, anchored, longest, match, nmatch))
+#if defined(RE2_CLAB_SHADOW)
+  std::vector<StringPiece> generic_match(nmatch);
+  for (int i = 0; i < nmatch; ++i)
+    generic_match[i] = match[i];
+#endif
+  const bool found = b.Search(text, context, anchored, longest, match, nmatch);
+#if defined(RE2_CLAB_SHADOW)
+  BitState generic(this);
+  generic.DisableRuns();
+  const bool generic_found = generic.Search(text, context, anchored, longest,
+                                            generic_match.data(), nmatch);
+  ClabRequire(found == generic_found && b.SameState(generic));
+  for (int i = 0; i < nmatch; ++i)
+    ClabRequire(match[i].data() == generic_match[i].data() &&
+                match[i].size() == generic_match[i].size());
+  ++clab_shadow_stats.searches;
+#endif
+  if (!found)
     return false;
   if (kind == kFullMatch && EndPtr(match[0]) != EndPtr(text))
     return false;

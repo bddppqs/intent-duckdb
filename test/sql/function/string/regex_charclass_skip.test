@@ -1,0 +1,88 @@
+# name: test/sql/function/string/regex_charclass_skip.test
+# description: Deterministic RE2 character-class runs preserve captures and fallback behavior
+# group: [string]
+
+query TTT
+SELECT regexp_replace('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$', '\1'),
+       regexp_extract('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$', 1),
+       regexp_matches('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$');
+----
+example.test	example.test	1
+
+# Deferred alternatives must remain available after a long greedy run.
+query TT
+SELECT regexp_extract('aaab', '^([ab]+)b$', 1),
+       regexp_replace('aaab', '^([ab]+)b$', '[\1]');
+----
+aaa	[aaa]
+
+# Captures inside a loop must not be skipped.
+query TT
+SELECT regexp_extract('abba', '^(a|b)+$', 1),
+       regexp_extract('abba', '^((a|b)+)$', 1);
+----
+a	abba
+
+# A newline is not a dot byte unless the existing option permits it.
+query TTT
+SELECT regexp_matches('aaaa' || chr(10), '^([a-z]+).*$'),
+       regexp_matches('aaaa' || chr(10), '^([a-z]+).*$', 's'),
+       regexp_matches('aaaa' || chr(10), '^([a-z]+).*$', 'm');
+----
+0	1	0
+
+query TT
+SELECT regexp_replace('AAaa', '(a+)', 'x', 'i'),
+       regexp_replace('aba', '(a+)', 'x', 'g');
+----
+x	xbx
+
+query T
+SELECT hex(regexp_extract('é界abc/z', '^([^/]+)/.*$', 1));
+----
+C3A9E7958C616263
+
+# ASCII run/UTF-8 transitions on both sides of a visited-bitmap word boundary.
+query III
+SELECT length(regexp_extract(repeat('a', 63) || 'é' || repeat('b', 65) || '/x', '^([^/]+)/.*$', 1)),
+       length(regexp_extract(repeat('a', 64) || '界' || repeat('b', 64) || '/x', '^([^/]+)/.*$', 1)),
+       length(regexp_extract(repeat('a', 65) || 'é界' || repeat('b', 63) || '/x', '^([^/]+)/.*$', 1));
+----
+129	129	130
+
+query IIT
+SELECT length(regexp_replace('', '([a-z]+)', 'x')),
+       length(regexp_extract('', '([a-z]+)', 1)),
+       regexp_matches(NULL, '([a-z]+)');
+----
+0	0	NULL
+
+# Dynamic patterns retain the normal binding and matching rules.
+query IT rowsort
+SELECT i, regexp_extract(r, p, 1)
+FROM (VALUES (1, 'aaab', '(a+)'), (2, 'bbba', '(b+)'), (3, '', '(a*)')) v(i,r,p);
+----
+1	aaa
+2	bbb
+3	(empty)
+
+# Forty separate byte loops exceed the analysis-table cap but remain correct.
+query T
+SELECT regexp_extract(repeat('abc', 40), '^([ab]+c){40}$', 1);
+----
+abc
+
+# Sweep both sides of every possible BitState text cutoff (list_count <= 512).
+# The +/-12 band also covers the scheme prefix stripped by RE2 before dispatch.
+# This is 12,800 synthetic rows, not a benchmark-data or timing test.
+query I
+WITH lengths AS (
+  SELECT (262144 // i - 1 + delta)::INTEGER AS n
+  FROM range(1, 513) lists(i), range(-12, 13) offsets(delta)
+), strings AS (
+  SELECT 'http://h/' || repeat('a', n) AS r FROM lengths
+)
+SELECT count(*) FROM strings
+WHERE regexp_extract(r, '^https?://(?:www\.)?([^/]+)/.*$', 1) = 'h';
+----
+12800
