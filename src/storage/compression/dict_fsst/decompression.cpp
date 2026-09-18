@@ -97,14 +97,16 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	dictionary_indices_ptr = data_ptr_cast(baseptr + dictionary_indices_dest);
 	string_lengths_ptr = data_ptr_cast(baseptr + string_lengths_dest);
 
-	const bool cache_dictionary = initialize_dictionary && mode == DictFSSTMode::DICT_FSST &&
-	                              segment.segment_type == ColumnSegmentType::PERSISTENT;
+	bool cache_dictionary = initialize_dictionary && mode == DictFSSTMode::DICT_FSST &&
+	                              segment.segment_type == ColumnSegmentType::PERSISTENT && segment.UseDictionaryCache();
 	if (cache_dictionary) {
 		auto cached = segment.db.GetObjectCache().Get<MaterializedDictionaryEntry>(segment.GetDictionaryCacheKey());
 		if (cached) {
+			segment.ObserveDictionaryCacheHit();
 			dictionary = cached->dictionary;
 			return;
 		}
+		cache_dictionary = segment.AdmitDictionaryCacheMiss();
 	}
 
 	switch (mode) {
@@ -153,6 +155,7 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 		auto cached = segment.db.GetObjectCache().GetOrCreate<MaterializedDictionaryEntry>(
 		    segment.GetDictionaryCacheKey(), dictionary, bytes);
 		if (cached) {
+			segment.ObserveDictionaryCachePublication();
 			dictionary = cached->dictionary;
 		}
 	}

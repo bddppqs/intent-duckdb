@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "duckdb/common/enums/scan_vector_type.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -131,7 +133,30 @@ public:
 		return dictionary_cache_key;
 	}
 
+	//! Approximate admission hints only: data identity/lifetime still use the binding key.
+	bool UseDictionaryCache() const {
+		return !(dictionary_cache_hint.load(std::memory_order_relaxed) & CACHE_BYPASS);
+	}
+	bool AdmitDictionaryCacheMiss() {
+		auto hint = dictionary_cache_hint.load(std::memory_order_relaxed);
+		if ((hint & (CACHE_PUBLISHED | CACHE_HIT)) == CACHE_PUBLISHED) {
+			dictionary_cache_hint.fetch_or(CACHE_BYPASS, std::memory_order_relaxed);
+			return false;
+		}
+		return !(hint & CACHE_BYPASS);
+	}
+	void ObserveDictionaryCacheHit() {
+		dictionary_cache_hint.fetch_or(CACHE_HIT, std::memory_order_relaxed);
+	}
+	void ObserveDictionaryCachePublication() {
+		dictionary_cache_hint.fetch_or(CACHE_PUBLISHED, std::memory_order_relaxed);
+	}
+
 private:
+	static constexpr uint8_t CACHE_PUBLISHED = 1;
+	static constexpr uint8_t CACHE_HIT = 2;
+	static constexpr uint8_t CACHE_BYPASS = 4;
+	std::atomic<uint8_t> dictionary_cache_hint {0};
 	void InvalidateDictionaryCache();
 	string dictionary_cache_key;
 	void Scan(ColumnScanState &state, idx_t scan_count, Vector &result);

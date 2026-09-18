@@ -85,6 +85,8 @@ ColumnSegment::ColumnSegment(ColumnSegment &other)
       type_size(other.type_size), segment_type(other.segment_type), stats(std::move(other.stats)),
       block(std::move(other.block)), function(other.function), block_id(other.block_id), offset(other.offset),
       segment_size(other.segment_size), segment_state(std::move(other.segment_state)) {
+	dictionary_cache_hint.store(other.dictionary_cache_hint.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	other.dictionary_cache_hint.store(0, std::memory_order_relaxed);
 	dictionary_cache_key = std::move(other.dictionary_cache_key);
 	other.dictionary_cache_key.clear();
 	// For constant segments (CompressionType::COMPRESSION_CONSTANT) the block is a nullptr.
@@ -98,6 +100,7 @@ ColumnSegment::~ColumnSegment() {
 }
 
 void ColumnSegment::InvalidateDictionaryCache() {
+	dictionary_cache_hint.store(0, std::memory_order_relaxed);
 	if (!dictionary_cache_key.empty()) {
 		db.GetObjectCache().Delete(dictionary_cache_key);
 		dictionary_cache_key = "dict_fsst-" + UUID::ToString(UUID::GenerateRandomUUID());
