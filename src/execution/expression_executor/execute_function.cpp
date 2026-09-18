@@ -2,8 +2,55 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/function/scalar/regexp.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 namespace duckdb {
+
+namespace {
+class RegexpReplaceDictionaryMemo : public ObjectCacheEntry {
+public:
+	RegexpReplaceDictionaryMemo(buffer_ptr<VectorChildBuffer> dictionary_p, idx_t bytes_p)
+	    : dictionary(std::move(dictionary_p)), bytes(bytes_p) {
+	}
+	static string ObjectType() {
+		return "regexp_replace_dictionary_memo_v1";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return bytes;
+	}
+	buffer_ptr<VectorChildBuffer> dictionary;
+	const idx_t bytes;
+};
+
+optional_idx DictionaryMemoWeight(VectorChildBuffer &dictionary, idx_t count, const string &key) {
+	static constexpr idx_t MAX_ENTRY_BYTES = 8ULL * 1024 * 1024;
+	idx_t bytes = 0;
+	auto add = [&](idx_t part) {
+		if (part > MAX_ENTRY_BYTES - bytes) {
+			return false;
+		}
+		bytes += part;
+		return true;
+	};
+	// Include both LRU/map key copies and conservative cache-node overhead. Prepay
+	// the only lazy shared data: the existing mutex-protected cached_hashes vector.
+	if (count > MAX_ENTRY_BYTES / (sizeof(string_t) + sizeof(hash_t)) ||
+	    !add(sizeof(RegexpReplaceDictionaryMemo) + sizeof(VectorChildBuffer) + sizeof(VectorStringBuffer) +
+	         2 * sizeof(VectorBuffer) + 1024) ||
+	    !add(key.size()) || !add(key.size()) ||
+	    !add(count * (sizeof(string_t) + sizeof(hash_t))) ||
+	    !add(ValidityMask::ValidityMaskSize(count)) || !add(ValidityMask::ValidityMaskSize(count)) ||
+	    !add(StringVector::GetStringBuffer(dictionary.data).GetStringAllocator().AllocationSize())) {
+		return optional_idx();
+	}
+	return bytes;
+}
+} // namespace
+
 
 ExecuteFunctionState::ExecuteFunctionState(const Expression &expr, ExpressionExecutorState &root)
     : ExpressionState(expr, root) {
@@ -34,6 +81,9 @@ ExecuteFunctionState::ExecuteFunctionState(const Expression &expr, ExpressionExe
 				break; // FIXME
 			}
 			input_col_idx = child_idx;
+		}
+		if (input_col_idx.IsValid() && input_col_idx.GetIndex() == 0) {
+			TryGetRegexpReplaceDictionaryMemoKey(bound_function, dictionary_memo_key);
 		}
 		break;
 	}
@@ -81,6 +131,18 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 			return false;
 		}
 
+		string memo_key;
+		if (!dictionary_memo_key.empty() && state.HasContext()) {
+			memo_key = dictionary_memo_key + to_string(input_dictionary_id.size()) + ":" + input_dictionary_id;
+			auto cached = ObjectCache::GetObjectCache(state.GetContext()).Get<RegexpReplaceDictionaryMemo>(memo_key);
+			if (cached) {
+				output_dictionary = cached->dictionary;
+				current_input_dictionary_id = input_dictionary_id;
+				result.Dictionary(output_dictionary, DictionaryVector::SelVector(unary_input));
+				return true;
+			}
+		}
+
 		// We can do dictionary optimization! Re-initialize
 		output_dictionary = DictionaryVector::CreateReusableDictionary(result.GetType(), input_dictionary_size);
 		current_input_dictionary_id = input_dictionary_id;
@@ -107,6 +169,16 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 			Vector output_intermediate(result.GetType());
 			expr.function.GetFunctionCallback()(input_chunk, state, output_intermediate);
 			VectorOperations::Copy(output_intermediate, output_dictionary->data, count, 0, offset);
+		}
+		if (!memo_key.empty()) {
+			const auto bytes = DictionaryMemoWeight(*output_dictionary, input_dictionary_size, memo_key);
+			if (bytes.IsValid()) {
+				auto cached = ObjectCache::GetObjectCache(state.GetContext()).GetOrCreate<RegexpReplaceDictionaryMemo>(
+				    memo_key, output_dictionary, bytes.GetIndex());
+				if (cached) {
+					output_dictionary = cached->dictionary;
+				}
+			}
 		}
 	}
 

@@ -84,6 +84,8 @@ private:
 	buffer_ptr<VectorChildBuffer> output_dictionary;
 	//! ID of the input dictionary Vector
 	string current_input_dictionary_id;
+	//! Exact supported expression identity, independent of the input dictionary generation.
+	string dictionary_memo_key;
 };
 
 struct ExpressionExecutorState {
