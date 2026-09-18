@@ -96,3 +96,55 @@ TEST_CASE("Test different hyperloglog version serialization", "[hyperloglog]") {
 		REQUIRE(original_count == deserialized_count);
 	}
 }
+
+TEST_CASE("CountZeros builtin equivalence", "[hyperloglog]") {
+	// Preserve the original de Bruijn algorithms as independent reference paths.
+	const auto reference_leading = [](uint64_t value) -> idx_t {
+		if (!value) {
+			return 64;
+		}
+		static constexpr uint64_t index[] = {0,  47, 1,  56, 48, 27, 2,  60, 57, 49, 41, 37, 28, 16, 3,  61,
+		                                     54, 58, 35, 52, 50, 42, 21, 44, 38, 32, 29, 23, 17, 11, 4,  62,
+		                                     46, 55, 26, 59, 40, 36, 15, 53, 34, 51, 20, 43, 31, 22, 10, 45,
+		                                     25, 39, 14, 33, 19, 30, 9,  24, 13, 18, 8,  12, 7,  6,  5,  63};
+		value |= value >> 1;
+		value |= value >> 2;
+		value |= value >> 4;
+		value |= value >> 8;
+		value |= value >> 16;
+		value |= value >> 32;
+		return 63 - index[(value * 0X03F79D71B4CB0A89ULL) >> 58];
+	};
+	const auto reference_trailing = [](uint64_t value) -> idx_t {
+		if (!value) {
+			return 64;
+		}
+		static constexpr uint64_t index[] = {63, 0,  58, 1,  59, 47, 53, 2,  60, 39, 48, 27, 54, 33, 42, 3,
+		                                     61, 51, 37, 40, 49, 18, 28, 20, 55, 30, 34, 11, 43, 14, 22, 4,
+		                                     62, 57, 46, 52, 38, 26, 32, 41, 50, 36, 17, 19, 29, 10, 13, 21,
+		                                     56, 45, 25, 31, 35, 16, 9,  12, 44, 24, 15, 8,  23, 7,  6,  5};
+		return index[((value & -value) * 0x07EDD5E59A4E28C2ULL) >> 58];
+	};
+	const auto check = [&](uint64_t value) {
+		CAPTURE(value);
+		REQUIRE(CountZeros<uint64_t>::Leading(value) == reference_leading(value));
+		REQUIRE(CountZeros<uint64_t>::Trailing(value) == reference_trailing(value));
+	};
+
+	check(0);
+	check(~uint64_t(0));
+	for (idx_t bit = 0; bit < 64; bit++) {
+		check(uint64_t(1) << bit);
+	}
+	static constexpr idx_t positions[] = {0, 1, 5, 6, 57, 58, 62, 63};
+	for (idx_t left = 0; left < 8; left++) {
+		for (idx_t right = left + 1; right < 8; right++) {
+			check((uint64_t(1) << positions[left]) | (uint64_t(1) << positions[right]));
+		}
+	}
+	uint64_t state = 0xD021C0A17E202609ULL;
+	for (idx_t i = 0; i < 1000000; i++) {
+		state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+		check(state);
+	}
+}
