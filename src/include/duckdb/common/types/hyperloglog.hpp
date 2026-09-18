@@ -66,6 +66,10 @@ public:
 public:
 	//! Add data to this HLL
 	void Update(Vector &input, Vector &hashes, idx_t count);
+	//! Add a selected subset without materializing a temporary hash vector.
+	void Update(Vector &input, Vector &hashes, const SelectionVector &selection, idx_t count, idx_t source_count);
+	//! Add selected hash values when the hash vector itself is the validity source.
+	void Update(Vector &hashes, const SelectionVector &selection, idx_t count, idx_t source_count);
 	//! Get copy of the HLL
 	unique_ptr<HyperLogLog> Copy() const;
 

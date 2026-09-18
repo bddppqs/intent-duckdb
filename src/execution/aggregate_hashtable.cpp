@@ -672,10 +672,6 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 	// convert all vectors to unified format
 	TupleDataCollection::ToUnifiedFormat(state.partitioned_append_state.chunk_state, state.group_chunk);
 
-	if (enable_hll) {
-		hll.Update(group_hashes_v, group_hashes_v, groups.size());
-	}
-
 	group_hashes_v.Flatten(chunk_size);
 	const auto hashes = FlatVector::GetData<hash_t>(group_hashes_v);
 
@@ -807,6 +803,13 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 	}
 	if (iteration_count == capacity) {
 		throw InternalException("Maximum outer iteration count reached in GroupedAggregateHashTable");
+	}
+
+	// HLL insertion is idempotent for repeated hashes. Feed only the groups that
+	// this probe actually created; this preserves the estimator state while
+	// avoiding duplicate work in the enabled adaptation window.
+	if (enable_hll && new_group_count != 0) {
+		hll.Update(group_hashes_v, new_groups_out, new_group_count, chunk_size);
 	}
 
 	count += new_group_count;

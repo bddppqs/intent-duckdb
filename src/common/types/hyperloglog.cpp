@@ -112,6 +112,41 @@ void HyperLogLog::Update(Vector &input, Vector &hash_vec, const idx_t count) {
 	}
 }
 
+void HyperLogLog::Update(Vector &input, Vector &hash_vec, const SelectionVector &selection, const idx_t count,
+                         const idx_t source_count) {
+	UnifiedVectorFormat idata;
+	input.ToUnifiedFormat(source_count, idata);
+
+	UnifiedVectorFormat hdata;
+	hash_vec.ToUnifiedFormat(source_count, hdata);
+	const auto hashes = UnifiedVectorFormat::GetData<hash_t>(hdata);
+
+	for (idx_t i = 0; i < count; ++i) {
+		const auto source_index = selection.get_index(i);
+		D_ASSERT(source_index < source_count);
+		const auto input_index = idata.sel->get_index(source_index);
+		if (!idata.validity.RowIsValid(input_index)) {
+			continue;
+		}
+		const auto hash_index = hdata.sel->get_index(source_index);
+		InsertElement(hashes[hash_index]);
+	}
+}
+
+void HyperLogLog::Update(Vector &hash_vec, const SelectionVector &selection, const idx_t count,
+                         const idx_t source_count) {
+	UnifiedVectorFormat hdata;
+	hash_vec.ToUnifiedFormat(source_count, hdata);
+	const auto hashes = UnifiedVectorFormat::GetData<hash_t>(hdata);
+
+	for (idx_t i = 0; i < count; ++i) {
+		const auto source_index = selection.get_index(i);
+		D_ASSERT(source_index < source_count);
+		const auto hash_index = hdata.sel->get_index(source_index);
+		InsertElement(hashes[hash_index]);
+	}
+}
+
 unique_ptr<HyperLogLog> HyperLogLog::Copy() const {
 	auto result = make_uniq<HyperLogLog>();
 	memcpy(result->k, this->k, sizeof(k));
