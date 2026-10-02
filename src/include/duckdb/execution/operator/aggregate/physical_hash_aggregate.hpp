@@ -20,6 +20,8 @@ namespace duckdb {
 class ClientContext;
 class BufferManager;
 class PhysicalHashAggregate;
+class RunAggregateData;
+class FusedIntegerAggregate;
 
 struct HashAggregateGroupingData {
 public:
@@ -73,6 +75,7 @@ public:
 	                      vector<GroupingSet> grouping_sets, vector<unsafe_vector<idx_t>> grouping_functions,
 	                      idx_t estimated_cardinality, TupleDataValidityType group_validity,
 	                      TupleDataValidityType distinct_validity);
+	~PhysicalHashAggregate() override;
 
 	//! The grouping sets
 	GroupedAggregateData grouped_aggregate_data;
@@ -83,6 +86,14 @@ public:
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
 	//! A recreation of the input chunk, with nulls for everything that isnt a group
 	vector<LogicalType> input_group_types;
+
+	//! Run-aware grouped aggregation over an unfiltered seq_scan of one RLE/Constant integer group column: the scan
+	//! turns each (value, run length) pair into one hash probe and one grouped state update. Null when the
+	//! plan shape is not eligible
+	shared_ptr<RunAggregateData> run_aggregate;
+	//! The fused integer aggregate: compact rows partitioned once, one table per partition built and scanned
+	//! once. Null when the shape checks refuse the plan
+	unique_ptr<FusedIntegerAggregate> fused;
 
 	//! Filters given to Sink and friends
 	unsafe_vector<idx_t> non_distinct_filter;
@@ -97,8 +108,13 @@ public:
 	                                                 GlobalSourceState &gstate) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
+	//! The operator's GetData before the output conversion: GetDataInternal re-emits the typed keys over the global
+	//! dictionary when they come out as codes
+	SourceResultType GlobalDictionaryGetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const;
 
 	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	InsertionOrderPreservingMap<string> ExtraSourceParams(GlobalSourceState &gstate,
+	                                                      LocalSourceState &lstate) const override;
 
 	bool IsSource() const override {
 		return true;

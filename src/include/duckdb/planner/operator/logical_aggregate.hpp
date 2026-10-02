@@ -15,6 +15,21 @@
 #include "duckdb/parser/group_by_node.hpp"
 
 namespace duckdb {
+class DynamicTableFilterSet;
+
+//! Plan-time marker of the first-keys rewrite (FirstKeysAggregate): the marked aggregate emits the first k distinct
+//! group keys of its input and pushes a row-level key filter into the probe-side scan. Not serialized: a copy made
+//! through serialization is a plain aggregate again (still exact under its LIMIT).
+struct FirstKeysAggregateInfo {
+	//! The number of keys to emit
+	idx_t k = 0;
+	//! The probe-side scan's dynamic filter set
+	shared_ptr<DynamicTableFilterSet> probe_filters;
+	//! Per group: the probe scan's column index (index into its column ids) the key filter applies to
+	vector<idx_t> probe_column_indexes;
+	//! Per group: the probe scan's storage type of that column
+	vector<LogicalType> probe_storage_types;
+};
 
 //! LogicalAggregate represents an aggregate operation with (optional) GROUP BY
 //! operator.
@@ -41,6 +56,8 @@ public:
 	vector<unique_ptr<BaseStatistics>> group_stats;
 	//! Whether the inputs to all expression are non-NULL
 	TupleDataValidityType distinct_validity;
+	//! First-keys marker (optional, not serialized)
+	unique_ptr<FirstKeysAggregateInfo> first_keys;
 
 public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

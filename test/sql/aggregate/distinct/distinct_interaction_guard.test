@@ -1,0 +1,80 @@
+# name: test/sql/aggregate/distinct/distinct_interaction_guard.test
+# description: Interaction guard: a VARCHAR group key (the small-dictionary gid) beside count(DISTINCT x) and a
+#              non-distinct aggregate (the mixed DISTINCT shape) is a shape no member admits alone (the mixed fold refuses the
+#              VARCHAR key, the gid path the second aggregate), so the composition takes the general path on it: an EXPLAIN
+#              (FORMAT JSON) per guarded shape asserts no fused marker, and the answers are the general path's.
+#              The controls show the guard is narrow: the VARCHAR key alone (the gid path) and the SMALLINT-key mixed shape
+#              (the mixed fold) still take the fused DISTINCT path.
+# group: [distinct]
+
+statement ok
+CREATE TABLE tg AS SELECT CASE WHEN (i // 256) % 41 = 40 THEN 'https://example.com/model/' ELSE 'https://example.com/model/' || lpad(((i // 256) % 41)::VARCHAR, 2, '0') END AS g, ((i // 1024) % 7)::SMALLINT AS s, ((i // 16) % 50000)::BIGINT AS x, ((i % 13) - 6)::SMALLINT AS w FROM range(2097152) t(i);
+
+# guarded: one VARCHAR key, count(DISTINCT x) and count(*)
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY g)
+----
+41	131072	2097152	3184	3200
+
+query III
+SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY g ORDER BY g LIMIT 3
+----
+https://example.com/model/	3184	50944
+https://example.com/model/00	3200	51200
+https://example.com/model/01	3200	51200
+
+# guarded: one VARCHAR key, count(DISTINCT x) beside sum, count and avg of other columns
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u, sum(w) AS t, count(w) AS k, avg(s) AS a FROM tg GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(t)::BIGINT, sum(k)::BIGINT, min((a * 1000000)::BIGINT), max((a * 1000000)::BIGINT) FROM (SELECT g, count(DISTINCT x) AS u, sum(w) AS t, count(w) AS k, avg(s) AS a FROM tg GROUP BY g)
+----
+41	131072	-20	2097152	2970000	3030000
+
+query IIIII
+SELECT g, u, t::BIGINT, k, (a * 1000000)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(w) AS t, count(w) AS k, avg(s) AS a FROM tg GROUP BY g) ORDER BY g LIMIT 3
+----
+https://example.com/model/	3184	-11	50944	3010050
+https://example.com/model/00	3200	-4	51200	2995000
+https://example.com/model/01	3200	-2	51200	3000000
+
+# guarded: a SMALLINT key beside the VARCHAR key, count(DISTINCT x) and count(*)
+query II
+EXPLAIN (FORMAT JSON) SELECT s, g, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY s, g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, min(u), max(u) FROM (SELECT s, g, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY s, g)
+----
+287	131072	2097152	448	480
+
+# control: the VARCHAR key alone keeps the gid path
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM tg GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*gid_keys=1.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u FROM tg GROUP BY g)
+----
+41	131072	3184	3200
+
+# control: the SMALLINT-key mixed shape keeps the mixed fold's path
+query II
+EXPLAIN (FORMAT JSON) SELECT s, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY s
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, min(u), max(u) FROM (SELECT s, count(DISTINCT x) AS u, count(*) AS c FROM tg GROUP BY s)
+----
+7	131072	2097152	18688	18752

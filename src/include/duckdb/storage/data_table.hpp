@@ -296,8 +296,9 @@ public:
 	//! AddIndex moves an index to this table's index list.
 	void AddIndex(unique_ptr<Index> index);
 
-	//! Returns a list of the partition stats
-	vector<PartitionStatistics> GetPartitionStats(ClientContext &context);
+	//! Returns a list of the partition stats; with whole_table, one partition for the whole table when its statistics
+	//! are exact and nothing was written since it was loaded, else the list as without it
+	vector<PartitionStatistics> GetPartitionStats(ClientContext &context, bool whole_table = false);
 
 private:
 	//! Verify the new added constraints against current persistent&local data

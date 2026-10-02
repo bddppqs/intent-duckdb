@@ -1,0 +1,362 @@
+# name: test/sql/filter/test_small_in_list_pushdown.test
+# description: Small IN lists and OR chains of equalities on one column pushed into the scan: two to four values and the longer lists that stay a filter, NULL constants, NOT IN, OR chains in either operand order, OR chains over two columns and with a non-equality, integer, decimal, string and date columns with NULL rows, lists combined with other predicates, grouped and ordered with OFFSET, and a parquet scan; the answers are the plain engine answers at threads 8 and 1
+# group: [filter]
+
+statement ok
+CREATE TABLE sil AS SELECT id, CASE WHEN id % 101 = 0 THEN NULL ELSE (id % 17 - 3)::SMALLINT END AS s, (id % 1000)::INTEGER AS i, (id % 13)::BIGINT AS b, CASE WHEN id % 89 = 0 THEN NULL ELSE chr(97 + (id % 11)::INTEGER) END AS v, (id % 700 / 10)::DECIMAL(9,1) AS dm, DATE '2019-07-01' + (id % 45)::INTEGER AS dt, (id % 3)::INTEGER AS k FROM range(250000) t(id)
+
+statement ok
+SET threads = 8
+
+# IN with 2 values
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6)
+----
+29121	3640003608
+
+# IN with 3 values
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6, 11)
+----
+43681	5460130514
+
+# IN with 4 values
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-3, 0, 6, 13)
+----
+58240	7279934028
+
+# IN with 5 values
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-3, 0, 6, 11, 13)
+----
+72800	9100060934
+
+# NULL constants and NOT IN
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (1, NULL)
+----
+14561	1820082664
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s NOT IN (1, 2)
+----
+218402	27300211271
+
+# no row matches
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (100, 200)
+----
+0	NULL
+
+# OR chains
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s = 2
+----
+29122	3640194679
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE 1 = s OR s = 2 OR 5 = s
+----
+43682	5460144873
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s = 2 OR s = 3 OR s = 4 OR s = 5
+----
+72803	9100206981
+
+# OR over two columns and with a non-equality
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR i = 2
+----
+14796	1849348134
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s > 10
+----
+58239	7280051737
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s IS NULL
+----
+17037	2129551714
+
+# integer, bigint, decimal, string and date columns
+query II
+SELECT count(*), sum(id) FROM sil WHERE i IN (7, 70, 700)
+----
+750	93569250
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE b IN (0, 12)
+----
+38461	4807538460
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE dm IN (1.0, 2.5, 69.9)
+----
+1073	134208473
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE v IN ('a', 'k')
+----
+44944	5618022664
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE v = 'b' OR v = 'c'
+----
+44944	5618022528
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE dt IN (DATE '2019-07-02', DATE '2019-08-14')
+----
+11111	1388861101
+
+# combined with other predicates
+query II
+SELECT count(*), sum(id) FROM sil WHERE k = 1 AND s IN (-1, 6) AND b = 5 AND dt >= DATE '2019-07-01' AND dt <= DATE '2019-07-31'
+----
+497	62181641
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6) AND s IN (6, 7)
+----
+14560	1819979646
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6) AND i > 500
+----
+14530	1820125136
+
+# grouped and ordered with OFFSET
+query III
+SELECT i, dt, count(*) AS c FROM sil WHERE k = 2 AND s IN (-1, 6) GROUP BY i, dt ORDER BY c DESC, i, dt LIMIT 10 OFFSET 5
+----
+2	2019-07-18	4
+3	2019-07-09	4
+3	2019-07-24	4
+4	2019-07-15	4
+5	2019-07-06	4
+5	2019-07-21	4
+7	2019-07-03	4
+7	2019-07-18	4
+8	2019-07-09	4
+8	2019-07-24	4
+
+# the surviving rows themselves
+query II
+SELECT id, s FROM sil WHERE s IN (0, 13) ORDER BY id LIMIT 8
+----
+3	0
+16	13
+20	0
+33	13
+37	0
+50	13
+54	0
+67	13
+
+query II
+SELECT id, v FROM sil WHERE v IN ('a', 'b') OR v IS NULL ORDER BY id LIMIT 8
+----
+0	NULL
+1	b
+11	a
+12	b
+22	a
+23	b
+33	a
+34	b
+
+statement ok
+SET threads = 1
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6)
+----
+29121	3640003608
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6, 11)
+----
+43681	5460130514
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-3, 0, 6, 13)
+----
+58240	7279934028
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-3, 0, 6, 11, 13)
+----
+72800	9100060934
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (1, NULL)
+----
+14561	1820082664
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s NOT IN (1, 2)
+----
+218402	27300211271
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (100, 200)
+----
+0	NULL
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s = 2
+----
+29122	3640194679
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE 1 = s OR s = 2 OR 5 = s
+----
+43682	5460144873
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s = 2 OR s = 3 OR s = 4 OR s = 5
+----
+72803	9100206981
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR i = 2
+----
+14796	1849348134
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s > 10
+----
+58239	7280051737
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s = 1 OR s IS NULL
+----
+17037	2129551714
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE i IN (7, 70, 700)
+----
+750	93569250
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE b IN (0, 12)
+----
+38461	4807538460
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE dm IN (1.0, 2.5, 69.9)
+----
+1073	134208473
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE v IN ('a', 'k')
+----
+44944	5618022664
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE v = 'b' OR v = 'c'
+----
+44944	5618022528
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE dt IN (DATE '2019-07-02', DATE '2019-08-14')
+----
+11111	1388861101
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE k = 1 AND s IN (-1, 6) AND b = 5 AND dt >= DATE '2019-07-01' AND dt <= DATE '2019-07-31'
+----
+497	62181641
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6) AND s IN (6, 7)
+----
+14560	1819979646
+
+query II
+SELECT count(*), sum(id) FROM sil WHERE s IN (-1, 6) AND i > 500
+----
+14530	1820125136
+
+query III
+SELECT i, dt, count(*) AS c FROM sil WHERE k = 2 AND s IN (-1, 6) GROUP BY i, dt ORDER BY c DESC, i, dt LIMIT 10 OFFSET 5
+----
+2	2019-07-18	4
+3	2019-07-09	4
+3	2019-07-24	4
+4	2019-07-15	4
+5	2019-07-06	4
+5	2019-07-21	4
+7	2019-07-03	4
+7	2019-07-18	4
+8	2019-07-09	4
+8	2019-07-24	4
+
+query II
+SELECT id, s FROM sil WHERE s IN (0, 13) ORDER BY id LIMIT 8
+----
+3	0
+16	13
+20	0
+33	13
+37	0
+50	13
+54	0
+67	13
+
+query II
+SELECT id, v FROM sil WHERE v IN ('a', 'b') OR v IS NULL ORDER BY id LIMIT 8
+----
+0	NULL
+1	b
+11	a
+12	b
+22	a
+23	b
+33	a
+34	b
+
+require parquet
+
+statement ok
+COPY (SELECT * FROM sil) TO '__TEST_DIR__/test_small_in_list_pushdown.parquet' (FORMAT parquet)
+
+statement ok
+SET threads = 8
+
+# a parquet scan
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE s IN (-1, 6)
+----
+29121	3640003608
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE s = 2 OR s = 9
+----
+29121	3640180017
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE v IN ('c', 'd', 'e')
+----
+67415	8426783540
+
+statement ok
+SET threads = 1
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE s IN (-1, 6)
+----
+29121	3640003608
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE s = 2 OR s = 9
+----
+29121	3640180017
+
+query II
+SELECT count(*), sum(id) FROM read_parquet('__TEST_DIR__/test_small_in_list_pushdown.parquet') WHERE v IN ('c', 'd', 'e')
+----
+67415	8426783540

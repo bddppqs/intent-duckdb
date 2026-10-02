@@ -130,6 +130,11 @@ struct TupleDataChunkState {
 	//! Re-usable arrays used while building buffer space
 	unsafe_vector<reference<TupleDataChunkPart>> chunk_parts;
 	unsafe_vector<pair<idx_t, idx_t>> chunk_part_indices;
+
+	//! the VARCHAR column this append stores verbatim (no heap copy, heap size 0), INVALID_INDEX for none,
+	//! and the buffer owning the bytes its strings point to, which every collection receiving the rows holds
+	column_t borrowed_key_column = DConstants::INVALID_INDEX;
+	buffer_ptr<VectorBuffer> borrowed_owner;
 };
 
 struct SortKeyPayloadState {

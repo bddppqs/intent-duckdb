@@ -1,0 +1,328 @@
+# name: test/sql/aggregate/group/run_channel_fused.test
+# description: The run kind of the fused integer aggregate: a COUNT(*) GROUP BY over one run-eligible integer key
+#              whose plan carries the grouped run channel attaches the kernel in run kind (the EXPLAIN text
+#              kind=run, read from EXPLAIN (FORMAT JSON)); its answers equal the count(k) twin and closed-form
+#              summaries; the refused shapes keep the regular run path. No require line.
+# group: [group]
+
+# t_big: a BIGINT key in runs of 4, its range past 2^32 (no compressed key)
+statement ok
+CREATE TABLE t_big(k BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_big SELECT ((i // 4) * 4294967311)::BIGINT FROM range(2097152) t(i);
+
+# t_int: an INTEGER key in runs of 3 over the full range
+statement ok
+CREATE TABLE t_int(k INTEGER USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_int SELECT ((i // 3) * 7919 % 2147483647)::INTEGER FROM range(2097152) t(i);
+
+# t_small: a SMALLINT key in runs of 5 over 60,000 values (past the perfect-hash range)
+statement ok
+CREATE TABLE t_small(k SMALLINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_small SELECT ((i // 5) % 60000 - 30000)::SMALLINT FROM range(2097152) t(i);
+
+# t_usmall: a USMALLINT key in runs of 7
+statement ok
+CREATE TABLE t_usmall(k USMALLINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_usmall SELECT ((i // 7) % 60000)::USMALLINT FROM range(2097152) t(i);
+
+# t_uint: a UINTEGER key in runs of 2
+statement ok
+CREATE TABLE t_uint(k UINTEGER USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_uint SELECT ((i // 2) * 2654435761 % 4294967291)::UINTEGER FROM range(2097152) t(i);
+
+# t_ubig: a UBIGINT key in runs of 6
+statement ok
+CREATE TABLE t_ubig(k UBIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_ubig SELECT ((i // 6) * 4294967311)::UBIGINT FROM range(2097152) t(i);
+
+# t_straddle: runs of 3,000, 65,535 (the rle_count_t cap), 70,000, 122,880 (a row group), 2,047 and 2,049 rows, then runs of 1,000: every run crossing a vector, a stored entry, a segment or a row-group boundary arrives as several run rows for one key and folds
+statement ok
+CREATE TABLE t_straddle(k BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_straddle SELECT (CASE WHEN i < 3000 THEN 1 WHEN i < 68535 THEN 2 WHEN i < 138535 THEN 3 WHEN i < 261415 THEN 4 WHEN i < 263462 THEN 5 WHEN i < 265511 THEN 6 ELSE 7 + (i - 265511) // 1000 END * 4294967311)::BIGINT FROM range(1200000) t(i);
+
+# t_floor: 2^19 rows, under the 2^20 floor - the regular run path (Run Aggregate alone)
+statement ok
+CREATE TABLE t_floor(k BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_floor SELECT ((i // 4) * 4294967311)::BIGINT FROM range(524288) t(i);
+
+# t_null: a key that can hold NULL - the regular run path (its NULL-bearing vectors take the ordinary scan)
+statement ok
+CREATE TABLE t_null(k BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_null SELECT CASE WHEN i % 100000 = 7 THEN NULL ELSE ((i // 4) * 4294967311)::BIGINT END FROM range(2097152) t(i);
+
+# t_tiny: a TINYINT key: never run kind (the perfect-hash aggregate takes it; the kernel refuses INT8 besides)
+statement ok
+CREATE TABLE t_tiny(k TINYINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_tiny SELECT ((i // 4) % 200 - 100)::TINYINT FROM range(2097152) t(i);
+
+statement ok
+CHECKPOINT;
+
+# ---------------------------------------------------------------------------------------------------------------
+# engaged: the EXPLAIN text kind=run beside the scan-side Run Aggregate; answers against closed-form summaries and the twin
+# ---------------------------------------------------------------------------------------------------------------
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_big GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_big GROUP BY k);
+----
+524288	2097152	4	4	2361178746081516716032	0	2251795526582257
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_big GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_big GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_big GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_big GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_big GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	4
+4294967311	4
+8589934622	4
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_int GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_int GROUP BY k);
+----
+699051	2097152	2	3	2038704583483882	0	2147482339
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_int GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_int GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_int GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_int GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_int GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	3
+5303	3
+6611	3
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_small GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_small GROUP BY k);
+----
+60000	2097152	30	35	-85677465	-30000	29999
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_small GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_small GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_small GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_small GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_small GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+-30000	35
+-29999	35
+-29998	35
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_usmall GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_usmall GROUP BY k);
+----
+60000	2097152	28	35	62828650789	0	59999
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_usmall GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_usmall GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_usmall GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_usmall GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_usmall GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	35
+1	35
+2	35
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_uint GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_uint GROUP BY k);
+----
+1048576	2097152	2	2	4503605965951766	0	4294964468
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_uint GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_uint GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_uint GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_uint GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_uint GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	2
+11429	2
+14252	2
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_ubig GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_ubig GROUP BY k);
+----
+349526	2097152	2	6	1574117662857326755850	0	1501198449377275
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_ubig GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_ubig GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_ubig GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_ubig GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_ubig GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+0	6
+4294967311	6
+8589934622	6
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_straddle GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_straddle GROUP BY k);
+----
+941	1200000	489	122880	1905106916289576348	4294967311	4041564239651
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_straddle GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_straddle GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_straddle GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_straddle GROUP BY k));
+----
+0
+
+query II
+SELECT k, count(*) AS c FROM t_straddle GROUP BY k ORDER BY c DESC, k LIMIT 3;
+----
+17179869244	122880
+12884901933	70000
+8589934622	65535
+
+query II
+SELECT k, count(*) AS c FROM t_straddle GROUP BY k ORDER BY k LIMIT 8;
+----
+4294967311	3000
+8589934622	65535
+12884901933	70000
+17179869244	122880
+21474836555	2047
+25769803866	2049
+30064771177	1000
+34359738488	1000
+
+query III
+SELECT count(*), sum(c1), sum(c2) FROM (SELECT k, count(*) AS c1, count(*) + 1 AS c2 FROM t_big GROUP BY k HAVING count(*) > 3);
+----
+524288	2097152	2621440
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c1, count(*) AS c2 FROM t_big GROUP BY k;
+----
+physical_plan	<REGEX>:.*kind=run.*
+
+query III
+SELECT count(*), sum(c1), sum(c2) FROM (SELECT k, count(*) AS c1, count(*) AS c2 FROM t_big GROUP BY k);
+----
+524288	2097152	2097152
+
+# ---------------------------------------------------------------------------------------------------------------
+# refused: no kind=run marker; the answers equal the twin all the same
+# ---------------------------------------------------------------------------------------------------------------
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_floor GROUP BY k;
+----
+physical_plan	<!REGEX>:.*kind=run.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_floor GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_floor GROUP BY k);
+----
+131072	524288	4	4	147572827205161713664	0	562945660420081
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_floor GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_floor GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_floor GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_floor GROUP BY k));
+----
+0
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_null GROUP BY k;
+----
+physical_plan	<!REGEX>:.*kind=run.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_null GROUP BY k;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_null GROUP BY k);
+----
+524289	2097152	3	21	2361156197412939652501	0	2251795526582257
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_null GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_null GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_null GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_null GROUP BY k));
+----
+2
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM t_tiny GROUP BY k;
+----
+physical_plan	<!REGEX>:.*kind=run.*
+
+query IIIIIII
+SELECT count(*), sum(c), min(c), max(c), sum(k::HUGEINT * c), min(k), max(k) FROM (SELECT k, count(*) AS c FROM t_tiny GROUP BY k);
+----
+200	2097152	10484	10488	-1068288	-100	99
+
+query I
+SELECT count(*) FROM ((SELECT k, count(*) AS c FROM t_tiny GROUP BY k EXCEPT ALL SELECT k, count(k) AS c FROM t_tiny GROUP BY k) UNION ALL (SELECT k, count(k) AS c FROM t_tiny GROUP BY k EXCEPT ALL SELECT k, count(*) AS c FROM t_tiny GROUP BY k));
+----
+0
+
+# count(k) over a key that can hold NULL stays the unary aggregate, which never carries the run channel (over a key
+# without NULLs the planner turns count(k) into count_star())
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(k) AS c FROM t_null GROUP BY k;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*

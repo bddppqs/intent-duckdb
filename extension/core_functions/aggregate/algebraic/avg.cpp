@@ -100,6 +100,11 @@ static T GetAverageDivident(uint64_t count, optional_ptr<FunctionData> bind_data
 }
 
 struct IntegerAverageOperation : public BaseSumOperation<AverageSetOperation, RegularAdd> {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void RunOperation(STATE &state, const INPUT_TYPE &input, idx_t count) {
+		RunOperationInternal<INPUT_TYPE, STATE, OP>(state, input, count);
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
@@ -112,6 +117,11 @@ struct IntegerAverageOperation : public BaseSumOperation<AverageSetOperation, Re
 };
 
 struct IntegerAverageOperationHugeint : public BaseSumOperation<AverageSetOperation, AddToHugeint> {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void RunOperation(STATE &state, const INPUT_TYPE &input, idx_t count) {
+		RunOperationInternal<INPUT_TYPE, STATE, OP>(state, input, count);
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {

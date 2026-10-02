@@ -20,6 +20,8 @@ struct DataTableInfo {
 
 public:
 	DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p, string schema, string table);
+	//! Out of line, non-virtual: releases the table's global dictionaries without changing the class layout
+	~DataTableInfo();
 
 	//! Bind unknown indexes throwing an exception if binding fails.
 	//! Only binds the specified index type, or all, if nullptr.

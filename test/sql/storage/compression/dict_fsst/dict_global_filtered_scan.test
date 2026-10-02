@@ -1,0 +1,76 @@
+# name: test/sql/storage/compression/dict_fsst/dict_global_filtered_scan.test
+# description: A grouping scan estimated to read below gate_share of the table's rows builds and emits no global dictionary; every answer equals the per-segment scan, before and after another scan publishes the column
+# group: [dict_fsst]
+
+# site_id = <n> is estimated at 280 of 400,000 rows (below 0.01 of the table), so its grouping scans are gated whatever the column's size (no build, the per-segment vectors); flag = 1 is estimated at 200,000 rows, so its scan builds and publishes label, and the gated scans then read a published column
+
+statement ok
+ATTACH '__TEST_DIR__/dict_global_filtered_scan.db' AS globaldict (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE globaldict
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE docs AS SELECT i AS id, (i // 100)::INTEGER AS site_id, (i % 2)::TINYINT AS flag, CASE WHEN i % 7 = 0 THEN '' ELSE 'topic-of-the-page-number-' || (i % 5003)::VARCHAR END AS label FROM range(400000) r(i)
+
+statement ok
+CHECKPOINT
+
+# the gated scans before any build (site_id = 1228 straddles the row-group boundary at 122,880)
+
+query II
+SELECT label, count(*) AS c FROM docs WHERE site_id = 62 AND label <> '' GROUP BY label ORDER BY c DESC, label LIMIT 5
+----
+topic-of-the-page-number-1197	1
+topic-of-the-page-number-1198	1
+topic-of-the-page-number-1200	1
+topic-of-the-page-number-1201	1
+topic-of-the-page-number-1202	1
+
+query IIII
+SELECT count(*), count(DISTINCT label), min(label), max(label) FROM docs WHERE site_id = 1228
+----
+100	86	(empty)	topic-of-the-page-number-2826
+
+query III
+SELECT site_id, count(*), sum(c) FROM (SELECT site_id, label, count(*) AS c FROM docs WHERE site_id = 1229 GROUP BY ALL) GROUP BY site_id
+----
+1229	87	100
+
+# a scan estimated at half the table builds and publishes label
+
+query II
+SELECT label, count(*) AS c FROM docs WHERE flag = 1 GROUP BY label ORDER BY c DESC, label LIMIT 3
+----
+(empty)	28571
+topic-of-the-page-number-1002	35
+topic-of-the-page-number-1006	35
+
+# the gated scans over the published column: still the per-segment vectors, the same answers
+
+query II
+SELECT label, count(*) AS c FROM docs WHERE site_id = 62 AND label <> '' GROUP BY label ORDER BY c DESC, label LIMIT 5
+----
+topic-of-the-page-number-1197	1
+topic-of-the-page-number-1198	1
+topic-of-the-page-number-1200	1
+topic-of-the-page-number-1201	1
+topic-of-the-page-number-1202	1
+
+query IIII
+SELECT count(*), count(DISTINCT label), min(label), max(label) FROM docs WHERE site_id = 1228
+----
+100	86	(empty)	topic-of-the-page-number-2826
+
+query III
+SELECT site_id, count(*), sum(c) FROM (SELECT site_id, label, count(*) AS c FROM docs WHERE site_id = 1229 GROUP BY ALL) GROUP BY site_id
+----
+1229	87	100
+
+query IIII
+SELECT count(*), sum(c), min(label), max(label) FROM (SELECT label, count(*) AS c FROM docs GROUP BY label)
+----
+5004	400000	(empty)	topic-of-the-page-number-999

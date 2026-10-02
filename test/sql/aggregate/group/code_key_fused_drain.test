@@ -1,0 +1,110 @@
+# name: test/sql/aggregate/group/code_key_fused_drain.test
+# description: Code-typed group keys over the fused kernel's drain: every coded fused shape class at >= 2^20 rows matches the general path
+# group: [group]
+
+# The fused integer kernel over a code key (the group key typed as its INTEGER global code) at 1,100,000 rows, the
+# kernel's 2^20-row minimum passed: the 4-byte key (addr), the 5-byte key (a compressed SMALLINT beside the
+# word code), the 12-byte two-key (a BIGINT beside the word code) and the DISTINCT class (the word
+# code with count(DISTINCT BIGINT)). Every answer is the same whether or not the kernel drains (a drain budget
+# small enough that every shape crosses its threshold, or a failed slab allocation, forces one); without either
+# the kernel does not drain. The first pass plans
+# before the dictionaries are published (the general route); every later pass is code-typed. The expected values are the
+# general aggregate's on the same table.
+
+statement ok
+ATTACH '__TEST_DIR__/code_key_fused_drain.db' AS draindb (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE draindb
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE docs AS SELECT (i % 13)::SMALLINT AS cat, (hash(i % 400009) % 4000000000000)::BIGINT AS owner, 'https://www.example.org/globaldict/drain/path/' || (hash(i // 2) % 150000)::VARCHAR AS addr, CASE WHEN i % 5 = 0 THEN '' ELSE 'catalogue item number ' || (hash(i // 3) % 40000)::VARCHAR END AS word FROM range(1100000) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+SET threads=8
+
+loop pass 0 2
+
+# 4-byte code key
+query III
+SELECT count(*), sum(c), sum(hash(u, c)) FROM (SELECT addr AS u, count(*) AS c FROM docs GROUP BY addr)
+----
+145976	1100000	1344746567320868363745927
+
+# 5-byte key: cat (compressed to UTINYINT) and the word code
+query III
+SELECT count(*), sum(c), sum(hash(s, p, c)) FROM (SELECT cat AS s, word AS p, count(*) AS c FROM docs GROUP BY cat, word)
+----
+425070	1100000	3922152257743433674515328
+
+# 12-byte two-key: owner (a BIGINT past 2^32) and the word code
+query III
+SELECT count(*), sum(c), sum(hash(u, p, c)) FROM (SELECT owner AS u, word AS p, count(*) AS c FROM docs GROUP BY owner, word)
+----
+1099978	1100000	10141990614449323499335182
+
+# the DISTINCT class: the word code with count(DISTINCT owner)
+query III
+SELECT count(*), sum(n), sum(hash(p, n)) FROM (SELECT word AS p, count(DISTINCT owner) AS n FROM docs GROUP BY word)
+----
+39997	1099978	369377223864511307846880
+
+endloop
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 3
+----
+https://www.example.org/globaldict/drain/path/393	30
+https://www.example.org/globaldict/drain/path/145184	28
+https://www.example.org/globaldict/drain/path/23770	28
+
+query III
+SELECT cat, word, count(*) AS c FROM docs GROUP BY cat, word ORDER BY c DESC, cat, word LIMIT 3
+----
+0	(empty)	16924
+1	(empty)	16923
+2	(empty)	16923
+
+query III
+SELECT owner * 10, word, count(*) AS c FROM docs GROUP BY owner, word ORDER BY c DESC, owner, word LIMIT 3
+----
+27719176920	catalogue item number 1743	2
+4433544144570	catalogue item number 24670	2
+6467269828770	catalogue item number 2824	2
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs GROUP BY word ORDER BY u DESC, word LIMIT 3
+----
+(empty)	220000
+catalogue item number 18215	60
+catalogue item number 39554	58
+
+# one thread: every drain is the crossing thread's own
+statement ok
+SET threads=1
+
+query III
+SELECT count(*), sum(c), sum(hash(u, c)) FROM (SELECT addr AS u, count(*) AS c FROM docs GROUP BY addr)
+----
+145976	1100000	1344746567320868363745927
+
+query III
+SELECT count(*), sum(c), sum(hash(s, p, c)) FROM (SELECT cat AS s, word AS p, count(*) AS c FROM docs GROUP BY cat, word)
+----
+425070	1100000	3922152257743433674515328
+
+query III
+SELECT count(*), sum(c), sum(hash(u, p, c)) FROM (SELECT owner AS u, word AS p, count(*) AS c FROM docs GROUP BY owner, word)
+----
+1099978	1100000	10141990614449323499335182
+
+query III
+SELECT count(*), sum(n), sum(hash(p, n)) FROM (SELECT word AS p, count(DISTINCT owner) AS n FROM docs GROUP BY word)
+----
+39997	1099978	369377223864511307846880

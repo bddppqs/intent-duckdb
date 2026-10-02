@@ -11,6 +11,7 @@
 #include "duckdb/common/types/row/tuple_data_layout.hpp"
 #include "duckdb/common/types/row/tuple_data_segment.hpp"
 #include "duckdb/common/types/row/tuple_data_states.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 
@@ -152,6 +153,9 @@ public:
 	//! Scatters the given Vector to the given column id to the rows in the specified Chunk state
 	void Scatter(TupleDataChunkState &chunk_state, const Vector &source, const column_t column_id,
 	             const SelectionVector &append_sel, const idx_t append_count) const;
+	//! Store a borrowed string column verbatim (no heap)
+	void GlobalDictionaryScatterBorrowed(TupleDataChunkState &chunk_state, const column_t column_id,
+	                                     const SelectionVector &append_sel, const idx_t append_count) const;
 	//! Copy rows from input to the built Chunk state
 	void CopyRows(TupleDataChunkState &chunk_state, TupleDataChunkState &input, const SelectionVector &append_sel,
 	              const idx_t append_count) const;
@@ -167,6 +171,15 @@ public:
 	void Combine(TupleDataCollection &other);
 	//! Appends the other TupleDataCollection to this, destroying the other data collection
 	void Combine(unique_ptr<TupleDataCollection> other);
+	//! Hold the owner of borrowed string bytes for as long as this collection's rows live - at most once per
+	//! owner, keyed by identity; returns whether it was added
+	bool HoldBorrowedOwner(const buffer_ptr<VectorBuffer> &owner);
+	//! Hold every owner `other` holds (rows were copied from it), each at most once
+	void HoldBorrowedOwners(const TupleDataCollection &other);
+	//! The owners held
+	const vector<buffer_ptr<VectorBuffer>> &HeldStringOwners() const {
+		return held_owners;
+	}
 	//! Resets the TupleDataCollection, clearing all data
 	void Reset();
 
@@ -285,6 +298,10 @@ private:
 	idx_t data_size;
 	//! The data segments of the TupleDataCollection
 	unsafe_arena_vector<unsafe_arena_ptr<TupleDataSegment>> segments;
+	//! The owners of string bytes this collection's rows point to without a heap copy
+	vector<buffer_ptr<VectorBuffer>> held_owners;
+	//! The identities of the owners held (one entry per distinct owner)
+	unordered_set<const VectorBuffer *> held_owner_ids;
 	//! The set of scatter functions
 	unsafe_arena_vector<TupleDataScatterFunction> scatter_functions;
 	//! The set of gather functions

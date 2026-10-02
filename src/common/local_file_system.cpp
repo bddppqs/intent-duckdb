@@ -586,6 +586,31 @@ bool LocalFileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_
 #endif
 }
 
+bool LocalFileSystem::ReadAheadHint(FileHandle &handle, idx_t location, idx_t nr_bytes) {
+#if defined(__linux__)
+	auto unix_handle = dynamic_cast<UnixFileHandle *>(&handle);
+	if (!unix_handle || unix_handle->fd < 0 || nr_bytes == 0) {
+		return false;
+	}
+	return posix_fadvise(unix_handle->fd, UnsafeNumericCast<off_t>(location), UnsafeNumericCast<off_t>(nr_bytes),
+	                     POSIX_FADV_WILLNEED) == 0;
+#else
+	return false;
+#endif
+}
+
+bool LocalFileSystem::RandomAccessHint(FileHandle &handle) {
+#if defined(__linux__)
+	auto unix_handle = dynamic_cast<UnixFileHandle *>(&handle);
+	if (!unix_handle || unix_handle->fd < 0) {
+		return false;
+	}
+	return posix_fadvise(unix_handle->fd, 0, 0, POSIX_FADV_RANDOM) == 0;
+#else
+	return false;
+#endif
+}
+
 int64_t LocalFileSystem::GetFileSize(FileHandle &handle) {
 	const auto file_metadata = Stats(handle);
 	return file_metadata.file_size;
@@ -1206,6 +1231,14 @@ int64_t LocalFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_byte
 
 bool LocalFileSystem::Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) {
 	// TODO: Not yet implemented on windows.
+	return false;
+}
+
+bool LocalFileSystem::ReadAheadHint(FileHandle &handle, idx_t location, idx_t nr_bytes) {
+	return false;
+}
+
+bool LocalFileSystem::RandomAccessHint(FileHandle &handle) {
 	return false;
 }
 

@@ -70,6 +70,9 @@ void PartitionedTupleData::AppendUnified(PartitionedTupleDataAppendState &state,
 		const auto size_before = partition.data_size;
 		partition.AppendUnified(partition_pin_state, state.chunk_state, input, append_sel, actual_append_count);
 		data_size += partition.data_size - size_before;
+		if (state.chunk_state.borrowed_key_column != DConstants::INVALID_INDEX) {
+			partition.HoldBorrowedOwner(state.chunk_state.borrowed_owner);
+		}
 	} else {
 		// Compute the heap sizes for the whole chunk
 		if (!layout.AllConstant()) {
@@ -81,6 +84,11 @@ void PartitionedTupleData::AppendUnified(PartitionedTupleDataAppendState &state,
 
 		// Now scatter everything in one go
 		partitions[0]->Scatter(state.chunk_state, input, state.partition_sel, actual_append_count);
+		if (state.chunk_state.borrowed_key_column != DConstants::INVALID_INDEX) {
+			for (auto &partition : partitions) {
+				partition->HoldBorrowedOwner(state.chunk_state.borrowed_owner);
+			}
+		}
 	}
 
 	count += actual_append_count;
@@ -230,6 +238,23 @@ void PartitionedTupleData::BuildBufferSpace(PartitionedTupleDataAppendState &sta
 	}
 }
 
+void PartitionedTupleData::MarkReceivedOwners(PartitionedTupleDataAppendState &state, vector<bool> &received) const {
+	if (UseFixedSizeMap()) {
+		MarkReceivedOwners<true>(state, received);
+	} else {
+		MarkReceivedOwners<false>(state, received);
+	}
+}
+
+template <bool fixed>
+void PartitionedTupleData::MarkReceivedOwners(PartitionedTupleDataAppendState &state, vector<bool> &received) {
+	using GETTER = TemplatedMapGetter<list_entry_t, fixed>;
+	const auto &partition_entries = state.GetMap<fixed>();
+	for (auto it = partition_entries.begin(); it != partition_entries.end(); ++it) {
+		received[GETTER::GetKey(it)] = true;
+	}
+}
+
 void PartitionedTupleData::FlushAppendState(PartitionedTupleDataAppendState &state) {
 	for (idx_t partition_index = 0; partition_index < partitions.size(); partition_index++) {
 		auto &partition = *partitions[partition_index];
@@ -291,6 +316,13 @@ void PartitionedTupleData::Repartition(ClientContext &context, PartitionedTupleD
 		auto &partition = *partitions[partition_idx];
 
 		if (partition.Count() > 0) {
+			// rows copied without their heap still point at the owners' bytes: the targets that received
+			// this partition's rows (and only those) hold its owners, each at most once
+			const auto has_owners = !partition.HeldStringOwners().empty();
+			vector<bool> received;
+			if (has_owners) {
+				received.resize(new_partitioned_data.partitions.size(), false);
+			}
 			TupleDataChunkIterator iterator(partition, TupleDataPinProperties::DESTROY_AFTER_DONE, true);
 			auto &chunk_state = iterator.GetChunkState();
 			do {
@@ -299,7 +331,15 @@ void PartitionedTupleData::Repartition(ClientContext &context, PartitionedTupleD
 					throw InterruptException();
 				}
 				new_partitioned_data.Append(append_state, chunk_state, iterator.GetCurrentChunkCount());
+				if (has_owners) {
+					new_partitioned_data.MarkReceivedOwners(append_state, received);
+				}
 			} while (iterator.Next());
+			for (idx_t target_idx = 0; target_idx < received.size(); target_idx++) {
+				if (received[target_idx]) {
+					new_partitioned_data.partitions[target_idx]->HoldBorrowedOwners(partition);
+				}
+			}
 
 			RepartitionFinalizeStates(*this, new_partitioned_data, append_state, partition_idx);
 		}

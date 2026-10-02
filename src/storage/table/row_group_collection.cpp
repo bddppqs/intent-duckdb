@@ -22,6 +22,13 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -142,6 +149,8 @@ void RowGroupCollection::Initialize(PersistentTableData &data) {
 	metadata_pointers = data.read_metadata_pointers;
 	owned_row_groups->Initialize(data, metadata_pointers);
 	stats.Initialize(types, data);
+	stats_exact = data.stats_exact;
+	exact_since_load = data.stats_exact;
 }
 
 void RowGroupCollection::FinalizeCheckpoint(MetaBlockPointer pointer,
@@ -171,6 +180,8 @@ void RowGroupCollection::SetRowGroupAppendMode(RowGroupAppendMode mode) {
 
 void RowGroupCollection::InitializeEmpty() {
 	stats.InitializeEmpty(types);
+	// No rows, empty statistics: exact (appends keep them exact, see Append and MergeStorage)
+	stats_exact = true;
 }
 
 ColumnDataType GetColumnDataType(idx_t row_start) {
@@ -274,6 +285,59 @@ bool RowGroupCollection::InitializeScanInRowGroup(ClientContext &context, Collec
 	return row_group.GetNode().InitializeScanWithOffset(state, row_group, vector_index);
 }
 
+//===--------------------------------------------------------------------===//
+// Row-group pieces in pipelines without a batch index
+//===--------------------------------------------------------------------===//
+//! In a parallel scan whose pipeline sink requires no batch index and is not order-dependent, each of the first
+//! NumberOfThreads() admitted row groups of more than 30720 rows is split into min(4, ceil(rows / 30720)) pieces of 15
+//! vectors (the last the remainder): the taker scans piece 0, the rest are queued, and every task drains the queue
+//! before taking a new row group. Off, the standard hand-out and InitLocalState run.
+bool ParallelCollectionScanState::PiecesEnabled() {
+	return kRowGroupPieces;
+}
+
+static constexpr idx_t ROW_GROUP_PIECE_ROWS = 15 * STANDARD_VECTOR_SIZE;
+static constexpr idx_t ROW_GROUP_MAX_PIECES = 4;
+
+void ParallelCollectionScanState::DecidePieces(ClientContext &context, bool allowed) {
+	if (!PiecesEnabled()) {
+		return;
+	}
+	lock_guard<mutex> l(lock);
+	if (pieces_decided) {
+		return;
+	}
+	pieces_decided = true;
+	donation_cap = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	pieces_allowed = allowed && !reorderer && donation_cap > 1;
+}
+
+//! Split the admitted row group [row_start, max_row) that the taker's scan state was just initialised on at
+//! vector 0: queue pieces 1 .. n - 1 and narrow the taker's scan to piece 0 ([0, 15) vectors)
+static void DonatePieces(ParallelCollectionScanState &state, CollectionScanState &scan_state,
+                         RowGroupCollection &collection, SegmentNode<RowGroup> &row_group, idx_t max_row) {
+	auto row_start = row_group.GetRowStart();
+	auto rows = max_row - row_start;
+	auto piece_count = MinValue<idx_t>(ROW_GROUP_MAX_PIECES, (rows + ROW_GROUP_PIECE_ROWS - 1) / ROW_GROUP_PIECE_ROWS);
+	{
+		lock_guard<mutex> l(state.lock);
+		if (state.donated >= state.donation_cap) {
+			return;
+		}
+		state.donated++;
+		for (idx_t piece = 1; piece < piece_count; piece++) {
+			auto vector_index = piece * (ROW_GROUP_PIECE_ROWS / STANDARD_VECTOR_SIZE);
+			if (vector_index * STANDARD_VECTOR_SIZE >= rows) {
+				break;
+			}
+			auto piece_end = piece + 1 == piece_count ? max_row : row_start + (piece + 1) * ROW_GROUP_PIECE_ROWS;
+			state.pieces.push_back(ParallelScanPiece {&collection, &row_group, vector_index, piece_end});
+		}
+	}
+	scan_state.max_row = row_start + ROW_GROUP_PIECE_ROWS;
+	scan_state.max_row_group_row = ROW_GROUP_PIECE_ROWS;
+}
+
 void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
 	state.collection = this;
 	state.row_groups = GetRowGroups();
@@ -282,6 +346,11 @@ void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &sta
 	state.max_row = state.row_groups->GetBaseRowId() + total_rows;
 	state.batch_index = 0;
 	state.processed_rows = 0;
+	state.pieces_decided = false;
+	state.pieces_allowed = false;
+	state.donation_cap = 0;
+	state.donated = 0;
+	state.pieces.clear();
 }
 
 bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollectionScanState &state,
@@ -292,37 +361,49 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 		idx_t max_row;
 		optional_ptr<RowGroupCollection> collection;
 		optional_ptr<SegmentNode<RowGroup>> row_group;
+		bool may_donate = false;
 		{
 			// select the next row group to scan from the parallel state
 			lock_guard<mutex> l(state.lock);
-			if (!state.current_row_group) {
-				// no more data left to scan
-				break;
-			}
-			auto &current_row_group = state.current_row_group->GetNode();
-			if (current_row_group.count == 0) {
-				break;
-			}
-			auto row_start = state.current_row_group->GetRowStart();
-			collection = state.collection;
-			row_group = state.current_row_group;
-			if (ClientConfig::GetConfig(context).verify_parallelism) {
-				vector_index = state.vector_index;
-				max_row = row_start + MinValue<idx_t>(current_row_group.count,
-				                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
-				D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
-				state.vector_index++;
-				if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
-					state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
-					state.vector_index = 0;
-				}
+			if (!state.pieces.empty()) {
+				auto &next = state.pieces.back();
+				collection = next.collection;
+				row_group = next.row_group;
+				vector_index = next.vector_index;
+				max_row = next.max_row;
+				state.pieces.pop_back();
 			} else {
-				state.processed_rows += current_row_group.count;
-				vector_index = 0;
-				max_row = row_start + current_row_group.count;
-				state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+				if (!state.current_row_group) {
+					// no more data left to scan
+					break;
+				}
+				auto &current_row_group = state.current_row_group->GetNode();
+				if (current_row_group.count == 0) {
+					break;
+				}
+				auto row_start = state.current_row_group->GetRowStart();
+				collection = state.collection;
+				row_group = state.current_row_group;
+				if (ClientConfig::GetConfig(context).verify_parallelism) {
+					vector_index = state.vector_index;
+					max_row = row_start + MinValue<idx_t>(current_row_group.count,
+					                                      STANDARD_VECTOR_SIZE * state.vector_index + STANDARD_VECTOR_SIZE);
+					D_ASSERT(vector_index * STANDARD_VECTOR_SIZE < current_row_group.count);
+					state.vector_index++;
+					if (state.vector_index * STANDARD_VECTOR_SIZE >= current_row_group.count) {
+						state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+						state.vector_index = 0;
+					}
+				} else {
+					state.processed_rows += current_row_group.count;
+					vector_index = 0;
+					max_row = row_start + current_row_group.count;
+					state.current_row_group = state.GetNextRowGroup(*state.row_groups, *row_group).get();
+					may_donate = state.pieces_allowed;
+				}
+				max_row = MinValue<idx_t>(max_row, state.max_row);
+				may_donate = may_donate && max_row - row_start > ROW_GROUP_PIECE_ROWS;
 			}
-			max_row = MinValue<idx_t>(max_row, state.max_row);
 			scan_state.batch_index = ++state.batch_index;
 		}
 		D_ASSERT(collection);
@@ -334,6 +415,9 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 		if (!need_to_scan) {
 			// skip this row group
 			continue;
+		}
+		if (may_donate) {
+			DonatePieces(state, scan_state, *collection, *row_group, max_row);
 		}
 		return true;
 	}
@@ -493,6 +577,8 @@ bool RowGroupCollection::IsEmpty() const {
 }
 
 void RowGroupCollection::InitializeAppend(TransactionData transaction, TableAppendState &state) {
+	// Appended rows keep the statistics exact, but are not visible to every transaction
+	exact_since_load = false;
 	state.row_start = UnsafeNumericCast<row_t>(total_rows.load());
 	state.current_row = state.row_start;
 	state.total_append_count = 0;
@@ -646,6 +732,9 @@ void RowGroupCollection::CommitAppend(transaction_t commit_id, idx_t row_start, 
 }
 
 void RowGroupCollection::RevertAppendInternal(idx_t new_end_idx) {
+	// The statistics keep the reverted rows' values
+	stats_exact = false;
+	exact_since_load = false;
 	auto row_groups = GetRowGroups();
 
 	auto l = row_groups->Lock();
@@ -713,6 +802,11 @@ bool RowGroupCollection::IsPersistent() const {
 void RowGroupCollection::MergeStorage(RowGroupCollection &data, optional_ptr<DataTable> table,
                                       optional_ptr<StorageCommitState> commit_state) {
 	D_ASSERT(data.types == types);
+	// The merged statistics are exact only if the merged collection's are (a transaction-local update widens them)
+	exact_since_load = false;
+	if (!data.StatsExact()) {
+		stats_exact = false;
+	}
 	auto segments = data.GetRowGroups()->MoveSegments();
 	auto row_groups = GetRowGroups();
 	auto start_index = row_groups->GetBaseRowId() + total_rows.load();
@@ -769,6 +863,9 @@ void RowGroupCollection::MergeStorage(RowGroupCollection &data, optional_ptr<Dat
 // Delete
 //===--------------------------------------------------------------------===//
 idx_t RowGroupCollection::Delete(TransactionData transaction, DataTable &table, row_t *ids, idx_t count) {
+	// Total_rows keeps the deleted rows and the statistics their values (also if the delete is rolled back)
+	stats_exact = false;
+	exact_since_load = false;
 	idx_t delete_count = 0;
 	// delete is in the row groups
 	// we need to figure out for each id to which row group it belongs
@@ -831,6 +928,9 @@ optional_ptr<SegmentNode<RowGroup>> RowGroupCollection::NextUpdateRowGroup(RowGr
 
 void RowGroupCollection::Update(TransactionData transaction, DataTable &data_table, row_t *ids,
                                 const vector<PhysicalIndex> &column_ids, DataChunk &updates) {
+	// An update widens the statistics (also if it is rolled back)
+	stats_exact = false;
+	exact_since_load = false;
 	D_ASSERT(updates.size() >= 1);
 	idx_t pos = 0;
 	auto row_groups = GetRowGroups();
@@ -1089,6 +1189,9 @@ void RowGroupCollection::RemoveFromIndexes(const QueryContext &context, TableInd
 
 void RowGroupCollection::UpdateColumn(TransactionData transaction, DataTable &data_table, Vector &row_ids,
                                       const vector<column_t> &column_path, DataChunk &updates) {
+	// As Update
+	stats_exact = false;
+	exact_since_load = false;
 	D_ASSERT(updates.size() >= 1);
 	auto ids = FlatVector::GetData<row_t>(row_ids);
 	idx_t pos = 0;
@@ -1206,6 +1309,8 @@ struct VacuumState {
 	idx_t row_start = 0;
 	idx_t next_vacuum_idx = 0;
 	vector<optional_idx> row_group_counts;
+	//! Per row group: every row is already on disk unchanged (RowGroup::IsUnchangedOnDisk)
+	vector<bool> unchanged_on_disk;
 };
 
 class VacuumTask : public BaseCheckpointTask {
@@ -1382,6 +1487,7 @@ void RowGroupCollection::InitializeVacuumState(CollectionCheckpointState &checkp
 	for (auto &entry : checkpoint_state.row_groups.SegmentNodes()) {
 		auto &row_group = entry.GetNode();
 		auto row_group_count = row_group.GetCommittedRowCount();
+		state.unchanged_on_disk.push_back(row_group.IsUnchangedOnDisk());
 		if (!state.can_change_row_ids) {
 			idx_t total_count = row_group.count;
 			committed_counts.emplace_back(row_group_count);
@@ -1509,6 +1615,23 @@ bool RowGroupCollection::ScheduleVacuumTasks(CollectionCheckpointState &checkpoi
 	if (!perform_merge) {
 		return false;
 	}
+	// a merge whose row groups are all already on disk unchanged (no deletes, no rows held in memory, no updates) would
+	// rewrite data that is already written only to reduce the row group count - e.g. the partial row groups a parallel
+	// bulk insert has just written: skip it. Merges that reclaim deleted rows or pack rows held in memory still run, and
+	// rewrite any unchanged row group they include.
+	bool rewrites_only_unchanged = true;
+	for (idx_t idx = segment_idx; idx < next_idx; idx++) {
+		if (state.row_group_counts[idx].IsValid() && state.row_group_counts[idx].GetIndex() == 0) {
+			continue;
+		}
+		if (!state.unchanged_on_disk[idx]) {
+			rewrites_only_unchanged = false;
+			break;
+		}
+	}
+	if (rewrites_only_unchanged) {
+		return false;
+	}
 	// schedule the vacuum task
 	DUCKDB_LOG(checkpoint_state.writer.GetDatabase(), CheckpointLogType, GetAttached(), *info, segment_idx, merge_count,
 	           target_count, merge_rows, state.row_start);
@@ -1536,6 +1659,8 @@ unique_ptr<CheckpointTask> RowGroupCollection::GetCheckpointTask(CollectionCheck
 
 void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &global_stats) {
 	auto row_groups = GetRowGroups();
+	// a checkpoint starts a new storage epoch (a later scan builds the column dictionaries anew)
+	dict_global::BumpEpoch(info);
 
 	CollectionCheckpointState checkpoint_state(*this, writer, global_stats, *row_groups);
 
@@ -1942,6 +2067,42 @@ void RowGroupCollection::CommitDropTable() {
 //===--------------------------------------------------------------------===//
 // GetPartitionStats
 //===--------------------------------------------------------------------===//
+bool RowGroupCollection::TryGetExactLoadedCount(idx_t &count) const {
+	if (!exact_since_load) {
+		return false;
+	}
+	count = total_rows.load();
+	// a write clears the flag before it changes total_rows: the flag still set means the count was read before any
+	return exact_since_load;
+}
+
+void RowGroupCollection::ReadAheadColumnMetadata(const vector<storage_t> &columns) {
+	vector<storage_t> to_issue;
+	{
+		lock_guard<mutex> guard(metadata_read_ahead_lock);
+		if (metadata_read_ahead_issued.size() < types.size()) {
+			metadata_read_ahead_issued.resize(types.size(), false);
+		}
+		for (auto c : columns) {
+			if (c < metadata_read_ahead_issued.size() && !metadata_read_ahead_issued[c]) {
+				metadata_read_ahead_issued[c] = true;
+				to_issue.push_back(c);
+			}
+		}
+	}
+	if (to_issue.empty()) {
+		return;
+	}
+	vector<MetaBlockPointer> pointers;
+	auto row_groups = GetRowGroups();
+	for (auto &entry : row_groups->SegmentNodes()) {
+		entry.GetNode().CollectUnloadedColumnPointers(to_issue, pointers);
+	}
+	if (!pointers.empty()) {
+		GetMetadataManager().ReadAhead(pointers);
+	}
+}
+
 vector<PartitionStatistics> RowGroupCollection::GetPartitionStats() const {
 	vector<PartitionStatistics> result;
 	auto row_groups = GetRowGroups();

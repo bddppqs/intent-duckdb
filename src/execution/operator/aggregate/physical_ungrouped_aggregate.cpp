@@ -7,6 +7,8 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/aggregate/aggregate_object.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
+#include "duckdb/execution/operator/aggregate/fused_integer_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/execution/radix_partitioned_hashtable.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
@@ -33,6 +35,9 @@ PhysicalUngroupedAggregate::PhysicalUngroupedAggregate(PhysicalPlan &physical_pl
 		return;
 	}
 	distinct_data = make_uniq<DistinctAggregateData>(*distinct_collection_info, distinct_validity);
+}
+
+PhysicalUngroupedAggregate::~PhysicalUngroupedAggregate() {
 }
 
 //===--------------------------------------------------------------------===//
@@ -93,6 +98,8 @@ public:
 	bool finished;
 	//! The data related to the distinct aggregates (if there are any)
 	unique_ptr<DistinctAggregateState> distinct_state;
+	//! The fused path's state; null when the operator has no fused path
+	unique_ptr<FusedAggregateGlobalState> fused;
 };
 
 ArenaAllocator &GlobalUngroupedAggregateState::CreateAllocator() const {
@@ -242,6 +249,8 @@ public:
 	UngroupedAggregateExecuteState execute_state;
 	//! The local sink states of the distinct aggregates hash tables
 	vector<unique_ptr<LocalSinkState>> radix_states;
+	//! The fused path's state; null when the operator has no fused path
+	unique_ptr<FusedAggregateLocalState> fused;
 
 public:
 	void InitializeDistinctAggregates(const PhysicalUngroupedAggregate &op,
@@ -284,12 +293,26 @@ bool PhysicalUngroupedAggregate::SinkOrderDependent() const {
 }
 
 unique_ptr<GlobalSinkState> PhysicalUngroupedAggregate::GetGlobalSinkState(ClientContext &context) const {
+	if (fused) {
+		auto state = make_uniq<UngroupedAggregateGlobalSinkState>(*this, context);
+		state->fused = fused->GetGlobalSinkState(context);
+		return std::move(state);
+	}
+	if (run_aggregate) {
+		// fresh shared partial states for this execution (the scan's partials combine into them)
+		run_aggregate->Reset(BufferAllocator::Get(context));
+	}
 	return make_uniq<UngroupedAggregateGlobalSinkState>(*this, context);
 }
 
 unique_ptr<LocalSinkState> PhysicalUngroupedAggregate::GetLocalSinkState(ExecutionContext &context) const {
 	D_ASSERT(sink_state);
 	auto &gstate = sink_state->Cast<UngroupedAggregateGlobalSinkState>();
+	if (fused) {
+		auto state = make_uniq<UngroupedAggregateLocalSinkState>(*this, children[0].get().GetTypes(), gstate, context);
+		state->fused = fused->GetLocalSinkState(context);
+		return std::move(state);
+	}
 	return make_uniq<UngroupedAggregateLocalSinkState>(*this, children[0].get().GetTypes(), gstate, context);
 }
 
@@ -338,16 +361,33 @@ void PhysicalUngroupedAggregate::SinkDistinct(ExecutionContext &context, DataChu
 
 SinkResultType PhysicalUngroupedAggregate::Sink(ExecutionContext &context, DataChunk &chunk,
                                                 OperatorSinkInput &input) const {
+	// a mixed DISTINCT shape's drain re-sinks by table (the rebuilt (x) chunks to the distinct table alone, the
+	// re-expanded companion rows to the regular aggregates alone)
+	bool resinking_distinct_only = false;
+	bool resinking_regular_only = false;
+	if (fused) {
+		// the chunk goes into the fused buffers, unless the operator is abandoned: then this thread has drained
+		// its buffered rows (through this method) and the chunk takes the regular body below
+		auto &fused_gstate = *input.global_state.Cast<UngroupedAggregateGlobalSinkState>().fused;
+		auto &fused_lstate = *input.local_state.Cast<UngroupedAggregateLocalSinkState>().fused;
+		if (fused->Sink(context, chunk, input, *this, fused_gstate, fused_lstate)) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		resinking_distinct_only = fused_lstate.resinking_distinct_only;
+		resinking_regular_only = fused_lstate.resinking_regular_only;
+	}
 	auto &sink = input.local_state.Cast<UngroupedAggregateLocalSinkState>();
 
 	// perform the aggregation inside the local state
 	sink.execute_state.Reset();
 
-	if (distinct_data) {
+	if (distinct_data && !resinking_regular_only) {
 		SinkDistinct(context, chunk, input);
 	}
 
-	sink.execute_state.Sink(sink.state, chunk);
+	if (!resinking_distinct_only) {
+		sink.execute_state.Sink(sink.state, chunk);
+	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -391,6 +431,15 @@ SinkCombineResultType PhysicalUngroupedAggregate::Combine(ExecutionContext &cont
 	auto &gstate = input.global_state.Cast<UngroupedAggregateGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<UngroupedAggregateLocalSinkState>();
 	D_ASSERT(!gstate.finished);
+	if (fused) {
+		OperatorSinkInput sink_input {input.global_state, input.local_state, input.interrupt_state};
+		if (fused->Combine(context, sink_input, *this, *gstate.fused, *lstate.fused)) {
+			auto &client_profiler = QueryProfiler::Get(context.client);
+			context.thread.profiler.Flush(*this);
+			client_profiler.Flush(context.thread.profiler);
+			return SinkCombineResultType::FINISHED;
+		}
+	}
 
 	// finalize: combine the local state into the global state
 	// all aggregates are combinable: we might be doing a parallel aggregate
@@ -616,12 +665,21 @@ SinkFinalizeType PhysicalUngroupedAggregate::FinalizeDistinct(Pipeline &pipeline
 SinkFinalizeType PhysicalUngroupedAggregate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                       OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<UngroupedAggregateGlobalSinkState>();
+	if (fused) {
+		if (fused->Finalize(*gstate.fused)) {
+			return SinkFinalizeType::READY;
+		}
+	}
 
 	if (distinct_data) {
 		return FinalizeDistinct(pipeline, event, context, input.global_state);
 	}
 
 	D_ASSERT(!gstate.finished);
+	if (run_aggregate) {
+		// every scan thread has combined its run-path partial into the shared states: merge them exactly once
+		run_aggregate->CombineInto(gstate.state);
+	}
 	gstate.finished = true;
 	return SinkFinalizeType::READY;
 }
@@ -657,8 +715,79 @@ void GlobalUngroupedAggregateState::Finalize(DataChunk &result, idx_t column_off
 	}
 }
 
+//! The fused sink state when phase 2 owns the source (a fused path that was not abandoned), else null
+static optional_ptr<FusedAggregateGlobalState> FusedSourceState(const PhysicalUngroupedAggregate &op) {
+	if (!op.fused || !op.sink_state) {
+		return nullptr;
+	}
+	auto &fused_gstate = *op.sink_state->Cast<UngroupedAggregateGlobalSinkState>().fused;
+	if (fused_gstate.abandoned) {
+		return nullptr;
+	}
+	return &fused_gstate;
+}
+
+unique_ptr<GlobalSourceState> PhysicalUngroupedAggregate::GetGlobalSourceState(ClientContext &context) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetGlobalSourceState(context, *fused_gstate);
+		}
+	}
+	return PhysicalOperator::GetGlobalSourceState(context);
+}
+
+unique_ptr<LocalSourceState> PhysicalUngroupedAggregate::GetLocalSourceState(ExecutionContext &context,
+                                                                             GlobalSourceState &gstate) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetLocalSourceState(context);
+		}
+	}
+	return PhysicalOperator::GetLocalSourceState(context, gstate);
+}
+
+ProgressData PhysicalUngroupedAggregate::GetProgress(ClientContext &context, GlobalSourceState &gstate) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetProgress(*fused_gstate, gstate);
+		}
+	}
+	return PhysicalOperator::GetProgress(context, gstate);
+}
+
+InsertionOrderPreservingMap<string> PhysicalUngroupedAggregate::ExtraSourceParams(GlobalSourceState &gstate,
+                                                                               LocalSourceState &lstate) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->ExtraSourceParams(gstate);
+		}
+	}
+	return PhysicalOperator::ExtraSourceParams(gstate, lstate);
+}
+
+bool PhysicalUngroupedAggregate::ParallelSource() const {
+	return fused != nullptr;
+}
+
+OrderPreservationType PhysicalUngroupedAggregate::SourceOrder() const {
+	if (fused) {
+		return OrderPreservationType::NO_ORDER;
+	}
+	return PhysicalOperator::SourceOrder();
+}
+
 SourceResultType PhysicalUngroupedAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                              OperatorSourceInput &input) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetData(context, chunk, *fused_gstate, input);
+		}
+	}
 	auto &gstate = sink_state->Cast<UngroupedAggregateGlobalSinkState>();
 	D_ASSERT(gstate.finished);
 
@@ -683,6 +812,13 @@ InsertionOrderPreservingMap<string> PhysicalUngroupedAggregate::ParamsToString()
 		}
 	}
 	result["Aggregates"] = aggregate_info;
+	if (fused) {
+		optional_ptr<FusedAggregateGlobalState> fused_gstate;
+		if (sink_state) {
+			fused_gstate = sink_state->Cast<UngroupedAggregateGlobalSinkState>().fused.get();
+		}
+		result["Fused Distinct Aggregate"] = fused->ParamsString(fused_gstate, SourceOrder());
+	}
 	return result;
 }
 

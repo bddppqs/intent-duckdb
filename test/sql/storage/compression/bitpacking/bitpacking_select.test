@@ -1,0 +1,186 @@
+# name: test/sql/storage/compression/bitpacking/bitpacking_select.test
+# description: Selective reads of bitpacked columns in CONSTANT, CONSTANT_DELTA, FOR and DELTA_FOR mode: one row, rows 31 / 32 / 63 / 2047 of a vector, every row, a dense pseudo-random selection, NOT NULL and NULL-bearing columns; the answers are the plain engine answers at threads 1 and 8
+# group: [bitpacking]
+
+require vector_size 2048
+
+load {TEST_DIR}/bitpacking_select.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='bitpacking'
+
+statement ok
+PRAGMA force_bitpacking_mode='constant'
+
+statement ok
+CREATE TABLE t_constant AS SELECT i::BIGINT AS i, (i // 2048)::INTEGER AS v, (i // 4096)::SMALLINT AS w, CASE WHEN i % 9 = 0 THEN NULL ELSE (i // 2048)::INTEGER END AS vn FROM range(250000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_bitpacking_mode='constant_delta'
+
+statement ok
+CREATE TABLE t_constant_delta AS SELECT i::BIGINT AS i, (i * 3)::BIGINT AS v, (i * 2)::INTEGER AS w, CASE WHEN i % 9 = 0 THEN NULL ELSE (i * 3)::BIGINT END AS vn FROM range(250000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_bitpacking_mode='for'
+
+statement ok
+CREATE TABLE t_for AS SELECT i::BIGINT AS i, (i % 1000)::INTEGER AS v, (i % 200)::SMALLINT AS w, CASE WHEN i % 9 = 0 THEN NULL ELSE (i % 1000)::INTEGER END AS vn FROM range(250000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_bitpacking_mode='delta_for'
+
+statement ok
+CREATE TABLE t_delta_for AS SELECT i::BIGINT AS i, (i + (i % 7))::BIGINT AS v, (i % 3000 + i // 3000)::INTEGER AS w, CASE WHEN i % 9 = 0 THEN NULL ELSE (i + (i % 7))::BIGINT END AS vn FROM range(250000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_bitpacking_mode='auto'
+
+restart
+
+# every data segment bitpacked (constant)
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'BitPacking') FROM pragma_storage_info('t_constant') WHERE column_name IN ('v', 'w') AND segment_type <> 'VALIDITY'
+----
+true
+
+# every data segment bitpacked (constant_delta)
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'BitPacking') FROM pragma_storage_info('t_constant_delta') WHERE column_name IN ('v', 'w') AND segment_type <> 'VALIDITY'
+----
+true
+
+# every data segment bitpacked (for)
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'BitPacking') FROM pragma_storage_info('t_for') WHERE column_name IN ('v', 'w') AND segment_type <> 'VALIDITY'
+----
+true
+
+# every data segment bitpacked (delta_for)
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'BitPacking') FROM pragma_storage_info('t_delta_for') WHERE column_name IN ('v', 'w') AND segment_type <> 'VALIDITY'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# constant: one row
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant WHERE i = 123457
+----
+1	60	60	60	30	1	60
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant WHERE i % 2048 IN (31, 32, 63, 2047)
+----
+491	29890	0	122	14823	436	26599
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant WHERE i % 97 = 5
+----
+2578	156048	0	122	77380	2292	138723
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant WHERE hash(i) % 3 = 0
+----
+83024	5022419	0	122	2490364	73762	4462574
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant WHERE i >= 0
+----
+250000	15133856	0	122	7504464	222222	13452344
+
+# constant_delta: one row
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant_delta WHERE i = 123457
+----
+1	370371	370371	370371	246914	1	370371
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant_delta WHERE i % 2048 IN (31, 32, 63, 2047)
+----
+491	184439856	93	749757	122959904	436	164128782
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant_delta WHERE i % 97 = 5
+----
+2578	966668793	15	749922	644445862	2292	859344576
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant_delta WHERE hash(i) % 3 = 0
+----
+83024	31112982972	0	749976	20741988648	73762	27644708070
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_constant_delta WHERE i >= 0
+----
+250000	93749625000	0	749997	62499750000	222222	83333166669
+
+# for: one row
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_for WHERE i = 123457
+----
+1	457	457	457	57	1	457
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_for WHERE i % 2048 IN (31, 32, 63, 2047)
+----
+491	242952	0	999	49352	436	214594
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_for WHERE i % 97 = 5
+----
+2578	1287931	0	999	256731	2292	1145192
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_for WHERE hash(i) % 3 = 0
+----
+83024	41515324	0	999	8263124	73762	36879690
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_for WHERE i >= 0
+----
+250000	124875000	0	999	24875000	222222	110999223
+
+# delta_for: one row
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_delta_for WHERE i = 123457
+----
+1	123462	123462	123462	498	1	123462
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_delta_for WHERE i % 2048 IN (31, 32, 63, 2047)
+----
+491	61481417	34	249924	753201	436	54710891
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_delta_for WHERE i % 97 = 5
+----
+2578	322230668	10	249978	3960054	2292	286455068
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_delta_for WHERE hash(i) % 3 = 0
+----
+83024	10371243522	0	249996	127678901	73762	9215123904
+
+query IIIIIII
+SELECT count(*), sum(v), min(v), max(v), sum(w), count(vn), sum(vn) FROM t_delta_for WHERE i >= 0
+----
+250000	31250624995	0	250003	384167000	222222	27778388888
+
+endloop

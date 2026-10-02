@@ -1,0 +1,63 @@
+# name: test/sql/storage/compression/dict_fsst/dict_global_parallel_build.test
+# description: the global column dictionary built in parallel (more segments than one task decodes) answers as the per-segment scan
+# group: [dict_fsst]
+
+# 1,300,000 rows are 11 row groups: each VARCHAR column has more than one task's worth of DICT_FSST segments, so its
+# first grouping scan builds the dictionary over the scheduler's threads; every answer equals the per-segment scan's
+
+statement ok
+SET storage_compatibility_version='v1.5.0'
+
+load __TEST_DIR__/dict_global_parallel_build.db
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+SET threads=4
+
+statement ok
+CREATE TABLE docs AS SELECT i AS id, (i % 13)::SMALLINT AS cat, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://www.example.org/lite/some/long/path/' || (hash(i // 3) % 100000)::VARCHAR END AS addr, CASE WHEN i % 5 = 0 THEN '' ELSE 'catalogue item number ' || (hash(i // 2) % 9000)::VARCHAR END AS word FROM range(1300000) r(i)
+
+statement ok
+CHECKPOINT
+
+loop i 0 2
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 3
+----
+NULL	13403
+https://www.example.org/lite/some/long/path/98216	48
+https://www.example.org/lite/some/long/path/73939	45
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 3
+----
+catalogue item number 8258	172
+catalogue item number 702	171
+catalogue item number 8825	169
+
+query IIII
+SELECT count(*), count(addr), count(DISTINCT addr), count(DISTINCT word) FROM docs
+----
+1300000	1286597	98763	9001
+
+query II
+SELECT sum(hash(addr)), sum(hash(word)) FROM docs
+----
+12059402368259693951190166	10916144657936362467511693
+
+query III
+SELECT cat, addr, count(*) AS c FROM docs WHERE addr LIKE '%path/1%' GROUP BY cat, addr ORDER BY c DESC, addr, cat LIMIT 3
+----
+8	https://www.example.org/lite/some/long/path/14622	8
+3	https://www.example.org/lite/some/long/path/11221	7
+7	https://www.example.org/lite/some/long/path/11361	7
+
+restart
+
+statement ok
+SET threads=4
+
+endloop

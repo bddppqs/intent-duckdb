@@ -34,12 +34,19 @@
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/local_storage.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 
 namespace duckdb {
 
 DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_manager_p, string schema,
                              string table)
     : db(db), table_io_manager(std::move(table_io_manager_p)), schema(std::move(schema)), table(std::move(table)) {
+}
+
+DataTableInfo::~DataTableInfo() {
+	// the table's global-dictionary entry is released with it (a later table at the same address starts empty)
+	dict_global::ReleaseTable(*this);
 }
 
 void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) {
@@ -103,6 +110,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, ColumnDefinition
 
 	// this table replaces the previous table, hence the parent is no longer the root DataTable
 	parent.version = DataTableVersion::ALTERED;
+	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
+	dict_global::ReleaseTable(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_column)
@@ -151,6 +160,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_co
 
 	// this table replaces the previous table, hence the parent is no longer the root DataTable
 	parent.version = DataTableVersion::ALTERED;
+	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
+	dict_global::ReleaseTable(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint)
@@ -171,6 +182,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	}
 	local_storage.MoveStorage(parent, *this);
 	parent.version = DataTableVersion::ALTERED;
+	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
+	dict_global::ReleaseTable(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
@@ -207,6 +220,8 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 
 	// this table replaces the previous table, hence the parent is no longer the root DataTable
 	parent.version = DataTableVersion::ALTERED;
+	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
+	dict_global::ReleaseTable(*info);
 }
 
 vector<LogicalType> DataTable::GetTypes() {
@@ -244,6 +259,15 @@ TableIOManager &TableIOManager::Get(DataTable &table) {
 void DataTable::InitializeScan(ClientContext &context, DuckTransaction &transaction, TableScanState &state,
                                const vector<StorageIndex> &column_ids, optional_ptr<TableFilterSet> table_filters) {
 	auto &local_storage = LocalStorage::Get(transaction);
+	if (dict_global::DictGlobalEnabled()) {
+		vector<idx_t> storage_ids;
+		for (auto &column_id : column_ids) {
+			if (!column_id.IsRowIdColumn() && column_id.HasPrimaryIndex()) {
+				storage_ids.push_back(column_id.GetPrimaryIndex());
+			}
+		}
+		dict_global::EnsureBuilt(context, *this, storage_ids);
+	}
 	state.Initialize(column_ids, context, table_filters);
 	row_groups->InitializeScan(context, state.table_state, column_ids, table_filters);
 	local_storage.InitializeScan(*this, state.local_state, table_filters);
@@ -259,9 +283,68 @@ idx_t DataTable::GetRowGroupSize() const {
 	return row_groups->GetRowGroupSize();
 }
 
-vector<PartitionStatistics> DataTable::GetPartitionStats(ClientContext &context) {
-	auto result = row_groups->GetPartitionStats();
+namespace {
+
+//! The whole table as one partition, its column statistics the table's own (loaded with the table at attach)
+struct DuckDBPartitionTable : public PartitionRowGroup {
+	explicit DuckDBPartitionTable(shared_ptr<RowGroupCollection> collection_p) : collection(std::move(collection_p)) {
+	}
+
+	shared_ptr<RowGroupCollection> collection;
+
+	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		if (storage_index.HasChildren()) {
+			// only whole top-level columns: TableStatistics keeps no nested statistics beyond a pushdown extract
+			return nullptr;
+		}
+		auto stats = collection->CopyStats(storage_index);
+		// a write clears the flag before it changes the statistics: still set, the copy predates any write
+		if (!collection->ExactSinceLoad()) {
+			return nullptr;
+		}
+		return stats;
+	}
+
+	bool MinMaxIsExact(const BaseStatistics &stats, const StorageIndex &) override {
+		switch (stats.GetType().id()) {
+		case LogicalTypeId::FLOAT:
+		case LogicalTypeId::DOUBLE:
+			// -0.0 and 0.0 compare equal, so the statistics may keep either sign: not exact output
+		case LogicalTypeId::TIME_TZ:
+			// updated in its physical (uint64) order but merged in its logical (UTC) order: no single order is exact
+			return false;
+		default:
+			break;
+		}
+		if (stats.GetStatsType() == StatisticsType::STRING_STATS) {
+			// the row group's rule (RowGroup's DuckDBPartitionRowGroup): untruncated min and max
+			if (!StringStats::HasMaxStringLength(stats)) {
+				return false;
+			}
+			const idx_t max_length = StringStats::MaxStringLength(stats);
+			return max_length == StringStats::Max(stats).length() && max_length == StringStats::Min(stats).length();
+		}
+		return stats.GetStatsType() == StatisticsType::NUMERIC_STATS;
+	}
+};
+
+} // namespace
+
+vector<PartitionStatistics> DataTable::GetPartitionStats(ClientContext &context, bool whole_table) {
 	auto &local_storage = LocalStorage::Get(context, db);
+	if (whole_table && !local_storage.Find(*this)) {
+		// No transaction-local rows; the stored rows, all visible, described exactly by the table statistics
+		PartitionStatistics table_partition;
+		if (row_groups->TryGetExactLoadedCount(table_partition.count)) {
+			table_partition.row_start = 0;
+			table_partition.count_type = CountType::COUNT_EXACT;
+			table_partition.partition_row_group = make_shared_ptr<DuckDBPartitionTable>(row_groups);
+			vector<PartitionStatistics> result;
+			result.push_back(std::move(table_partition));
+			return result;
+		}
+	}
+	auto result = row_groups->GetPartitionStats();
 	auto local_partitions = local_storage.GetPartitionStats(*this);
 	result.insert(result.end(), local_partitions.begin(), local_partitions.end());
 	return result;
@@ -280,6 +363,40 @@ idx_t DataTable::MaxThreads(ClientContext &context) const {
 void DataTable::InitializeParallelScan(ClientContext &context, ParallelTableScanState &state,
                                        const vector<ColumnIndex> &column_indexes) {
 	auto &local_storage = LocalStorage::Get(context, db);
+	{
+		// request the scanned columns' metadata of every row group at once, before the scan loads it row group by
+		// row group
+		vector<storage_t> storage_ids;
+		for (auto &column_index : column_indexes) {
+			if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || !column_index.HasPrimaryIndex()) {
+				continue;
+			}
+			const auto logical = column_index.GetPrimaryIndex();
+			for (auto &column : column_definitions) {
+				if (column.Logical().index == logical) {
+					storage_ids.push_back(column.StorageOid());
+					break;
+				}
+			}
+		}
+		row_groups->ReadAheadColumnMetadata(storage_ids);
+	}
+	if (dict_global::DictGlobalEnabled()) {
+		vector<idx_t> storage_ids;
+		for (auto &column_index : column_indexes) {
+			if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || !column_index.HasPrimaryIndex()) {
+				continue;
+			}
+			const auto logical = column_index.GetPrimaryIndex();
+			for (auto &column : column_definitions) {
+				if (column.Logical().index == logical) {
+					storage_ids.push_back(column.StorageOid());
+					break;
+				}
+			}
+		}
+		dict_global::EnsureBuilt(context, *this, storage_ids);
+	}
 	row_groups->InitializeParallelScan(state.scan_state);
 
 	local_storage.InitializeParallelScan(*this, state.local_state);

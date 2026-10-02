@@ -24,6 +24,8 @@ public:
 	TableStatistics table_stats;
 	idx_t total_rows;
 	idx_t row_group_count;
+	//! Total_rows and table_stats are exact for the stored rows (written at checkpoint, property 105)
+	bool stats_exact = false;
 	MetaBlockPointer block_pointer;
 };
 

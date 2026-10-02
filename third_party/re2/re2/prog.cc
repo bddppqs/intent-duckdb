@@ -18,9 +18,6 @@
 #include <algorithm>
 #include <memory>
 #include <utility>
-#if defined(RE2_CLAB_STATS)
-#include <stdio.h>
-#endif
 
 #include "util/util.h"
 #include "util/logging.h"
@@ -725,13 +722,6 @@ void Prog::set_dfa_mem(int64_t dfa_mem) {
     dfa_mem -= bytes;
   }
   dfa_mem_ = dfa_mem;
-#if defined(RE2_CLAB_STATS)
-  fprintf(stderr, "RE2_CLAB_PROG runnable_lists=%d analysis_bytes=%zu text_max=%zu dfa_bytes=%lld\n%s\n",
-          charclass_run_tables_.size()/256,
-          (charclass_run_index_.size() + charclass_run_tables_.size())*sizeof(uint16_t)
-              + sizeof(charclass_run_index_) + sizeof(charclass_run_tables_),
-          bit_state_text_max_size_, static_cast<long long>(dfa_mem_), Dump().c_str());
-#endif
 }
 
 void Prog::MarkSuccessors(SparseArray<int>* rootmap,

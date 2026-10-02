@@ -1,0 +1,263 @@
+# name: test/sql/aggregate/aggregates/string_group_key.test
+# description: VARCHAR group keys in the grouped aggregate: inlined (<= 12 bytes) and heap
+#              (> 12 bytes) keys, NULL and empty-string keys, multi-column VARCHAR + fixed-width
+#              groups, and aggregates with allocated state, over enough groups that the partitioned
+#              hash table merges partial rows in its finalize phase.  Every answer is checked with
+#              an md5 over the ordered group keys (and over key=value pairs), so a group key whose
+#              bytes are wrong anywhere in the table changes the answer.
+# group: [aggregates]
+
+# ---------------------------------------------------------------------------------------------
+# 1. the explicit small cases: NULL, the empty string, and the 12/13-byte inline boundary
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE t_edge(k VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO t_edge VALUES
+	(NULL, 1), (NULL, 2),
+	('', 3), ('', 4), ('', 5),
+	('a', 6),
+	('0123456789-1', 7), ('0123456789-1', 8),
+	('0123456789012', 9),
+	('0123456789012345678901234567890123456789', 10),
+	(' ', 11),
+	('   trailing and leading   ', 12);
+
+query TII
+SELECT k, count(*), sum(i) FROM t_edge GROUP BY k ORDER BY k NULLS LAST;
+----
+(empty)	3	12
+ 	1	11
+   trailing and leading   	1	12
+0123456789-1	2	15
+0123456789012	1	9
+0123456789012345678901234567890123456789	1	10
+a	1	6
+NULL	2	3
+
+query II
+SELECT length(k), count(*) FROM t_edge WHERE k IS NOT NULL GROUP BY length(k) ORDER BY 1;
+----
+0	3
+1	2
+12	2
+13	1
+26	1
+40	1
+
+statement ok
+PRAGMA disable_verification
+
+# ---------------------------------------------------------------------------------------------
+# 2. a mixed-length VARCHAR group key over 18,003 groups: the answers must not depend on the
+#    thread count, and every key must come back byte-identical
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t_mixed(k VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO t_mixed SELECT
+	CASE
+		WHEN i % 1009 = 0 THEN NULL
+		WHEN i % 1013 = 0 THEN ''
+		WHEN i % 2 = 0 THEN 'k' || ((i // 2) % 9001)::VARCHAR
+		ELSE 'a-group-key-that-never-inlines-' || ((i // 2) % 9001)::VARCHAR
+	END,
+	i::INTEGER
+FROM range(240000) t(i);
+
+foreach threads 1 8
+
+statement ok
+PRAGMA threads=${threads}
+
+# the group keys themselves
+query IIII
+SELECT count(*), count(k), sum(length(k)), md5(string_agg(k, ',' ORDER BY k))
+FROM (SELECT k FROM t_mixed GROUP BY k) g;
+----
+18004	18003	357820	0340a2edfed222844fa9264e2efdeb2c
+
+# the keys paired with their counts, and with their sums, so a key can neither be lost nor
+# attached to the wrong group
+query II
+SELECT md5(string_agg(k || '=' || c::VARCHAR, ',' ORDER BY k)),
+       md5(string_agg(k || '=' || s::VARCHAR, ',' ORDER BY k))
+FROM (SELECT k, count(*) AS c, sum(i) AS s FROM t_mixed GROUP BY k) g
+WHERE k IS NOT NULL;
+----
+9788d1daf4c6531a5ec87b419282664f	ce2486a8e2bd0066f138c31e81d6d4fd
+
+query II
+SELECT c, s FROM (SELECT k, count(*) AS c, sum(i) AS s FROM t_mixed GROUP BY k) g WHERE k IS NULL;
+----
+238	28456827
+
+endloop
+
+statement ok
+PRAGMA threads=8
+
+# ---------------------------------------------------------------------------------------------
+# 3. the same shape under PRAGMA verify_parallelism, which forces the parallel grouped aggregate
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t_small(k VARCHAR, i INTEGER);
+
+statement ok
+INSERT INTO t_small SELECT
+	CASE
+		WHEN i % 97 = 0 THEN NULL
+		WHEN i % 89 = 0 THEN ''
+		WHEN i % 3 = 0 THEN 's' || (i % 701)::VARCHAR
+		WHEN i % 3 = 1 THEN '0123456789ab'
+		ELSE '0123456789abc-' || (i % 701)::VARCHAR
+	END,
+	i::INTEGER
+FROM range(20000) t(i);
+
+statement ok
+PRAGMA verify_parallelism
+
+foreach threads 1 8
+
+statement ok
+PRAGMA threads=${threads}
+
+query III
+SELECT count(*), count(k), md5(string_agg(k, ',' ORDER BY k))
+FROM (SELECT k FROM t_small GROUP BY k) g;
+----
+1405	1404	ef5874c0abd4081635e2edb6a7136d5c
+
+query I
+SELECT md5(string_agg(k || '=' || c::VARCHAR, ',' ORDER BY k))
+FROM (SELECT k, count(*) AS c FROM t_small GROUP BY k) g
+WHERE k IS NOT NULL;
+----
+cfd6f1ad7a52634205bd01fd2b60cacc
+
+query I
+SELECT count(*) FROM (SELECT k, count(*) AS c FROM t_small GROUP BY k) g WHERE k IS NULL AND c = 207;
+----
+1
+
+endloop
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+statement ok
+PRAGMA threads=8
+
+# ---------------------------------------------------------------------------------------------
+# 4. a multi-column group: one VARCHAR key beside one fixed-width key
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t_two(k VARCHAR, j INTEGER);
+
+statement ok
+INSERT INTO t_two SELECT
+	CASE
+		WHEN i % 617 = 0 THEN NULL
+		WHEN i % 619 = 0 THEN ''
+		WHEN i % 2 = 1 THEN 'p-' || (i % 37)::VARCHAR
+		ELSE 'a-much-longer-group-key-' || (i % 4001)::VARCHAR
+	END,
+	(i % 13)::INTEGER
+FROM range(150000) t(i);
+
+foreach threads 1 8
+
+statement ok
+PRAGMA threads=${threads}
+
+query III
+SELECT count(*), count(*) FILTER (WHERE k IS NULL),
+       md5(string_agg(k || '|' || j::VARCHAR || '=' || c::VARCHAR, ',' ORDER BY k, j))
+FROM (SELECT k, j, count(*) AS c FROM t_two GROUP BY k, j) g;
+----
+52426	13	06cfbef1c072e7ec87e40bb5cf484c54
+
+endloop
+
+statement ok
+PRAGMA threads=8
+
+# ---------------------------------------------------------------------------------------------
+# 5. aggregates that carry allocated state, so the merged group's state is combined and destroyed
+#    on rows whose key bytes were not copied with them
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t_state(k VARCHAR, v VARCHAR);
+
+statement ok
+INSERT INTO t_state SELECT
+	CASE WHEN i % 2 = 1 THEN 'state-group-key-' || (i % 5003)::VARCHAR ELSE 'sg' || (i % 5003)::VARCHAR END,
+	'v' || (i % 271)::VARCHAR
+FROM range(120000) t(i);
+
+foreach threads 1 8
+
+statement ok
+PRAGMA threads=${threads}
+
+query II
+SELECT count(*), md5(string_agg(k || '=' || mn || '/' || mx, ',' ORDER BY k))
+FROM (SELECT k, min(v) AS mn, max(v) AS mx FROM t_state GROUP BY k) g;
+----
+10006	b65ed8d8bf4718b5500359043b036807
+
+query I
+SELECT md5(string_agg(k || '=' || a, ',' ORDER BY k))
+FROM (SELECT k, string_agg(v, '|' ORDER BY v) AS a FROM t_state GROUP BY k) g;
+----
+372e3160b82af8f96e52ed53522739f6
+
+endloop
+
+statement ok
+PRAGMA threads=8
+
+# ---------------------------------------------------------------------------------------------
+# 7. the external path: a VARCHAR-key aggregate under a memory limit low enough that
+#    the aggregate goes external, where the borrow is never active; the answers must not depend on
+#    the thread count, and every key's bytes are checked through its md5.  It runs last, so the
+#    memory limit it sets reaches no other section
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t_spill AS SELECT range AS i FROM range(3000000);
+
+statement ok
+SET memory_limit='80MB'
+
+foreach threads 1 8
+
+statement ok
+PRAGMA threads=${threads}
+
+query IIII
+SELECT count(*), sum(c), sum(length(k)), sum(md5_number_lower(k)::HUGEINT * c)
+FROM (SELECT k, count(*) AS c
+      FROM (SELECT 'spill-group-key-' || repeat('z', 40) || '-' || (i % 1000000)::VARCHAR AS k FROM t_spill) s
+      GROUP BY k) g;
+----
+1000000	3000000	62888890	27657055517522407027605051
+
+endloop
+
+statement ok
+RESET memory_limit
+
+statement ok
+PRAGMA threads=8

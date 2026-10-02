@@ -1,0 +1,45 @@
+# name: test/sql/aggregate/group/code_key_source_chunk_per_task.test
+# description: a code-keyed aggregate's output chunk belongs to its source task: a join above it that yields with output
+# still pending for a chunk reads that chunk's own values when it resumes, whatever other tasks ran on the thread
+# group: [group]
+
+statement ok
+ATTACH '__TEST_DIR__/code_key_source_chunk_per_task.db' AS d (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE d
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t AS SELECT i, 'first-column-value-' || (hash(i) % 40000)::VARCHAR AS a FROM range(400000) r(i)
+
+statement ok
+CREATE TABLE f AS SELECT 0 AS z FROM range(256) r(i)
+
+statement ok
+CHECKPOINT
+
+# the first grouping builds the column's dictionary (and the true counts); the plans after it group by the codes
+statement ok
+CREATE TEMP TABLE truth AS SELECT a AS k, count(*) AS c FROM t GROUP BY a
+
+query II
+EXPLAIN SELECT g.a AS k, g.c FROM (SELECT a, count(*) AS c FROM t GROUP BY a) g JOIN f ON g.c % 1 = f.z
+----
+physical_plan	<REGEX>:.*Code Keys.*
+
+# each probe chunk yields hundreds of output chunks, more than a task runs before it yields: every output row's count
+# must still be its own key's
+foreach threads 1 2 4 8
+
+statement ok
+SET threads=${threads}
+
+query III
+SELECT count(*), count(DISTINCT j.k), count(*) FILTER (WHERE j.c <> tr.c) FROM (SELECT g.a AS k, g.c FROM (SELECT a, count(*) AS c FROM t GROUP BY a) g JOIN f ON g.c % 1 = f.z) j JOIN truth tr ON j.k = tr.k
+----
+10239232	39997	0
+
+endloop

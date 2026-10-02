@@ -177,6 +177,10 @@ protected:
 	void BuildBufferSpace(PartitionedTupleDataAppendState &state);
 	template <bool fixed>
 	void BuildBufferSpace(PartitionedTupleDataAppendState &state);
+	//! Mark the partitions the last append through `state` wrote rows into
+	void MarkReceivedOwners(PartitionedTupleDataAppendState &state, vector<bool> &received) const;
+	template <bool fixed>
+	static void MarkReceivedOwners(PartitionedTupleDataAppendState &state, vector<bool> &received);
 	//! Create a collection for a specific a partition
 	unique_ptr<TupleDataCollection> CreatePartitionCollection() {
 		return make_uniq<TupleDataCollection>(buffer_manager, layout_ptr, tag, stl_allocator);

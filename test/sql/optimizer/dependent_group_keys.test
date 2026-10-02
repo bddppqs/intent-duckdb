@@ -1,0 +1,324 @@
+# name: test/sql/optimizer/dependent_group_keys.test
+# description: a group key x + k, k + x or x - k (k a constant, x a retained integer group key of the same type) is removed
+# from the aggregate and rebuilt above it when the statistics of x prove the arithmetic cannot overflow; every signed and
+# unsigned integer width up to 64 bits; the answers equal those with the pass disabled
+# group: [optimizer]
+
+statement ok
+PRAGMA explain_output = 'optimized_only'
+
+# each x spans more than its type's next smaller width, so no key is compressed before the pass reads it
+statement ok
+CREATE TABLE t_tinyint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (0 + 10 * (i % 10))::TINYINT END AS x, i AS y FROM range(101) r(i)
+
+# TINYINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::TINYINT AS p, x - 2::TINYINT AS m, 3::TINYINT + x AS q, count(*) FROM t_tinyint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::TINYINT AS p, x - 2::TINYINT AS m, 3::TINYINT + x AS q, count(*) AS c FROM t_tinyint GROUP BY x, p, m, q)
+----
+11	450	460	430	480	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::TINYINT AS p, x - 2::TINYINT AS m, 3::TINYINT + x AS q, count(*) FROM t_tinyint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::TINYINT AS p, x - 2::TINYINT AS m, 3::TINYINT + x AS q, count(*) AS c FROM t_tinyint GROUP BY x, p, m, q)
+----
+11	450	460	430	480	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_smallint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (0 + 1000 * (i % 10))::SMALLINT END AS x, i AS y FROM range(101) r(i)
+
+# SMALLINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::SMALLINT AS p, x - 2::SMALLINT AS m, 3::SMALLINT + x AS q, count(*) FROM t_smallint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::SMALLINT AS p, x - 2::SMALLINT AS m, 3::SMALLINT + x AS q, count(*) AS c FROM t_smallint GROUP BY x, p, m, q)
+----
+11	45000	45010	44980	45030	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::SMALLINT AS p, x - 2::SMALLINT AS m, 3::SMALLINT + x AS q, count(*) FROM t_smallint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::SMALLINT AS p, x - 2::SMALLINT AS m, 3::SMALLINT + x AS q, count(*) AS c FROM t_smallint GROUP BY x, p, m, q)
+----
+11	45000	45010	44980	45030	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_integer AS SELECT CASE WHEN i = 100 THEN NULL ELSE (0 + 1000000 * (i % 10))::INTEGER END AS x, i AS y FROM range(101) r(i)
+
+# INTEGER: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::INTEGER AS p, x - 2::INTEGER AS m, 3::INTEGER + x AS q, count(*) FROM t_integer GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::INTEGER AS p, x - 2::INTEGER AS m, 3::INTEGER + x AS q, count(*) AS c FROM t_integer GROUP BY x, p, m, q)
+----
+11	45000000	45000010	44999980	45000030	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::INTEGER AS p, x - 2::INTEGER AS m, 3::INTEGER + x AS q, count(*) FROM t_integer GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::INTEGER AS p, x - 2::INTEGER AS m, 3::INTEGER + x AS q, count(*) AS c FROM t_integer GROUP BY x, p, m, q)
+----
+11	45000000	45000010	44999980	45000030	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_bigint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (0 + 1000000000000 * (i % 10))::BIGINT END AS x, i AS y FROM range(101) r(i)
+
+# BIGINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::BIGINT AS p, x - 2::BIGINT AS m, 3::BIGINT + x AS q, count(*) FROM t_bigint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::BIGINT AS p, x - 2::BIGINT AS m, 3::BIGINT + x AS q, count(*) AS c FROM t_bigint GROUP BY x, p, m, q)
+----
+11	45000000000000	45000000000010	44999999999980	45000000000030	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::BIGINT AS p, x - 2::BIGINT AS m, 3::BIGINT + x AS q, count(*) FROM t_bigint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::BIGINT AS p, x - 2::BIGINT AS m, 3::BIGINT + x AS q, count(*) AS c FROM t_bigint GROUP BY x, p, m, q)
+----
+11	45000000000000	45000000000010	44999999999980	45000000000030	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_utinyint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (2 + 10 * (i % 10))::UTINYINT END AS x, i AS y FROM range(101) r(i)
+
+# UTINYINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::UTINYINT AS p, x - 2::UTINYINT AS m, 3::UTINYINT + x AS q, count(*) FROM t_utinyint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UTINYINT AS p, x - 2::UTINYINT AS m, 3::UTINYINT + x AS q, count(*) AS c FROM t_utinyint GROUP BY x, p, m, q)
+----
+11	470	480	450	500	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::UTINYINT AS p, x - 2::UTINYINT AS m, 3::UTINYINT + x AS q, count(*) FROM t_utinyint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UTINYINT AS p, x - 2::UTINYINT AS m, 3::UTINYINT + x AS q, count(*) AS c FROM t_utinyint GROUP BY x, p, m, q)
+----
+11	470	480	450	500	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_usmallint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (2 + 1000 * (i % 10))::USMALLINT END AS x, i AS y FROM range(101) r(i)
+
+# USMALLINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::USMALLINT AS p, x - 2::USMALLINT AS m, 3::USMALLINT + x AS q, count(*) FROM t_usmallint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::USMALLINT AS p, x - 2::USMALLINT AS m, 3::USMALLINT + x AS q, count(*) AS c FROM t_usmallint GROUP BY x, p, m, q)
+----
+11	45020	45030	45000	45050	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::USMALLINT AS p, x - 2::USMALLINT AS m, 3::USMALLINT + x AS q, count(*) FROM t_usmallint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::USMALLINT AS p, x - 2::USMALLINT AS m, 3::USMALLINT + x AS q, count(*) AS c FROM t_usmallint GROUP BY x, p, m, q)
+----
+11	45020	45030	45000	45050	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_uinteger AS SELECT CASE WHEN i = 100 THEN NULL ELSE (2 + 1000000 * (i % 10))::UINTEGER END AS x, i AS y FROM range(101) r(i)
+
+# UINTEGER: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::UINTEGER AS p, x - 2::UINTEGER AS m, 3::UINTEGER + x AS q, count(*) FROM t_uinteger GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UINTEGER AS p, x - 2::UINTEGER AS m, 3::UINTEGER + x AS q, count(*) AS c FROM t_uinteger GROUP BY x, p, m, q)
+----
+11	45000020	45000030	45000000	45000050	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::UINTEGER AS p, x - 2::UINTEGER AS m, 3::UINTEGER + x AS q, count(*) FROM t_uinteger GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UINTEGER AS p, x - 2::UINTEGER AS m, 3::UINTEGER + x AS q, count(*) AS c FROM t_uinteger GROUP BY x, p, m, q)
+----
+11	45000020	45000030	45000000	45000050	101
+
+statement ok
+RESET disabled_optimizers
+
+statement ok
+CREATE TABLE t_ubigint AS SELECT CASE WHEN i = 100 THEN NULL ELSE (2 + 1000000000000 * (i % 10))::UBIGINT END AS x, i AS y FROM range(101) r(i)
+
+# UBIGINT: the three dependent keys are removed, one group key remains
+query II
+EXPLAIN SELECT x, x + 1::UBIGINT AS p, x - 2::UBIGINT AS m, 3::UBIGINT + x AS q, count(*) FROM t_ubigint GROUP BY x, p, m, q
+----
+logical_opt	<REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UBIGINT AS p, x - 2::UBIGINT AS m, 3::UBIGINT + x AS q, count(*) AS c FROM t_ubigint GROUP BY x, p, m, q)
+----
+11	45000000000020	45000000000030	45000000000000	45000000000050	101
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT x, x + 1::UBIGINT AS p, x - 2::UBIGINT AS m, 3::UBIGINT + x AS q, count(*) FROM t_ubigint GROUP BY x, p, m, q
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query IIIIII
+SELECT count(*), sum(x), sum(p), sum(m), sum(q), sum(c) FROM (SELECT x, x + 1::UBIGINT AS p, x - 2::UBIGINT AS m, 3::UBIGINT + x AS q, count(*) AS c FROM t_ubigint GROUP BY x, p, m, q)
+----
+11	45000000000020	45000000000030	45000000000000	45000000000050	101
+
+statement ok
+RESET disabled_optimizers
+
+# the keys are kept when the statistics of x do not rule out an overflow: the error is the one the kept key raises
+statement ok
+CREATE TABLE t_edge AS SELECT (i * 18)::TINYINT AS s, (i * 36)::UTINYINT AS u, (9223372036854775800 + i)::BIGINT AS b FROM range(0, 8) r(i)
+
+statement ok
+INSERT INTO t_edge VALUES (127, 0, 9223372036854775807)
+
+query II
+EXPLAIN SELECT s, s + 1::TINYINT AS p, count(*) FROM t_edge GROUP BY s, p
+----
+logical_opt	<!REGEX>:.*Groups: s.*
+
+statement error
+SELECT s, s + 1::TINYINT AS p, count(*) FROM t_edge GROUP BY s, p
+----
+Overflow
+
+statement error
+SELECT u, u - 1::UTINYINT AS m, count(*) FROM t_edge GROUP BY u, m
+----
+Overflow
+
+statement error
+SELECT b, b + 1 AS p, count(*) FROM t_edge GROUP BY b, p
+----
+Overflow
+
+# below the edge the answers are the plain ones
+query III
+SELECT s, s + 1::TINYINT AS p, count(*) FROM t_edge WHERE s < 127 GROUP BY s, p ORDER BY s
+----
+0	1	1
+18	19	1
+36	37	1
+54	55	1
+72	73	1
+90	91	1
+108	109	1
+126	127	1
+
+# a subtraction with the column on the right, a key over another column and a key alone are kept
+query II
+EXPLAIN SELECT x, 10 - x AS n, count(*) FROM t_integer GROUP BY x, n
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query II
+EXPLAIN SELECT x, y + 1 AS p, count(*) FROM t_integer GROUP BY x, p
+----
+logical_opt	<!REGEX>:.*Groups: x.*
+
+query III
+SELECT x + 1 AS p, x - 1 AS m, count(*) FROM t_integer GROUP BY p, m ORDER BY p NULLS LAST
+----
+1	-1	10
+1000001	999999	10
+2000001	1999999	10
+3000001	2999999	10
+4000001	3999999	10
+5000001	4999999	10
+6000001	5999999	10
+7000001	6999999	10
+8000001	7999999	10
+9000001	8999999	10
+NULL	NULL	1
+
+# the removed key is usable in HAVING and ORDER BY and keeps its alias
+query III
+SELECT x, x + 100 AS p, count(*) FROM t_integer GROUP BY x, p HAVING p > 5000100 ORDER BY p DESC
+----
+9000000	9000100	10
+8000000	8000100	10
+7000000	7000100	10
+6000000	6000100	10

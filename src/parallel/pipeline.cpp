@@ -13,6 +13,9 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -92,9 +95,32 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 	return progress.IsValid();
 }
 
+bool Pipeline::InlineSingleTaskEnabled() {
+	return kInlineSingleTaskPipelines;
+}
+
+bool &Pipeline::SchedulingCompletedDependency() {
+	static thread_local bool scheduling = false;
+	return scheduling;
+}
+
+bool &Pipeline::InlineTaskRequested() {
+	static thread_local bool requested = false;
+	return requested;
+}
+
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
+	// when the event is scheduled because its last dependency completed (no executor lock is held), ask
+	// Event::SetTasks to run the one task here for a partial step instead of waking a worker
+	struct RequestGuard {
+		bool &requested;
+		~RequestGuard() {
+			requested = false;
+		}
+	} guard {InlineTaskRequested()};
+	guard.requested = InlineSingleTaskEnabled() && SchedulingCompletedDependency();
 	event->SetTasks(std::move(tasks));
 }
 

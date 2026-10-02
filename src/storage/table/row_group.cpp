@@ -1,4 +1,6 @@
 #include "duckdb/storage/table/row_group.hpp"
+
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/transaction/commit_state.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -10,6 +12,7 @@
 #include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
@@ -24,6 +27,7 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/storage/table/row_id_column_data.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -356,6 +360,7 @@ bool RowGroup::InitializeScanWithOffset(CollectionScanState &state, SegmentNode<
 		column_data.InitializeScanWithOffset(state.column_scans[i], row_number);
 		state.column_scans[i].scan_options = &state.GetOptions();
 	}
+	ReadAheadScan(state, row_number);
 	return true;
 }
 
@@ -382,7 +387,53 @@ bool RowGroup::InitializeScan(CollectionScanState &state, SegmentNode<RowGroup> 
 		column_data.InitializeScan(state.column_scans[i]);
 		state.column_scans[i].scan_options = &state.GetOptions();
 	}
+	ReadAheadScan(state, 0);
 	return true;
+}
+
+void RowGroup::ReadAheadScan(CollectionScanState &state, idx_t row_number) {
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&GetBlockManager());
+	if (!single_file || row_number >= state.max_row_group_row) {
+		return;
+	}
+	auto rows = state.max_row_group_row - row_number;
+	auto &column_ids = state.GetColumnIds();
+	auto &filter_info = state.GetFilterInfo();
+	PrefetchState prefetch_state;
+	if (!filter_info.HasFilters()) {
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			GetColumn(column_ids[i]).InitializePrefetch(prefetch_state, state.column_scans[i], rows);
+		}
+	} else {
+		// with filters only the column of the filter evaluated first is read for every vector: the other filter
+		// columns and the projected columns are read only for vectors that still have matching rows
+		auto &filter_list = filter_info.GetFilterList();
+		auto adaptive_filter = filter_info.GetAdaptiveFilter();
+		for (idx_t i = 0; i < filter_list.size(); i++) {
+			auto filter_idx = adaptive_filter && i < adaptive_filter->permutation.size() ? adaptive_filter->permutation[i] : i;
+			auto &filter = filter_list[filter_idx];
+			if (filter.IsAlwaysTrue()) {
+				continue;
+			}
+			GetColumn(filter.table_column_index)
+			    .InitializePrefetch(prefetch_state, state.column_scans[filter.scan_column_index], rows);
+			break;
+		}
+	}
+	single_file->ReadAhead(prefetch_state.blocks);
+}
+
+void RowGroup::CollectUnloadedColumnPointers(const vector<storage_t> &column_list,
+                                             vector<MetaBlockPointer> &result) const {
+	if (!is_loaded || column_pointers.size() != columns.size()) {
+		return;
+	}
+	for (auto c : column_list) {
+		if (c >= column_pointers.size() || is_loaded[c]) {
+			continue;
+		}
+		result.push_back(column_pointers[c]);
+	}
 }
 
 unique_ptr<RowGroup> RowGroup::CreateNewRowGroupCopy(RowGroupCollection &new_collection, idx_t new_column_count) {
@@ -623,8 +674,10 @@ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
 		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			return false;
 		}
-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER &&
+		    !filter.Cast<OptionalFilter>().FiltersRows(*entry.filter_state)) {
 			// these are only for row group checking, set as always true so we don't check it
+			// (a Top-N bound applied row by row stays in the per-vector loop while its thread-local state is active)
 			filters.SetFilterAlwaysTrue(i);
 		} else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
 			// filter is always true - no need to check it
@@ -665,8 +718,11 @@ bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
 			target_row = state.max_row;
 		}
 		D_ASSERT(target_row >= row_start);
-		D_ASSERT(target_row <= row_start + this->count);
-		idx_t target_vector_index = (target_row - row_start) / STANDARD_VECTOR_SIZE;
+		D_ASSERT(target_row <= this->count);
+		// target_row is relative to the row group (segment row starts are), so the vector holding the segment's
+		// end is target_row / STANDARD_VECTOR_SIZE; subtracting row_start again gave the segment's vector count,
+		// which is only the right target for a segment that starts at row 0 of the row group
+		idx_t target_vector_index = target_row / STANDARD_VECTOR_SIZE;
 
 		if (!target_vector_index_max.IsValid() || target_vector_index_max.GetIndex() < target_vector_index) {
 			target_vector_index_max = target_vector_index;
@@ -737,6 +793,26 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 		}
 
 		bool has_filters = filter_info.HasFilters();
+		auto run_aggregate = state.GetRunAggregate();
+		if (run_aggregate && count == max_count && !has_filters && !state.GetOptions().force_fetch_row) {
+			// run-aware aggregation: when every projected column of this vector lies in RLE/Constant segments
+			// with no NULL, update or deleted row, aggregate the (value, run length) pairs and emit no chunk
+			bool run_eligible = true;
+			for (idx_t i = 0; i < column_ids.size(); i++) {
+				if (!GetColumn(column_ids[i]).RunEligible(state.column_scans[i], max_count)) {
+					run_eligible = false;
+					break;
+				}
+			}
+			if (run_eligible) {
+				for (idx_t i = 0; i < column_ids.size(); i++) {
+					GetColumn(column_ids[i]).ScanRuns(state.column_scans[i], max_count, run_aggregate->GetSink(i));
+				}
+				run_aggregate->AddRows(max_count);
+				state.vector_index++;
+				continue;
+			}
+		}
 		if (count == max_count && !has_filters) {
 			// scan all vectors completely: full scan without deletions or table filters
 			for (idx_t i = 0; i < column_ids.size(); i++) {
@@ -1630,6 +1706,22 @@ bool RowGroup::HasChanges() const {
 	return false;
 }
 
+bool RowGroup::IsUnchangedOnDisk() {
+	if (GetCommittedRowCount() != count) {
+		// rows were deleted
+		return false;
+	}
+	for (idx_t c = 0; c < columns.size(); c++) {
+		if (!ColumnIsLoaded(c)) {
+			continue;
+		}
+		if (columns[c]->HasAnyChanges()) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool RowGroup::IsPersistent() const {
 	for (auto &column : columns) {
 		if (!column->IsPersistent()) {
@@ -1721,6 +1813,10 @@ struct DuckDBPartitionRowGroup : public PartitionRowGroup {
 	const bool is_exact;
 
 	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		if (storage_index.HasPrimaryIndex()) {
+			// the caller reads this column's statistics partition by partition: request its metadata at once
+			row_group->GetCollection().ReadAheadColumnMetadata({storage_index.GetPrimaryIndex()});
+		}
 		return row_group->GetStatistics(storage_index);
 	}
 

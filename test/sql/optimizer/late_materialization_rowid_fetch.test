@@ -1,0 +1,311 @@
+# name: test/sql/optimizer/late_materialization_rowid_fetch.test
+# description: The row-id fetch for a small row-id IN filter: a late-materialised ORDER BY ... LIMIT over a contains filter at non-consecutive row ids, LIMIT ... OFFSET, a base-table sample, LIMIT 60 (above the IN threshold), dynamic_or_filter_threshold = 0, late_materialization_max_rows = 0, user row-id IN lists (with a comparison, with missing, negative and duplicate row ids, above the threshold), and the same after a DELETE of result rows, inside a transaction with an uncommitted append and after an UPDATE of a projected column; the answers are the plain engine answers at threads 1 and 8
+# group: [optimizer]
+
+require vector_size 2048
+
+load {TEST_DIR}/late_materialization_rowid_fetch.db readwrite v1.5.0
+
+statement ok
+CREATE TABLE t_rf(i BIGINT, o BIGINT, k INTEGER, g BIGINT, u VARCHAR USING COMPRESSION 'dict_fsst', w VARCHAR USING COMPRESSION 'dict_fsst', v VARCHAR, n1 INTEGER, n3 SMALLINT)
+
+statement ok
+INSERT INTO t_rf SELECT i::BIGINT, ((i * 7919) % 400000)::BIGINT, (i % 2048)::INTEGER, (i // 1000)::BIGINT, CASE WHEN i % 5003 = 0 THEN 'needle-' || i::VARCHAR ELSE 'https://example.com/m1/' || md5((i // 3)::VARCHAR) END, 'w' || lpad((i % 50)::VARCHAR, 2, '0'), 'v:' || md5(i::VARCHAR), (i % 997)::INTEGER, (i % 100)::SMALLINT FROM range(400000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# the late-materialised top 10: the semi join pushes ten non-consecutive row ids
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+0	0	0	0	needle-0	w00	v:cfcd208495d565ef66e7dff9f98764da	0	0
+320192	448	704	320	needle-320192	w42	v:4b2c01c9bf29d0974bad443828e4efde	155	92
+215129	6551	89	215	needle-215129	w29	v:ff77019dbbe764afb10598e3d4f0360f	774	29
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+
+# LIMIT ... OFFSET
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10 OFFSET 5
+----
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	w35	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	w22	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	w09	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+335201	56719	1377	335	needle-335201	w01	v:3bce4486a9a7ad77450dfc33d9bbd0c5	209	1
+230138	62822	762	230	needle-230138	w38	v:dd2578c154171a89f2ad507bb0adef78	828	38
+
+# LIMIT 60: above the IN threshold (no row-id IN filter)
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 60
+----
+0	0	0	0	needle-0	w00	v:cfcd208495d565ef66e7dff9f98764da	0	0
+320192	448	704	320	needle-320192	w42	v:4b2c01c9bf29d0974bad443828e4efde	155	92
+215129	6551	89	215	needle-215129	w29	v:ff77019dbbe764afb10598e3d4f0360f	774	29
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	w35	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	w22	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	w09	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+335201	56719	1377	335	needle-335201	w01	v:3bce4486a9a7ad77450dfc33d9bbd0c5	209	1
+230138	62822	762	230	needle-230138	w38	v:dd2578c154171a89f2ad507bb0adef78	828	38
+125075	68925	147	125	needle-125075	w25	v:238ec1e3e2f542fec78673f68cd1a9a4	450	75
+20012	75028	1580	20	needle-20012	w12	v:6eab78f10219a83895b2e2d71dc0656e	72	12
+340204	75476	236	340	needle-340204	w04	v:682fe0fab18742d0a1dbabbe0240e33f	227	4
+235141	81579	1669	235	needle-235141	w41	v:bc094eec1cb12e4870733317caf1e244	846	41
+130078	87682	1054	130	needle-130078	w28	v:88f54b4998a0ba895addb51c54cf56af	468	78
+25015	93785	439	25	needle-25015	w15	v:05204fdf0a9a07a4eac25ec99af7ae24	90	15
+345207	94233	1143	345	needle-345207	w07	v:6be704fca5f41e074b88a0eec2f353ae	245	7
+240144	100336	528	240	needle-240144	w44	v:a4bfec0698e1a12739102825df88a7f9	864	44
+135081	106439	1961	135	needle-135081	w31	v:30baef21d598049dfc91db7e164b2d1e	486	81
+30018	112542	1346	30	needle-30018	w18	v:6026ab34372aefc36721984187f2afc6	108	18
+350210	112990	2	350	needle-350210	w10	v:ed53f61ae28213a66ceca50a4c9f04e1	263	10
+245147	119093	1435	245	needle-245147	w47	v:4550fbe6028a13e578a651daa0e8ff53	882	47
+140084	125196	820	140	needle-140084	w34	v:3e04f019562baeb10f41e7b9fb14c6be	504	84
+35021	131299	205	35	needle-35021	w21	v:64608f951c2e26fcddeb4dca75459470	126	21
+355213	131747	909	355	needle-355213	w13	v:4b1ff638a046ea1369b02df40a324416	281	13
+250150	137850	294	250	needle-250150	w00	v:864b0f82cb843e0b1bf4c68d24b0caba	900	50
+145087	143953	1727	145	needle-145087	w37	v:7e2d577818b7d5917f9947ee730872ba	522	87
+40024	150056	1112	40	needle-40024	w24	v:4d76707f952e51c08eef013d3fbcf89a	144	24
+360216	150504	1816	360	needle-360216	w16	v:74dee402933f30c49a649d0af19acbf3	299	16
+255153	156607	1201	255	needle-255153	w03	v:e8d251367b26315c544937179e1b199d	918	53
+150090	162710	586	150	needle-150090	w40	v:cc8b8bf14cff73e4b19a8365c0328b45	540	90
+45027	168813	2019	45	needle-45027	w27	v:fd9feaee224753f923d50254601e7b0e	162	27
+365219	169261	675	365	needle-365219	w19	v:5ce0f52d95880899c18a2287119b78b7	317	19
+260156	175364	60	260	needle-260156	w06	v:63db2e0e90d69a5ab735f93f2db4bb4a	936	56
+155093	181467	1493	155	needle-155093	w43	v:f29a5ba7901052f10861b464afb4ab54	558	93
+50030	187570	878	50	needle-50030	w30	v:33702a9c691c0f5aaac103d7dd1952eb	180	30
+370222	188018	1582	370	needle-370222	w22	v:d0b183c99099bbe8c0082e597589b234	335	22
+265159	194121	967	265	needle-265159	w09	v:857106ba919cec57ad8fd64e284a717d	954	59
+160096	200224	352	160	needle-160096	w46	v:f6b3369459e720afa3d285f5e00188f7	576	96
+55033	206327	1785	55	needle-55033	w33	v:8f061aed19808b460b034b628a555fce	198	33
+375225	206775	441	375	needle-375225	w25	v:aff3b9a6b963b60f5348d9a1f8f8561f	353	25
+270162	212878	1874	270	needle-270162	w12	v:14eeaea6642a46673a7cf7190cd0a54e	972	62
+165099	218981	1259	165	needle-165099	w49	v:dae04c6b48a5c0a9f6dcdf84fba70830	594	99
+60036	225084	644	60	needle-60036	w36	v:3594d41999f82d36c2a96aaab1eb3e4e	216	36
+380228	225532	1348	380	needle-380228	w28	v:10b192991a666eed951f7335510e771b	371	28
+275165	231635	733	275	needle-275165	w15	v:83d4adc0d09ca66e0ad861cba54a4d0a	990	65
+170102	237738	118	170	needle-170102	w02	v:ff564381a6e133861e8747cb321308e4	612	2
+65039	243841	1551	65	needle-65039	w39	v:38aae010a444b0dbbbee14c61b4017c2	234	39
+385231	244289	207	385	needle-385231	w31	v:8f20b9eccb2e6c8c4eca6dbfdcdeb171	389	31
+280168	250392	1640	280	needle-280168	w18	v:ed479b457ee84f1d5b1c25d587a7ff74	11	68
+175105	256495	1025	175	needle-175105	w05	v:3c2ed381b12c2360962863acdf6c1a7c	630	5
+70042	262598	410	70	needle-70042	w42	v:104f0fc9789e68dfb7d0e2ed6e9681bc	252	42
+390234	263046	1114	390	needle-390234	w34	v:6ff002737910102287890b460be5ab6d	407	34
+285171	269149	499	285	needle-285171	w21	v:b4ac39e71c57ae59e76ce08895caa775	29	71
+180108	275252	1932	180	needle-180108	w08	v:8f2ad6912837fe09c3870459f699d6f9	648	8
+
+statement ok
+SET dynamic_or_filter_threshold = 0
+
+# no dynamic IN filter
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+0	0	0	0	needle-0	w00	v:cfcd208495d565ef66e7dff9f98764da	0	0
+320192	448	704	320	needle-320192	w42	v:4b2c01c9bf29d0974bad443828e4efde	155	92
+215129	6551	89	215	needle-215129	w29	v:ff77019dbbe764afb10598e3d4f0360f	774	29
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+
+statement ok
+RESET dynamic_or_filter_threshold
+
+statement ok
+SET late_materialization_max_rows = 0
+
+# no late materialisation
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+0	0	0	0	needle-0	w00	v:cfcd208495d565ef66e7dff9f98764da	0	0
+320192	448	704	320	needle-320192	w42	v:4b2c01c9bf29d0974bad443828e4efde	155	92
+215129	6551	89	215	needle-215129	w29	v:ff77019dbbe764afb10598e3d4f0360f	774	29
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+
+statement ok
+RESET late_materialization_max_rows
+
+# a base-table sample of 10 rows, late-materialised: every column a function of i
+query II
+SELECT count(*), bool_and(o = (i * 7919) % 400000 AND k = i % 2048 AND g = i // 1000 AND v = 'v:' || md5(i::VARCHAR) AND w = 'w' || lpad((i % 50)::VARCHAR, 2, '0') AND n1 = i % 997 AND n3 = i % 100) FROM (SELECT * FROM t_rf USING SAMPLE 10 ROWS)
+----
+10	true
+
+# a user row-id IN list, two row ids past the table
+query III
+SELECT i, u, v FROM t_rf WHERE rowid IN (5, 70000, 123456, 399999, 400001, 1000000) ORDER BY i
+----
+5	https://example.com/m1/c4ca4238a0b923820dcc509a6f75849b	v:e4da3b7fbbce2345d7772b0674a318d5
+70000	https://example.com/m1/0ba7bc92fcd57e337ebb9e74308c811f	v:3078a255aee86ecc4ac1eb36b69af2f0
+123456	https://example.com/m1/96cef91ce78fa11066456db9b1275661	v:e10adc3949ba59abbe56e057f20f883e
+399999	https://example.com/m1/c13ed6ac872669a72792efa1571994dc	v:6a2b50e288940201e5dd527a028ba2ad
+
+# a user row-id IN list under a comparison
+query III
+SELECT i, u, v FROM t_rf WHERE rowid IN (5, 70000, 123456, 399999) AND rowid >= 70000 ORDER BY i
+----
+70000	https://example.com/m1/0ba7bc92fcd57e337ebb9e74308c811f	v:3078a255aee86ecc4ac1eb36b69af2f0
+123456	https://example.com/m1/96cef91ce78fa11066456db9b1275661	v:e10adc3949ba59abbe56e057f20f883e
+399999	https://example.com/m1/c13ed6ac872669a72792efa1571994dc	v:6a2b50e288940201e5dd527a028ba2ad
+
+# a negative and a duplicated row id
+query II
+SELECT i, u FROM t_rf WHERE rowid IN (-1, 3, 3, 250000) ORDER BY i
+----
+3	https://example.com/m1/c4ca4238a0b923820dcc509a6f75849b
+250000	https://example.com/m1/dd935e1362065ade42b17e6c3c958cc2
+
+# a user row-id IN list of 60 values (above the threshold)
+query II
+SELECT count(*), sum(i)::BIGINT FROM t_rf WHERE rowid IN (1, 8, 15, 22, 29, 36, 43, 50, 57, 64, 71, 78, 85, 92, 99, 106, 113, 120, 127, 134, 141, 148, 155, 162, 169, 176, 183, 190, 197, 204, 211, 218, 225, 232, 239, 246, 253, 260, 267, 274, 281, 288, 295, 302, 309, 316, 323, 330, 337, 344, 351, 358, 365, 372, 379, 386, 393, 400, 407, 414)
+----
+60	12450
+
+# row-id IN beside a filter on another column
+query II
+SELECT i, u FROM t_rf WHERE i IN (5, 70000, 123456) AND rowid IN (5, 70000, 399999) ORDER BY i
+----
+5	https://example.com/m1/c4ca4238a0b923820dcc509a6f75849b
+70000	https://example.com/m1/0ba7bc92fcd57e337ebb9e74308c811f
+
+endloop
+
+statement ok
+DELETE FROM t_rf WHERE i IN (SELECT i FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 3)
+
+# after a DELETE of three result rows
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	w35	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	w22	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	w09	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO t_rf SELECT 900000 + i, i - 5, 0, 0, 'needle-local-' || i::VARCHAR, 'wl', 'v:' || md5((900000 + i)::VARCHAR), 0, 0 FROM range(5) tbl(i)
+
+# inside a transaction with an uncommitted append (transaction-local row ids)
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+900000	-5	0	0	needle-local-0	wl	v:c3c4f8c964d8fbd9ce62ff3921bd5e79	0	0
+900001	-4	0	0	needle-local-1	wl	v:5a1c0540a0374eb9ff78d7785693f7dc	0	0
+900002	-3	0	0	needle-local-2	wl	v:a084764b113e3d74b052e5b1206bc496	0	0
+900003	-2	0	0	needle-local-3	wl	v:422d8f98242aca54c57d76dbf9034951	0	0
+900004	-1	0	0	needle-local-4	wl	v:c28fcbc72a8ed56a211088a913d25c7e	0	0
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+
+statement ok
+ROLLBACK
+
+# after the rollback
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+110066	12654	1522	110	needle-110066	w16	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	w03	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	w45	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	w32	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	w19	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	w06	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	w48	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	w35	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	w22	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	w09	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+
+statement ok
+UPDATE t_rf SET w = 'updated-' || i::VARCHAR WHERE contains(u, 'needle')
+
+# after an UPDATE of a projected column
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+110066	12654	1522	110	needle-110066	updated-110066	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	updated-5003	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	updated-325195	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	updated-220132	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	updated-115069	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	updated-10006	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	updated-330198	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	updated-225135	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	updated-120072	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	updated-15009	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+
+statement ok
+SET threads = 1
+
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10
+----
+110066	12654	1522	110	needle-110066	updated-110066	v:c77bfc84f19aeccdbdbf83b4bb3074e9	396	66
+5003	18757	907	5	needle-5003	updated-5003	v:240ac9371ec2671ae99847c3ae2e6384	18	3
+325195	19205	1611	325	needle-325195	updated-325195	v:8da3948c5ac8448cad821c56fa853f59	173	95
+220132	25308	996	220	needle-220132	updated-220132	v:a088fe0abcbc66811b1fe7b995ed0712	792	32
+115069	31411	381	115	needle-115069	updated-115069	v:5dfde97d835853b9720acc66b472b6ef	414	69
+10006	37514	1814	10	needle-10006	updated-10006	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	updated-330198	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	updated-225135	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	updated-120072	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	updated-15009	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+
+query IIIIIIIII
+SELECT i, o, k, g, u, w, v, n1, n3 FROM t_rf WHERE contains(u, 'needle') ORDER BY o LIMIT 10 OFFSET 5
+----
+10006	37514	1814	10	needle-10006	updated-10006	v:19b1b73d63d4c9ea79f8ca57e9d67095	36	6
+330198	37962	470	330	needle-330198	updated-330198	v:9bb8297ec5c589c4d68341719be889ca	191	98
+225135	44065	1903	225	needle-225135	updated-225135	v:fba36c2ab0349a96e3380bb916305137	810	35
+120072	50168	1288	120	needle-120072	updated-120072	v:ecf7338534fd167aee5968ad57feaf7a	432	72
+15009	56271	673	15	needle-15009	updated-15009	v:4252db6ade40e2522ac46e2e00c5655f	54	9
+335201	56719	1377	335	needle-335201	updated-335201	v:3bce4486a9a7ad77450dfc33d9bbd0c5	209	1
+230138	62822	762	230	needle-230138	updated-230138	v:dd2578c154171a89f2ad507bb0adef78	828	38
+125075	68925	147	125	needle-125075	updated-125075	v:238ec1e3e2f542fec78673f68cd1a9a4	450	75
+20012	75028	1580	20	needle-20012	updated-20012	v:6eab78f10219a83895b2e2d71dc0656e	72	12
+340204	75476	236	340	needle-340204	updated-340204	v:682fe0fab18742d0a1dbabbe0240e33f	227	4

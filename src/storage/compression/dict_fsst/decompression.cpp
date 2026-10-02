@@ -2,6 +2,8 @@
 #include "fsst.h"
 #include "duckdb/common/fsst.hpp"
 #include "duckdb/storage/object_cache.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 namespace dict_fsst {
@@ -61,6 +63,9 @@ string_t CompressedStringScanState::FetchStringFromDict(Vector &result, uint32_t
 
 void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	baseptr = handle->Ptr() + segment.GetBlockOffset();
+	if (initialize_dictionary && dict_global::DictGlobalEnabled()) {
+		global_translation = dict_global::FindScanTranslation(segment);
+	}
 
 	// Load header values
 	auto header_ptr = reinterpret_cast<dict_fsst_compression_header_t *>(baseptr);
@@ -100,7 +105,19 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	bool cache_dictionary = initialize_dictionary && mode == DictFSSTMode::DICT_FSST &&
 	                              segment.segment_type == ColumnSegmentType::PERSISTENT && segment.UseDictionaryCache();
 	if (cache_dictionary) {
-		auto cached = segment.db.GetObjectCache().Get<MaterializedDictionaryEntry>(segment.GetDictionaryCacheKey());
+		shared_ptr<MaterializedDictionaryEntry> cached;
+		shared_ptr<ObjectCacheEntry> remembered;
+		switch (LookupSegmentDictionary(segment, remembered)) {
+		case SegmentDictionaryLookup::HIT:
+			cached = shared_ptr_cast<ObjectCacheEntry, MaterializedDictionaryEntry>(std::move(remembered));
+			break;
+		case SegmentDictionaryLookup::ABSENT:
+			break;
+		case SegmentDictionaryLookup::ASK_CACHE:
+			cached = segment.db.GetObjectCache().Get<MaterializedDictionaryEntry>(segment.GetDictionaryCacheKey());
+			RememberSegmentDictionary(segment, cached);
+			break;
+		}
 		if (cached) {
 			segment.ObserveDictionaryCacheHit();
 			dictionary = cached->dictionary;
@@ -130,6 +147,19 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 		return;
 	}
 
+	// the whole-dictionary materialisation is deferred to EnsureDictionary(), which the consumers that need the
+	// dictionary call first; a selection-aware filter or a sparse partial scan decodes only the referenced entries
+	dictionary_deferred = true;
+	cache_dictionary_admitted = cache_dictionary;
+}
+
+void CompressedStringScanState::EnsureDictionary() {
+	if (dictionary || !dictionary_deferred) {
+		return;
+	}
+	dictionary_deferred = false;
+	const bool cache_dictionary = cache_dictionary_admitted;
+
 	dictionary = DictionaryVector::CreateReusableDictionary(segment.type, dict_count);
 	auto dict_child_data = FlatVector::GetData<string_t>(dictionary->data);
 	auto &validity = FlatVector::Validity(dictionary->data);
@@ -144,6 +174,15 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 		dict_child_data[i] = FetchStringFromDict(dict_data, offset, i);
 		offset += string_len;
 	}
+	// a DICT_FSST-mode entry is decompressed into dict_data's own string buffer (an inlined one has no bytes
+	// elsewhere), so that buffer owns every string of the dictionary; set before the dictionary is published and never
+	// written after. An all-inlined dictionary has no buffer (nothing to borrow); DICTIONARY-mode entries are views into
+	// the pinned block and never carry the flag.
+	auto dict_auxiliary = dict_data.GetAuxiliary();
+	if (mode == DictFSSTMode::DICT_FSST && dict_auxiliary &&
+	    dict_auxiliary->GetBufferType() == VectorBufferType::STRING_BUFFER) {
+		dict_auxiliary->Cast<VectorStringBuffer>().owns_all_strings = true;
+	}
 	if (cache_dictionary) {
 		// The string slots and arena are immutable after publication. GetCachedHashes
 		// synchronizes the only lazy shared metadata with cached_hashes_lock. Reserve
@@ -152,13 +191,78 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 		                   sizeof(VectorStringBuffer) + dict_count * (sizeof(string_t) + sizeof(hash_t)) +
 		                   ValidityMask::ValidityMaskSize(dict_count) +
 		                   StringVector::GetStringBuffer(dict_data).GetStringAllocator().AllocationSize();
+		NoteSegmentDictionaryPublication(segment);
 		auto cached = segment.db.GetObjectCache().GetOrCreate<MaterializedDictionaryEntry>(
 		    segment.GetDictionaryCacheKey(), dictionary, bytes);
 		if (cached) {
 			segment.ObserveDictionaryCachePublication();
 			dictionary = cached->dictionary;
+			RememberSegmentDictionary(segment, cached);
 		}
 	}
+}
+
+string_t CompressedStringScanState::DecodeEntry(idx_t code) {
+	D_ASSERT(code >= 1 && code < dict_count);
+	D_ASSERT(!dictionary && dictionary_deferred);
+	if (!decoded_known) {
+		decoded_known = make_unsafe_uniq_array<uint8_t>(dict_count);
+		memset(decoded_known.get(), 0, dict_count);
+		decoded = make_unsafe_uniq_array_uninitialized<string_t>(dict_count);
+	}
+	if (decoded_known[code]) {
+		return decoded[code];
+	}
+	if (entry_offsets.empty()) {
+		entry_offsets.resize(dict_count + 1);
+		uint32_t offset = 0;
+		for (idx_t i = 0; i < dict_count; i++) {
+			entry_offsets[i] = offset;
+			offset += string_lengths[i];
+		}
+		entry_offsets[dict_count] = offset;
+	}
+	if (!decode_buffer) {
+		decode_buffer = make_uniq<Vector>(LogicalType::VARCHAR, 1U);
+	}
+	auto value = FetchStringFromDict(*decode_buffer, entry_offsets[code], code);
+	if (mode == DictFSSTMode::DICTIONARY && !value.IsInlined()) {
+		// a DICTIONARY-mode entry is a view into the pinned block: copy it into the scan-state buffer
+		value = StringVector::AddStringOrBlob(*decode_buffer, value);
+	}
+	decoded[code] = value;
+	decoded_known[code] = 1;
+	decoded_on_demand = true;
+	return value;
+}
+
+void CompressedStringScanState::DecodeEntriesInto(Vector &target) {
+	D_ASSERT(!dictionary && dictionary_deferred);
+	auto target_data = FlatVector::GetData<string_t>(target);
+	// the offsets run over every entry exactly as EnsureDictionary() runs them; slot zero (NULL) is not written
+	uint32_t offset = 0;
+	for (uint32_t i = 0; i < dict_count; i++) {
+		auto string_len = string_lengths[i];
+		if (i > 0) {
+			target_data[i - 1] = FetchStringFromDict(target, offset, i);
+		}
+		offset += string_len;
+	}
+}
+
+bool CompressedStringScanState::PreferOnDemandDecode(optional_ptr<ColumnScanState> column_state) const {
+	if (dictionary || !dictionary_deferred) {
+		return false;
+	}
+	if (decoded_on_demand) {
+		return true;
+	}
+	// a segment first reached inside a vector (its head piece): follow the segment scanned just before it
+	if (!column_state || column_state->previous_states.empty()) {
+		return false;
+	}
+	auto previous = dynamic_cast<const CompressedStringScanState *>(column_state->previous_states.back().get());
+	return previous && previous->decoded_on_demand && !previous->dictionary;
 }
 
 const SelectionVector &CompressedStringScanState::GetSelVec(idx_t start, idx_t scan_count) {
@@ -194,12 +298,33 @@ const SelectionVector &CompressedStringScanState::GetSelVec(idx_t start, idx_t s
 	}
 }
 
-void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_offset, idx_t start, idx_t scan_count) {
+void CompressedStringScanState::ScanToFlatVector(Vector &result, idx_t result_offset, idx_t start, idx_t scan_count,
+                                                 optional_ptr<ColumnScanState> column_state) {
 	auto result_data = FlatVector::GetData<string_t>(result);
 	auto &validity = FlatVector::Validity(result);
 
 	// Create a decompression buffer of sufficient size if we don't already have one.
 	auto &selvec = GetSelVec(start, scan_count);
+
+	if (!dictionary && dictionary_deferred) {
+		if (PreferOnDemandDecode(column_state)) {
+			for (idx_t i = 0; i < scan_count; i++) {
+				auto string_number = selvec.get_index(i);
+				if (string_number == 0) {
+					validity.SetInvalid(result_offset + i);
+					result_data[result_offset + i] = string_t(nullptr, 0);
+					continue;
+				}
+				result_data[result_offset + i] = DecodeEntry(string_number);
+			}
+			if (decode_buffer) {
+				StringVector::AddHeapReference(result, *decode_buffer);
+			}
+			result.Verify(result_offset + scan_count);
+			return;
+		}
+		EnsureDictionary();
+	}
 
 	//! (index 0 is reserved for NULL, which we don't have in this mode)
 	const idx_t start_offset = mode == DictFSSTMode::FSST_ONLY ? start + 1 : 0;
@@ -261,17 +386,43 @@ bool CompressedStringScanState::AllowDictionaryScan(idx_t scan_count) {
 	if (scan_count != STANDARD_VECTOR_SIZE) {
 		return false;
 	}
+	EnsureDictionary();
 	if (!dictionary) {
 		return false;
 	}
 	return true;
 }
 
+bool CompressedStringScanState::AllowGlobalDictionaryScan(idx_t scan_count) const {
+	// a whole or partial vector of one segment: the global child is fixed, so a partial count is a dictionary vector
+	// too (the per-segment path requires a whole vector)
+	return global_translation && mode != DictFSSTMode::FSST_ONLY && scan_count > 0 && scan_count <= STANDARD_VECTOR_SIZE;
+}
+
+void CompressedStringScanState::ScanToGlobalDictionary(const SelectionVector &local, idx_t count, Vector &result) {
+	if (!global_dictionary_sel || global_dictionary_sel_size < count) {
+		global_dictionary_sel_size = MaxValue<idx_t>(count, STANDARD_VECTOR_SIZE);
+		global_dictionary_sel = make_buffer<SelectionVector>(global_dictionary_sel_size);
+	}
+	auto out = global_dictionary_sel->data();
+	auto codes = global_translation->codes.get();
+	for (idx_t i = 0; i < count; i++) {
+		out[i] = UnsafeNumericCast<sel_t>(codes[local.get_index(i)]);
+	}
+	result.Dictionary(global_translation->VectorChild(), *global_dictionary_sel);
+}
+
 void CompressedStringScanState::ScanToDictionaryVector(ColumnSegment &segment, Vector &result, idx_t result_offset,
                                                        idx_t start, idx_t scan_count) {
-	D_ASSERT(scan_count == STANDARD_VECTOR_SIZE);
 	D_ASSERT(result_offset == 0);
-
+	if (global_translation) {
+		auto &local = GetSelVec(start, scan_count);
+		ScanToGlobalDictionary(local, scan_count, result);
+		result.Verify(result_offset + scan_count);
+		return;
+	}
+	D_ASSERT(scan_count == STANDARD_VECTOR_SIZE);
+	EnsureDictionary();
 	auto &selvec = GetSelVec(start, scan_count);
 	result.Dictionary(dictionary, selvec);
 	result.Verify(result_offset + scan_count);

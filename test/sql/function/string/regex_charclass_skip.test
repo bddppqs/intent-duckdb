@@ -3,9 +3,9 @@
 # group: [string]
 
 query TTT
-SELECT regexp_replace('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$', '\1'),
-       regexp_extract('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$', 1),
-       regexp_matches('https://www.example.test/a', '^https?://(?:www\.)?([^/]+)/.*$');
+SELECT regexp_replace('data:v1/example.test/a', '^data:(?:v1/)?([^/]+)/.*$', '\1'),
+       regexp_extract('data:v1/example.test/a', '^data:(?:v1/)?([^/]+)/.*$', 1),
+       regexp_matches('data:v1/example.test/a', '^data:(?:v1/)?([^/]+)/.*$');
 ----
 example.test	example.test	1
 
@@ -73,16 +73,15 @@ SELECT regexp_extract(repeat('abc', 40), '^([ab]+c){40}$', 1);
 abc
 
 # Sweep both sides of every possible BitState text cutoff (list_count <= 512).
-# The +/-12 band also covers the scheme prefix stripped by RE2 before dispatch.
-# This is 12,800 synthetic rows, not a benchmark-data or timing test.
+# The +/-12 band also covers the literal prefix stripped by RE2 before dispatch.
 query I
 WITH lengths AS (
   SELECT (262144 // i - 1 + delta)::INTEGER AS n
   FROM range(1, 513) lists(i), range(-12, 13) offsets(delta)
 ), strings AS (
-  SELECT 'http://h/' || repeat('a', n) AS r FROM lengths
+  SELECT 'data:h/' || repeat('a', n) AS r FROM lengths
 )
 SELECT count(*) FROM strings
-WHERE regexp_extract(r, '^https?://(?:www\.)?([^/]+)/.*$', 1) = 'h';
+WHERE regexp_extract(r, '^data:(?:v1/)?([^/]+)/.*$', 1) = 'h';
 ----
 12800

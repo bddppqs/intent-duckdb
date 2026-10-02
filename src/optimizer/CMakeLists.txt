@@ -16,6 +16,7 @@ add_library_unity(
   common_aggregate_optimizer.cpp
   common_subplan_optimizer.cpp
   compressed_materialization.cpp
+  count_first_topk.cpp
   cse_optimizer.cpp
   cte_filter_pusher.cpp
   cte_inlining.cpp
@@ -25,6 +26,7 @@ add_library_unity(
   filter_combiner.cpp
   filter_pullup.cpp
   filter_pushdown.cpp
+  first_keys_aggregate.cpp
   in_clause_rewriter.cpp
   join_filter_pushdown_optimizer.cpp
   late_materialization.cpp

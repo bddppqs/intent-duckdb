@@ -37,6 +37,7 @@ class ColumnData;
 class DuckTransaction;
 class RowGroupSegmentTree;
 class TableFilter;
+class RunAggregatePartial;
 struct AdaptiveFilterState;
 struct TableScanOptions;
 struct ScanSamplingInfo;
@@ -263,6 +264,9 @@ public:
 	optional_ptr<SegmentNode<RowGroup>> GetRootSegment() const;
 	bool Scan(DuckTransaction &transaction, DataChunk &result);
 	bool Scan(DataChunk &result, TableScanType type, optional_ptr<SegmentLock> l = nullptr);
+	//! The run-aware aggregate partial of the owning table scan: only for the main table state (never for
+	//! transaction-local storage), null when the scan feeds no run-aware aggregate
+	optional_ptr<RunAggregatePartial> GetRunAggregate();
 
 private:
 	TableScanState &parent;
@@ -306,6 +310,8 @@ public:
 	ScanFilterInfo filters;
 	//! Sampling info
 	ScanSamplingInfo sampling_info;
+	//! Per-thread run-aware aggregate partial (may be null)
+	unique_ptr<RunAggregatePartial> run_aggregate;
 
 public:
 	void Initialize(vector<StorageIndex> column_ids, optional_ptr<ClientContext> context = nullptr,
@@ -323,11 +329,23 @@ private:
 	vector<StorageIndex> column_ids;
 };
 
+//! A queued vector-range piece of a donated row group
+struct ParallelScanPiece {
+	optional_ptr<RowGroupCollection> collection;
+	optional_ptr<SegmentNode<RowGroup>> row_group;
+	idx_t vector_index;
+	idx_t max_row;
+};
+
 struct ParallelCollectionScanState {
 	ParallelCollectionScanState();
 	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(RowGroupSegmentTree &row_groups) const;
 	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(RowGroupSegmentTree &row_groups,
 	                                                    SegmentNode<RowGroup> &row_group) const;
+	//! whether row-group pieces are enabled (defined in row_group_collection.cpp; a compile-time constant), and
+	//! pieces_allowed set from the pipeline predicate once per state
+	static bool PiecesEnabled();
+	void DecidePieces(ClientContext &context, bool allowed);
 
 	//! The row group collection we are scanning
 	RowGroupCollection *collection;
@@ -341,6 +359,14 @@ struct ParallelCollectionScanState {
 
 	//! Optional state for custom row group ordering
 	unique_ptr<RowGroupReorderer> reorderer;
+
+	//! Whether the first donation_cap admitted row groups may be split into pieces (decided once)
+	bool pieces_decided;
+	bool pieces_allowed;
+	//! The scheduler's thread count at the decision; row groups donated so far; the pieces not yet handed out
+	idx_t donation_cap;
+	idx_t donated;
+	vector<ParallelScanPiece> pieces;
 };
 
 struct ParallelTableScanState {

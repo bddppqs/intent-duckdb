@@ -1,0 +1,94 @@
+# name: test/sql/storage/compression/dict_fsst/code_domain_composite.test
+# description: The mask scan and the packed-image skip on the single-code filter path of DICT_FSST: <> with the failing code filling whole 32-row
+#              blocks (the packed-image skip) and mixed blocks (the mask scan), = on a rare and on the dominant code
+#              (the ONE_PASSES mask), NULL rows inside mixed blocks (the NULL slot's term), a table whose last vector is
+#              short (the unchanged tail path); answers in closed form from the generator at threads 1 and 8
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load {TEST_DIR}/code_domain_composite.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+# t_blocks: 368,640 rows (180 whole vectors); in every block of 32 rows whose index is not a multiple of 3, s and n
+# are '' (a whole all-'' block); in the other blocks s = 'v' || lpad(i % 40) and n the same with a NULL every 13th row
+statement ok
+CREATE TABLE t_blocks AS SELECT i::BIGINT AS i, CASE WHEN (i // 32) % 3 <> 0 THEN '' ELSE 'v' || lpad((i % 40)::VARCHAR, 2, '0') END AS s, CASE WHEN (i // 32) % 3 <> 0 THEN '' WHEN i % 13 = 0 THEN NULL ELSE 'w' || lpad((i % 40)::VARCHAR, 2, '0') END AS n FROM range(368640) t(i)
+
+# t_tail: the same generator over 370,000 rows (the last vector short)
+statement ok
+CREATE TABLE t_tail AS SELECT i::BIGINT AS i, CASE WHEN (i // 32) % 3 <> 0 THEN '' ELSE 'v' || lpad((i % 40)::VARCHAR, 2, '0') END AS s, CASE WHEN (i // 32) % 3 <> 0 THEN '' WHEN i % 13 = 0 THEN NULL ELSE 'w' || lpad((i % 40)::VARCHAR, 2, '0') END AS n FROM range(370000) t(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST') FROM pragma_storage_info('t_blocks') WHERE column_name IN ('s', 'n') AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# ONE_FAILS, the failing code filling two of every three blocks
+query IIIII
+SELECT count(*), count(DISTINCT s), min(i), max(i), sum(i) FROM t_blocks WHERE s <> ''
+----
+122880	40	0	368575	22645248000
+
+# ONE_PASSES on a rare code
+query II
+SELECT count(*), sum(i) FROM t_blocks WHERE s = 'v07'
+----
+3072	566068224
+
+# ONE_PASSES on the dominant code (whole blocks survive)
+query II
+SELECT count(*), sum(i) FROM t_blocks WHERE s = ''
+----
+245760	45302292480
+
+# ONE_FAILS with NULL rows in the mixed blocks (the NULL slot fails <>)
+query III
+SELECT count(*), count(DISTINCT n), sum(i) FROM t_blocks WHERE n <> ''
+----
+113428	40	20903419392
+
+query I
+SELECT count(*) FROM t_blocks WHERE n IS NULL
+----
+9452
+
+# the short last vector
+query IIIII
+SELECT count(*), count(DISTINCT s), min(i), max(i), sum(i) FROM t_tail WHERE s <> ''
+----
+123344	40	0	369999	22816605080
+
+query II
+SELECT count(*), sum(i) FROM t_tail WHERE s = 'v07'
+----
+3083	570129901
+
+query II
+SELECT count(*), sum(i) FROM t_tail WHERE s = ''
+----
+246656	45633209920
+
+query III
+SELECT count(*), count(DISTINCT n), sum(i) FROM t_tail WHERE n <> ''
+----
+113856	40	21061481749
+
+query I
+SELECT count(*) FROM t_tail WHERE n IS NULL
+----
+9488
+
+endloop

@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/execution/executor.hpp"
+#include "duckdb/parallel/pipeline.hpp"
 
 namespace duckdb {
 
@@ -17,7 +18,17 @@ void Event::CompleteDependency() {
 	if (current_finished == total_dependencies) {
 		// all dependencies have been completed: schedule the event
 		D_ASSERT(total_tasks == 0);
-		Schedule();
+		{
+			struct SchedulingGuard {
+				bool &scheduling;
+				bool saved;
+				~SchedulingGuard() {
+					scheduling = saved;
+				}
+			} guard {Pipeline::SchedulingCompletedDependency(), Pipeline::SchedulingCompletedDependency()};
+			guard.scheduling = true;
+			Schedule();
+		}
 		if (total_tasks == 0) {
 			Finish();
 		}
@@ -81,6 +92,26 @@ void Event::SetTasks(vector<shared_ptr<Task>> tasks) {
 	D_ASSERT(total_tasks == 0);
 	D_ASSERT(!tasks.empty());
 	this->total_tasks = tasks.size();
+	auto &inline_requested = Pipeline::InlineTaskRequested();
+	if (inline_requested && tasks.size() == 1) {
+		// run the one task of a sequential pipeline here for a partial step instead of queueing it and
+		// waking a worker; what it does not finish takes the usual paths (the queue, or the executor's reschedule set)
+		inline_requested = false;
+		auto task = std::move(tasks[0]);
+		auto result = task->Execute(TaskExecutionMode::PROCESS_PARTIAL);
+		switch (result) {
+		case TaskExecutionResult::TASK_FINISHED:
+		case TaskExecutionResult::TASK_ERROR: // the executor holds the error, as for a queued task
+			return;
+		case TaskExecutionResult::TASK_NOT_FINISHED:
+			ts.ScheduleTask(executor.GetToken(), std::move(task));
+			return;
+		case TaskExecutionResult::TASK_BLOCKED:
+			task->Deschedule();
+			return;
+		}
+		return;
+	}
 	ts.ScheduleTasks(executor.GetToken(), tasks);
 }
 

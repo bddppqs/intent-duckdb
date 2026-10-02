@@ -19,6 +19,7 @@
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 
 namespace duckdb {
+class RunAggregateData;
 
 //! Represents a scan of a base table
 class PhysicalTableScan : public PhysicalOperator {
@@ -56,6 +57,8 @@ public:
 	shared_ptr<DynamicTableFilterSet> dynamic_filters;
 	//! Virtual columns
 	virtual_column_map_t virtual_columns;
+	//! Run-aware aggregation descriptor shared with the ungrouped aggregate above this scan (may be null)
+	shared_ptr<RunAggregateData> run_aggregate;
 
 public:
 	string GetName() const override;

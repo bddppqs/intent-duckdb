@@ -1,0 +1,701 @@
+# name: test/sql/aggregate/group/dict_global_code_keys.test
+# description: Group keys typed as their global codes match the general aggregate
+# group: [group]
+
+# A group key over a published admitted column is typed as its code on a plan made after the publish, and re-emitted as the string; every answer equals the general aggregate's
+
+statement ok
+ATTACH '__TEST_DIR__/dict_global_code_keys.db' AS globaldict (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE globaldict
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE docs AS SELECT i AS id, (i % 13)::SMALLINT AS cat, (hash(i) % 5000)::BIGINT AS owner, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://www.example.org/globaldict/some/long/path/' || (hash(i // 3) % 20000)::VARCHAR END AS addr, CASE WHEN i % 5 = 0 THEN '' ELSE 'catalogue item number ' || (hash(i // 2) % 3000)::VARCHAR END AS word, 'topic-of-the-page-number-' || (i % 211)::VARCHAR AS label FROM range(400000) r(i)
+
+statement ok
+CHECKPOINT
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/7646	53
+https://www.example.org/globaldict/some/long/path/13103	52
+https://www.example.org/globaldict/some/long/path/14090	51
+https://www.example.org/globaldict/some/long/path/4378	51
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/7646	53
+1	https://www.example.org/globaldict/some/long/path/13103	52
+1	https://www.example.org/globaldict/some/long/path/14090	51
+1	https://www.example.org/globaldict/some/long/path/4378	51
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 63	159
+catalogue item number 2096	158
+catalogue item number 2881	158
+catalogue item number 1990	153
+catalogue item number 1516	149
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+4	catalogue item number 2754	22
+9	catalogue item number 1801	22
+12	catalogue item number 2675	22
+2	catalogue item number 631	21
+4	catalogue item number 1217	21
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+1790	(empty)	31
+200	(empty)	30
+2023	(empty)	29
+4592	(empty)	29
+113	(empty)	28
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+87	40	(empty)	8
+2110	55	(empty)	8
+3428	40	(empty)	8
+3900	0	(empty)	8
+503	25	(empty)	7
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19979
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+184977460081451630916906	19980	1087743
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234960280856016582511624	19980
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+topic-of-the-page-number-101	1896	399946
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/7646	https://www.example.org/globaldict/some/long/path/7646	topic-of-the-page-number-88	53
+https://www.example.org/globaldict/some/long/path/13103	https://www.example.org/globaldict/some/long/path/13103	topic-of-the-page-number-9	52
+https://www.example.org/globaldict/some/long/path/14090	https://www.example.org/globaldict/some/long/path/14090	topic-of-the-page-number-9	51
+https://www.example.org/globaldict/some/long/path/4378	https://www.example.org/globaldict/some/long/path/4378	topic-of-the-page-number-66	51
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/7646	53
+https://www.example.org/globaldict/some/long/path/13103	52
+https://www.example.org/globaldict/some/long/path/14090	51
+https://www.example.org/globaldict/some/long/path/4378	51
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/7646	53
+1	https://www.example.org/globaldict/some/long/path/13103	52
+1	https://www.example.org/globaldict/some/long/path/14090	51
+1	https://www.example.org/globaldict/some/long/path/4378	51
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 63	159
+catalogue item number 2096	158
+catalogue item number 2881	158
+catalogue item number 1990	153
+catalogue item number 1516	149
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+4	catalogue item number 2754	22
+9	catalogue item number 1801	22
+12	catalogue item number 2675	22
+2	catalogue item number 631	21
+4	catalogue item number 1217	21
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+1790	(empty)	31
+200	(empty)	30
+2023	(empty)	29
+4592	(empty)	29
+113	(empty)	28
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+87	40	(empty)	8
+2110	55	(empty)	8
+3428	40	(empty)	8
+3900	0	(empty)	8
+503	25	(empty)	7
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19979
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+184977460081451630916906	19980	1087743
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234960280856016582511624	19980
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+topic-of-the-page-number-101	1896	399946
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/7646	https://www.example.org/globaldict/some/long/path/7646	topic-of-the-page-number-88	53
+https://www.example.org/globaldict/some/long/path/13103	https://www.example.org/globaldict/some/long/path/13103	topic-of-the-page-number-9	52
+https://www.example.org/globaldict/some/long/path/14090	https://www.example.org/globaldict/some/long/path/14090	topic-of-the-page-number-9	51
+https://www.example.org/globaldict/some/long/path/4378	https://www.example.org/globaldict/some/long/path/4378	topic-of-the-page-number-66	51
+
+# rows appended after the publish arrive over no published dictionary: looked up, or given codes of their own; the answers are unchanged
+
+statement ok
+INSERT INTO docs SELECT 500000 + i, 2, 2, 'https://www.example.org/globaldict/some/long/path/' || 'appended-' || (i % 7)::VARCHAR, 'catalogue item number ' || (i % 5)::VARCHAR, 'topic-of-the-page-number-5' FROM range(3000) r(i)
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/appended-0	429
+https://www.example.org/globaldict/some/long/path/appended-1	429
+https://www.example.org/globaldict/some/long/path/appended-2	429
+https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/appended-0	429
+1	https://www.example.org/globaldict/some/long/path/appended-1	429
+1	https://www.example.org/globaldict/some/long/path/appended-2	429
+1	https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 0	725
+catalogue item number 1	721
+catalogue item number 4	720
+catalogue item number 3	700
+catalogue item number 2	691
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	612
+2	catalogue item number 4	611
+2	catalogue item number 2	606
+2	catalogue item number 3	606
+2	catalogue item number 1	603
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	600
+2	catalogue item number 1	600
+2	catalogue item number 2	600
+2	catalogue item number 3	600
+2	catalogue item number 4	600
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+2	0	catalogue item number 0	50
+2	1	catalogue item number 1	50
+2	2	catalogue item number 2	50
+2	3	catalogue item number 3	50
+2	4	catalogue item number 4	50
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19986
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+185034451185336704156852	19987	1088163
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234973891312817694223382	19987
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-5	4896	502999
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/appended-0	https://www.example.org/globaldict/some/long/path/appended-0	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-1	https://www.example.org/globaldict/some/long/path/appended-1	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-2	https://www.example.org/globaldict/some/long/path/appended-2	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-3	https://www.example.org/globaldict/some/long/path/appended-3	topic-of-the-page-number-5	429
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/appended-0	429
+https://www.example.org/globaldict/some/long/path/appended-1	429
+https://www.example.org/globaldict/some/long/path/appended-2	429
+https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/appended-0	429
+1	https://www.example.org/globaldict/some/long/path/appended-1	429
+1	https://www.example.org/globaldict/some/long/path/appended-2	429
+1	https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 0	725
+catalogue item number 1	721
+catalogue item number 4	720
+catalogue item number 3	700
+catalogue item number 2	691
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	612
+2	catalogue item number 4	611
+2	catalogue item number 2	606
+2	catalogue item number 3	606
+2	catalogue item number 1	603
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	600
+2	catalogue item number 1	600
+2	catalogue item number 2	600
+2	catalogue item number 3	600
+2	catalogue item number 4	600
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+2	0	catalogue item number 0	50
+2	1	catalogue item number 1	50
+2	2	catalogue item number 2	50
+2	3	catalogue item number 3	50
+2	4	catalogue item number 4	50
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19986
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+185034451185336704156852	19987	1088163
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234973891312817694223382	19987
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-5	4896	502999
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/appended-0	https://www.example.org/globaldict/some/long/path/appended-0	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-1	https://www.example.org/globaldict/some/long/path/appended-1	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-2	https://www.example.org/globaldict/some/long/path/appended-2	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-3	https://www.example.org/globaldict/some/long/path/appended-3	topic-of-the-page-number-5	429
+
+statement ok
+CHECKPOINT
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/appended-0	429
+https://www.example.org/globaldict/some/long/path/appended-1	429
+https://www.example.org/globaldict/some/long/path/appended-2	429
+https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/appended-0	429
+1	https://www.example.org/globaldict/some/long/path/appended-1	429
+1	https://www.example.org/globaldict/some/long/path/appended-2	429
+1	https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 0	725
+catalogue item number 1	721
+catalogue item number 4	720
+catalogue item number 3	700
+catalogue item number 2	691
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	612
+2	catalogue item number 4	611
+2	catalogue item number 2	606
+2	catalogue item number 3	606
+2	catalogue item number 1	603
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	600
+2	catalogue item number 1	600
+2	catalogue item number 2	600
+2	catalogue item number 3	600
+2	catalogue item number 4	600
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+2	0	catalogue item number 0	50
+2	1	catalogue item number 1	50
+2	2	catalogue item number 2	50
+2	3	catalogue item number 3	50
+2	4	catalogue item number 4	50
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19986
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+185034451185336704156852	19987	1088163
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234973891312817694223382	19987
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-5	4896	502999
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/appended-0	https://www.example.org/globaldict/some/long/path/appended-0	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-1	https://www.example.org/globaldict/some/long/path/appended-1	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-2	https://www.example.org/globaldict/some/long/path/appended-2	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-3	https://www.example.org/globaldict/some/long/path/appended-3	topic-of-the-page-number-5	429
+
+query II
+SELECT addr, count(*) AS c FROM docs GROUP BY addr ORDER BY c DESC, addr LIMIT 5
+----
+NULL	4124
+https://www.example.org/globaldict/some/long/path/appended-0	429
+https://www.example.org/globaldict/some/long/path/appended-1	429
+https://www.example.org/globaldict/some/long/path/appended-2	429
+https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query III
+SELECT 1, addr, count(*) AS c FROM docs GROUP BY 1, addr ORDER BY c DESC, addr LIMIT 5
+----
+1	NULL	4124
+1	https://www.example.org/globaldict/some/long/path/appended-0	429
+1	https://www.example.org/globaldict/some/long/path/appended-1	429
+1	https://www.example.org/globaldict/some/long/path/appended-2	429
+1	https://www.example.org/globaldict/some/long/path/appended-3	429
+
+query II
+SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 5
+----
+catalogue item number 0	725
+catalogue item number 1	721
+catalogue item number 4	720
+catalogue item number 3	700
+catalogue item number 2	691
+
+query II
+SELECT word, count(DISTINCT owner) AS u FROM docs WHERE word <> '' GROUP BY word ORDER BY u DESC, word LIMIT 5
+----
+catalogue item number 2881	150
+catalogue item number 2096	146
+catalogue item number 1990	145
+catalogue item number 2163	145
+catalogue item number 63	144
+
+query III
+SELECT cat, word, count(*) AS c FROM docs WHERE word <> '' GROUP BY cat, word ORDER BY c DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	612
+2	catalogue item number 4	611
+2	catalogue item number 2	606
+2	catalogue item number 3	606
+2	catalogue item number 1	603
+
+query III
+SELECT owner, word, count(*) FROM docs GROUP BY owner, word ORDER BY count(*) DESC, 1, 2 LIMIT 5
+----
+2	catalogue item number 0	600
+2	catalogue item number 1	600
+2	catalogue item number 2	600
+2	catalogue item number 3	600
+2	catalogue item number 4	600
+
+query IIII
+SELECT owner, id % 60 AS m, word, count(*) FROM docs GROUP BY owner, m, word ORDER BY count(*) DESC, 1, 2, 3 LIMIT 5
+----
+2	0	catalogue item number 0	50
+2	1	catalogue item number 1	50
+2	2	catalogue item number 2	50
+2	3	catalogue item number 3	50
+2	4	catalogue item number 4	50
+
+query II
+SELECT addr IS NULL, count(*) FROM (SELECT addr, count(*) FROM docs GROUP BY addr) GROUP BY 1 ORDER BY 1
+----
+false	19986
+true	1
+
+query III
+SELECT sum(hash(u, c)), count(*), sum(length(u)) FROM (SELECT addr u, count(*) c FROM docs GROUP BY addr)
+----
+185034451185336704156852	19987	1088163
+
+query II
+SELECT sum(hash(regexp_replace(u, '[0-9]+', 'N'))), count(*) FROM (SELECT addr u FROM docs GROUP BY addr)
+----
+234973891312817694223382	19987
+
+query III
+SELECT u, c, l FROM (SELECT addr u, count(*) c, max(length(addr)) l FROM docs GROUP BY addr) WHERE u LIKE '%/1234%' ORDER BY u
+----
+https://www.example.org/globaldict/some/long/path/1234	20	54
+https://www.example.org/globaldict/some/long/path/12340	18	55
+https://www.example.org/globaldict/some/long/path/12341	35	55
+https://www.example.org/globaldict/some/long/path/12342	15	55
+https://www.example.org/globaldict/some/long/path/12343	9	55
+https://www.example.org/globaldict/some/long/path/12344	27	55
+https://www.example.org/globaldict/some/long/path/12345	33	55
+https://www.example.org/globaldict/some/long/path/12346	9	55
+https://www.example.org/globaldict/some/long/path/12347	21	55
+https://www.example.org/globaldict/some/long/path/12348	21	55
+https://www.example.org/globaldict/some/long/path/12349	30	55
+
+query III
+SELECT t.label, t.c, h.n FROM (SELECT label, count(*) c FROM docs GROUP BY label) t JOIN (SELECT label, max(id) n FROM docs GROUP BY label) h ON t.label = h.label ORDER BY t.c DESC, t.label LIMIT 5
+----
+topic-of-the-page-number-5	4896	502999
+topic-of-the-page-number-0	1896	399845
+topic-of-the-page-number-1	1896	399846
+topic-of-the-page-number-10	1896	399855
+topic-of-the-page-number-100	1896	399945
+
+query IIII
+SELECT addr, min(addr), max(label), count(*) FROM docs GROUP BY addr ORDER BY 4 DESC, 1 LIMIT 5
+----
+NULL	NULL	topic-of-the-page-number-99	4124
+https://www.example.org/globaldict/some/long/path/appended-0	https://www.example.org/globaldict/some/long/path/appended-0	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-1	https://www.example.org/globaldict/some/long/path/appended-1	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-2	https://www.example.org/globaldict/some/long/path/appended-2	topic-of-the-page-number-5	429
+https://www.example.org/globaldict/some/long/path/appended-3	https://www.example.org/globaldict/some/long/path/appended-3	topic-of-the-page-number-5	429
+

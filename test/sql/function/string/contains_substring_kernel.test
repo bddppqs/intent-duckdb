@@ -1,0 +1,192 @@
+# name: test/sql/function/string/contains_substring_kernel.test
+# description: The run-time-dispatched vector substring kernel behind FindStrInStr: every arm of the needle-size switch (lengths 1..16 and 17..64), matches at offset 0, in the interior, at the last possible offset and absent, degenerate needles and haystacks, NULLs, multi-byte sequences, the inlined and pointer forms of string_t, and dictionary-compressed against uncompressed storage of the same values. Every expectation is an invariant or an independent oracle (min(k) over substr(s, k, len(n)) = n, which does not go through FindStrInStr), so no expected value restates the implementation.
+# group: [string]
+
+require vector_size 2048
+
+load {TEST_DIR}/contains_substring_kernel.db readwrite v1.5.0
+
+# long values (the pointer form of string_t) in a dictionary-compressed and an uncompressed copy of the same data
+statement ok
+CREATE TABLE t_long(i BIGINT, s VARCHAR USING COMPRESSION 'dict_fsst', s_flat VARCHAR USING COMPRESSION 'uncompressed')
+
+statement ok
+INSERT INTO t_long SELECT i::BIGINT, v, v FROM (SELECT i, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://example.org/path/' || md5((i // 3)::VARCHAR) || '/leaf/' || lpad((i % 977)::VARCHAR, 4, '0') END AS v FROM range(24576) tbl(i))
+
+# short values (the inlined form of string_t: at most 12 bytes)
+statement ok
+CREATE TABLE t_inline(i BIGINT, s VARCHAR USING COMPRESSION 'dict_fsst', s_flat VARCHAR USING COMPRESSION 'uncompressed')
+
+statement ok
+INSERT INTO t_inline SELECT i::BIGINT, v, v FROM (SELECT i, CASE WHEN i % 91 = 0 THEN NULL ELSE 'v' || lpad((i % 900)::VARCHAR, 3, '0') END AS v FROM range(12288) tbl(i))
+
+# multi-byte (high-byte) sequences
+statement ok
+CREATE TABLE t_bytes(i BIGINT, s VARCHAR USING COMPRESSION 'dict_fsst', s_flat VARCHAR USING COMPRESSION 'uncompressed')
+
+statement ok
+INSERT INTO t_bytes SELECT i::BIGINT, v, v FROM (SELECT i, 'na' || chr(233) || chr(20013) || chr(65279) || lpad((i % 313)::VARCHAR, 3, '0') || chr(200) || repeat(chr(228), i % 17) AS v FROM range(8192) tbl(i))
+
+# a haystack whose tail is a proper prefix of the needle, and one whose first needle byte repeats many times
+statement ok
+CREATE TABLE t_prefix(i BIGINT, s VARCHAR USING COMPRESSION 'dict_fsst', s_flat VARCHAR USING COMPRESSION 'uncompressed')
+
+statement ok
+INSERT INTO t_prefix SELECT i::BIGINT, v, v FROM (SELECT i, repeat('a', 30 + (i % 70)) || substr('needle-tail', 1, 1 + (i % 10)) AS v FROM range(8192) tbl(i))
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the dictionary column really is DICT_FSST in storage (never inferred)
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST') FROM pragma_storage_info('t_long') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression <> 'DICT_FSST') FROM pragma_storage_info('t_long') WHERE column_name = 's_flat' AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# ---------------------------------------------------------------------------------------------------------------
+# the returned index against an independent oracle: min(k) over substr(s, k, length(n)) = n, which never calls
+# FindStrInStr. Needle lengths 1..64 from the data itself at offset 0, in the interior and at the last possible
+# offset, plus an absent needle. A non-zero count would name the disagreeing (haystack, needle) pair.
+# ---------------------------------------------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+  SELECT h.s AS s, n.needle AS needle, instr(h.s, n.needle) AS got,
+         coalesce((SELECT min(k) FROM range(1, length(h.s) - length(n.needle) + 2) g(k)
+                   WHERE substr(h.s, k, length(n.needle)) = n.needle), 0) AS want
+  FROM (SELECT s FROM t_long WHERE s IS NOT NULL AND s <> '' AND i % 512 = 0) h,
+       LATERAL (SELECT unnest([substr(h.s, 1, L), substr(h.s, greatest(1, (length(h.s) - L) // 2), L),
+                               substr(h.s, greatest(1, length(h.s) - L + 1), L), 'ZQ' || repeat('Q', L)]) AS needle
+                FROM range(1, 65) r(L)) n
+) WHERE got IS DISTINCT FROM want
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT h.s AS s, n.needle AS needle, instr(h.s, n.needle) AS got,
+         coalesce((SELECT min(k) FROM range(1, length(h.s) - length(n.needle) + 2) g(k)
+                   WHERE substr(h.s, k, length(n.needle)) = n.needle), 0) AS want
+  FROM (SELECT s FROM t_bytes WHERE i % 256 = 0) h,
+       LATERAL (SELECT unnest([substr(h.s, 1, L), substr(h.s, greatest(1, (length(h.s) - L) // 2), L),
+                               substr(h.s, greatest(1, length(h.s) - L + 1), L), 'ZQ' || repeat('Q', L)]) AS needle
+                FROM range(1, 33) r(L)) n
+) WHERE got IS DISTINCT FROM want
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT h.s AS s, n.needle AS needle, instr(h.s, n.needle) AS got,
+         coalesce((SELECT min(k) FROM range(1, length(h.s) - length(n.needle) + 2) g(k)
+                   WHERE substr(h.s, k, length(n.needle)) = n.needle), 0) AS want
+  FROM (SELECT s FROM t_prefix WHERE i % 256 = 0) h,
+       LATERAL (SELECT unnest(['needle-tail', 'needle', 'an', 'aaaaaaaaaan', 'aa', 'a', substr(h.s, 1, L),
+                               substr(h.s, greatest(1, length(h.s) - L + 1), L)]) AS needle
+                FROM range(1, 40) r(L)) n
+) WHERE got IS DISTINCT FROM want
+----
+0
+
+query I
+SELECT count(*) FROM (
+  SELECT h.s AS s, n.needle AS needle, instr(h.s, n.needle) AS got,
+         coalesce((SELECT min(k) FROM range(1, length(h.s) - length(n.needle) + 2) g(k)
+                   WHERE substr(h.s, k, length(n.needle)) = n.needle), 0) AS want
+  FROM (SELECT s FROM t_inline WHERE s IS NOT NULL AND i % 64 = 0) h,
+       LATERAL (SELECT unnest([substr(h.s, 1, L), substr(h.s, greatest(1, length(h.s) - L + 1), L),
+                               'ZQ' || repeat('Q', L)]) AS needle
+                FROM range(1, 17) r(L)) n
+) WHERE got IS DISTINCT FROM want
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------
+# contains(), position(), strpos() and LIKE '%needle%' agree with instr() on every row of every table
+# ---------------------------------------------------------------------------------------------------------------
+query I
+SELECT count(*) FROM t_long, (SELECT unnest(['example', 'leaf', 'e', 'https://example.org/path/', 'zzz', '']) AS n)
+WHERE contains(s, n) IS DISTINCT FROM (instr(s, n) > 0)
+   OR position(n IN s) IS DISTINCT FROM instr(s, n)
+   OR strpos(s, n) IS DISTINCT FROM instr(s, n)
+   OR (s LIKE '%' || n || '%') IS DISTINCT FROM (instr(s, n) > 0)
+----
+0
+
+query I
+SELECT count(*) FROM t_bytes, (SELECT unnest([chr(233) || chr(20013), chr(200), chr(228) || chr(228), 'na', 'zz']) AS n)
+WHERE contains(s, n) IS DISTINCT FROM (instr(s, n) > 0) OR strpos(s, n) IS DISTINCT FROM instr(s, n)
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------
+# the dictionary-compressed and the uncompressed copies of the same values answer identically
+# ---------------------------------------------------------------------------------------------------------------
+query I
+SELECT count(*) FROM t_long, (SELECT unnest(['example', 'leaf', 'a', 'org/path', 'ZQQQ', substr('needle', 1, 3)]) AS n)
+WHERE instr(s, n) IS DISTINCT FROM instr(s_flat, n) OR contains(s, n) IS DISTINCT FROM contains(s_flat, n)
+----
+0
+
+query I
+SELECT count(*) FROM t_inline, (SELECT unnest(['v0', '00', '9', 'v', 'zz']) AS n)
+WHERE instr(s, n) IS DISTINCT FROM instr(s_flat, n) OR contains(s, n) IS DISTINCT FROM contains(s_flat, n)
+----
+0
+
+query I
+SELECT count(*) FROM t_prefix, (SELECT unnest(['needle-tail', 'needle', 'aaaaaaaaaan', 'an', 'a']) AS n)
+WHERE instr(s, n) IS DISTINCT FROM instr(s_flat, n) OR contains(s, n) IS DISTINCT FROM contains(s_flat, n)
+----
+0
+
+# ---------------------------------------------------------------------------------------------------------------
+# degenerate needles and haystacks, checked against the same independent oracle where it is defined
+# ---------------------------------------------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+  SELECT v.h AS h, v.n AS n, instr(v.h, v.n) AS got,
+         coalesce((SELECT min(k) FROM range(1, length(v.h) - length(v.n) + 2) g(k)
+                   WHERE substr(v.h, k, length(v.n)) = v.n), 0) AS want
+  FROM (VALUES ('abc', ''), ('abc', 'abcd'), ('abc', 'abc'), ('', 'abc'), ('', ''),
+               ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'aaab'),
+               (repeat('a', 4096), 'ab'), (repeat('a', 4096) || 'b', 'ab'), (repeat('ab', 2048), 'ba'),
+               ('abc', repeat('a', 5000)), (repeat('x', 31), 'xxx'), (repeat('x', 32), 'xxx'),
+               (repeat('x', 33), 'xxx'), (repeat('x', 34) || 'y', 'xy'), (repeat('x', 36) || 'y', 'xy'),
+               ('abcdefghijklmnopqrstuvwxyz0123456789', 'z0123456789'),
+               ('abcdefghijklmnopqrstuvwxyz0123456789', '9'),
+               ('abcdefghijklmnopqrstuvwxyz0123456789', 'a')) v(h, n)
+) WHERE got IS DISTINCT FROM want
+----
+0
+
+# NULL on either side or both propagates
+query I
+SELECT count(*) FROM (VALUES (NULL, 'a'), ('a', NULL), (NULL, NULL)) v(h, n)
+WHERE instr(v.h, v.n) IS NOT NULL OR contains(v.h, v.n) IS NOT NULL OR strpos(v.h, v.n) IS NOT NULL
+----
+0
+
+# a NULL haystack among real ones does not disturb its neighbours in the same vector
+query I
+SELECT count(*) FROM t_long WHERE s IS NULL AND (instr(s, 'example') IS NOT NULL OR contains(s, 'example') IS NOT NULL)
+----
+0
+
+query I
+SELECT count(*) FILTER (WHERE contains(s, 'example')) = count(*) FILTER (WHERE s IS NOT NULL AND s <> '') FROM t_long
+----
+true
+
+endloop

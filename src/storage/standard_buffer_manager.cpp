@@ -13,6 +13,9 @@
 #include "duckdb/storage/block_allocator.hpp"
 #include "duckdb/common/encryption_functions.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -698,8 +701,32 @@ void StandardBufferManager::FreeReservedMemory(idx_t size) {
 //===--------------------------------------------------------------------===//
 // Buffer Allocator
 //===--------------------------------------------------------------------===//
+// With kLateMaterializedRowIdFetch the reservation's size text is formatted only when the reservation fails.
+// EvictBlocksOrThrow takes its message arguments by value, so every allocation formatted
+// BytesToHumanReadableString(size) for an out-of-memory message it almost never raised; the lazy path makes the same
+// reservation and throws the same message. Off, the eager text is kept.
+static bool LazyReservationText() {
+	return kLateMaterializedRowIdFetch;
+}
+
 data_ptr_t StandardBufferManager::BufferAllocatorAllocate(PrivateAllocatorData *private_data, idx_t size) {
 	auto &data = private_data->Cast<BufferAllocatorData>();
+	if (LazyReservationText()) {
+		auto &manager = data.manager;
+		auto &pool = manager.buffer_pool;
+		auto r = pool.EvictBlocks(MemoryTag::ALLOCATOR, size, pool.maximum_memory, nullptr);
+		if (!r.success) {
+			string extra_text =
+			    StringUtil::Format(" (%s/%s used)", StringUtil::BytesToHumanReadableString(manager.GetUsedMemory()),
+			                       StringUtil::BytesToHumanReadableString(manager.GetMaxMemory()));
+			extra_text += manager.InMemoryWarning();
+			throw OutOfMemoryException("failed to allocate data of size %s%s",
+			                           StringUtil::BytesToHumanReadableString(size), extra_text);
+		}
+		// We rely on manual tracking of this one. :(
+		r.reservation.size = 0;
+		return Allocator::Get(manager.db).AllocateData(size);
+	}
 	auto reservation =
 	    data.manager.EvictBlocksOrThrow(MemoryTag::ALLOCATOR, size, nullptr, "failed to allocate data of size %s%s",
 	                                    StringUtil::BytesToHumanReadableString(size));

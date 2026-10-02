@@ -416,7 +416,6 @@ void TupleDataCollection::CopyRows(TupleDataChunkState &chunk_state, TupleDataCh
 		const auto source_heap_locations = FlatVector::GetData<data_ptr_t>(input.heap_locations);
 		const auto target_heap_locations = FlatVector::GetData<data_ptr_t>(chunk_state.heap_locations);
 		const auto heap_sizes = FlatVector::GetData<idx_t>(input.heap_sizes);
-		VerifyHeapSizes(source_locations, heap_sizes, append_sel, append_count, layout.GetHeapSizeOffset());
 
 		// Check if we need to copy anything at all
 		idx_t total_heap_size = 0;
@@ -432,8 +431,11 @@ void TupleDataCollection::CopyRows(TupleDataChunkState &chunk_state, TupleDataCh
 			}
 		}
 		if (total_heap_size == 0) {
+			// a caller may copy rows without their heap, so the rows' own heap sizes are
+			// verified against the input only when there is a heap to copy
 			return;
 		}
+		VerifyHeapSizes(source_locations, heap_sizes, append_sel, append_count, layout.GetHeapSizeOffset());
 
 		// Copy heap
 		if (!append_sel.IsSet()) {
@@ -487,7 +489,26 @@ void TupleDataCollection::Combine(TupleDataCollection &other) {
 	for (auto &other_seg : other.segments) {
 		AddSegment(std::move(other_seg));
 	}
+	// the owners of the borrowed string bytes move with the rows, each held once
+	HoldBorrowedOwners(other);
 	other.Reset();
+}
+
+bool TupleDataCollection::HoldBorrowedOwner(const buffer_ptr<VectorBuffer> &owner) {
+	if (!held_owners.empty() && held_owners.back() == owner) {
+		return false; // the common case: consecutive appends from one dictionary
+	}
+	if (!held_owner_ids.insert(owner.get()).second) {
+		return false; // already held (at most one entry per owner)
+	}
+	held_owners.push_back(owner);
+	return true;
+}
+
+void TupleDataCollection::HoldBorrowedOwners(const TupleDataCollection &other) {
+	for (auto &owner : other.held_owners) {
+		HoldBorrowedOwner(owner);
+	}
 }
 
 void TupleDataCollection::AddSegment(unsafe_arena_ptr<TupleDataSegment> segment) {
@@ -505,6 +526,8 @@ void TupleDataCollection::Reset() {
 	count = 0;
 	data_size = 0;
 	segments.clear();
+	held_owners.clear();
+	held_owner_ids.clear();
 
 	// Refreshes the TupleDataAllocator to prevent holding on to allocated data unnecessarily
 	allocator = make_shared_ptr<TupleDataAllocator>(*allocator);

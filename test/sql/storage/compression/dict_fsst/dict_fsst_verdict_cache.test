@@ -1,0 +1,279 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_verdict_cache.test
+# description: Cross-request DICT_FSST verdict cache: canonical contains / NOT contains / LIKE / NOT LIKE filters over persistent DICT_FSST- and DICTIONARY-mode columns on whole vectors (dense form) and after a selective filter on another column (sparse form), each statement three times per thread count so later runs read the verdicts earlier runs published; NULL and '' rows, the empty needle, needles with special bytes, multibyte needles, 256- and 257-byte needles, five needles on one dictionary, two canonical filters in one query and non-canonical shapes; then UPDATE, DELETE, CHECKPOINT, a dropped and reloaded table and a restart between runs; the answers are the plain engine answers at threads 1 and 8
+# group: [dict_fsst]
+
+load {TEST_DIR}/dict_fsst_verdict_cache.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_v AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://example.com/' || CASE WHEN (i // 3) % 13 = 0 THEN 'gopher/' ELSE 'site/' END || md5((i // 3)::VARCHAR) || CASE WHEN (i // 3) % 7 = 0 THEN '/.gopher./%_#v0' ELSE '/page' END END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS d, CASE WHEN i % 103 = 0 THEN NULL ELSE 'ü' || ((i // 3) % 500)::VARCHAR || '日本' || repeat('a', ((i // 3) % 300)::INTEGER) END AS m FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the modes read from segment_info: s and m mostly DICT_FSST mode, d DICTIONARY mode
+query I
+SELECT count(*) FILTER (WHERE segment_info LIKE 'DICT_FSST:%') >= 10 AND bool_and(compression = 'DICT_FSST') FROM pragma_storage_info('t_v') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICT_FSST:%') FROM pragma_storage_info('t_v') WHERE column_name = 'm' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICTIONARY:%') FROM pragma_storage_info('t_v') WHERE column_name = 'd' AND segment_type = 'VARCHAR'
+----
+true
+
+loop r 0 6
+
+statement ok
+SET threads = CASE WHEN ${r} < 3 THEN 1 ELSE 8 END
+
+# dense form: contains, NOT contains, LIKE, NOT LIKE on the DICT_FSST column
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE contains(s, 'gopher')
+----
+61299	61299	https://example.com/gopher/0024bd2092a4f3eaa6bd8c1728d3e007/page	https://example.com/site/fffffe98d0963d27015c198262d97221/.gopher./%_#v0
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE NOT contains(s, '.gopher.')
+----
+254967	254967	(empty)	https://example.com/site/fffee5badc626a2ab8086120712e5639/page
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE s LIKE '%gopher%'
+----
+61299	61299	https://example.com/gopher/0024bd2092a4f3eaa6bd8c1728d3e007/page	https://example.com/site/fffffe98d0963d27015c198262d97221/.gopher./%_#v0
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE s NOT LIKE '%.gopher.%'
+----
+254967	254967	(empty)	https://example.com/site/fffee5badc626a2ab8086120712e5639/page
+
+# sparse form: a selective filter on k first, the survivors' strings decoded
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 3 AND contains(s, 'gopher')
+----
+88	88	https://example.com/gopher/1ba75ef1c643f82ac4a09c7aa43bd3ff/page	https://example.com/site/e633c6ab554c0e79eb395d73fc855347/.gopher./%_#v0
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k = 5 AND s NOT LIKE '%.gopher.%'
+----
+124	124	(empty)	https://example.com/site/ff3f6b76fcf005c7632abe3eb4df6263/page
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 700 AND contains(s, 'gopher/a')
+----
+468	468	https://example.com/gopher/a0147e5eacd37cc518db6721a0cb526d/page	https://example.com/gopher/afe0cc0beb2b9f988e0c0682bce4c01b/page
+
+# NULL and '' rows: the empty needle and NOT over NULLs
+query II
+SELECT count(*), count(s) FROM t_v WHERE contains(s, '')
+----
+296907	296907
+
+query II
+SELECT count(*), count(s) FROM t_v WHERE NOT contains(s, 'x')
+----
+3336	3336
+
+query II
+SELECT count(*), count(s) FROM t_v WHERE k < 2 AND NOT contains(s, 'x')
+----
+2	2
+
+# needles with special bytes: a prefix of another needle, % _ # v0 as literal bytes
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'ab')
+----
+33536
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'a')
+----
+293571
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, '%')
+----
+41940
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, '_')
+----
+41940
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, '#v0')
+----
+41940
+
+# multibyte needles on the DICT_FSST column m
+query III
+SELECT count(*), min(m), max(m) FROM t_v WHERE contains(m, '日本')
+----
+297087	ü0日本	ü9日本aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+query III
+SELECT count(*), min(m), max(m) FROM t_v WHERE contains(m, 'ü42日')
+----
+594	ü42日本aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	ü42日本aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+# 256- and 257-byte needles (the second is not canonical)
+query I
+SELECT count(*) FROM t_v WHERE contains(m, repeat('a', 256))
+----
+43529
+
+query I
+SELECT count(*) FROM t_v WHERE contains(m, repeat('a', 257))
+----
+42540
+
+query I
+SELECT count(*) FROM t_v WHERE contains(m, 'ü299日本' || repeat('a', 250))
+----
+199
+
+# five needles on one dictionary
+query IIIII
+SELECT count(*) FILTER (WHERE contains(s, 'a')), count(*) FILTER (WHERE contains(s, 'b')), count(*) FILTER (WHERE contains(s, 'c')), count(*) FILTER (WHERE contains(s, 'd')), count(*) FILTER (WHERE contains(s, 'e')) FROM t_v
+----
+293571	256237	293571	256237	293571
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'e')
+----
+293571
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'f')
+----
+256542
+
+# contains on the DICTIONARY-mode column, and two canonical filters in one query
+query III
+SELECT count(*), min(d), max(d) FROM t_v WHERE contains(d, '1')
+----
+163370	d01	d19
+
+query IIII
+SELECT count(*), min(s), max(d), count(DISTINCT d) FROM t_v WHERE contains(s, 'gopher') AND NOT contains(d, '1')
+----
+27308	https://example.com/gopher/0024bd2092a4f3eaa6bd8c1728d3e007/page	d09	9
+
+# non-canonical shapes: prefix, suffix, ILIKE, a conjunction inside one expression, collation
+query I
+SELECT count(*) FROM t_v WHERE s LIKE 'https://example.com/gopher%'
+----
+22585
+
+query I
+SELECT count(*) FROM t_v WHERE s ILIKE '%GOPHER%'
+----
+61299
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'gopher') OR contains(s, 'page')
+----
+293571
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s COLLATE NOCASE, 'GOPHER')
+----
+61299
+
+query I
+SELECT count(*) FROM t_v WHERE contains(s, 'gopher') AND contains(s, '.gopher.')
+----
+41940
+
+endloop
+
+# a changed table: UPDATE and DELETE between runs, then CHECKPOINT (new segments) and a restart
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+UPDATE t_v SET s = 'https://updated.example.com/gopher/' || i::VARCHAR WHERE i % 1000 = 1
+
+statement ok
+DELETE FROM t_v WHERE i % 1000 = 2
+
+loop r 0 3
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE contains(s, 'gopher')
+----
+61477	61477	https://example.com/gopher/0024bd2092a4f3eaa6bd8c1728d3e007/page	https://updated.example.com/gopher/99001
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 3 AND contains(s, 'gopher')
+----
+88	88	https://example.com/gopher/1ba75ef1c643f82ac4a09c7aa43bd3ff/page	https://updated.example.com/gopher/256001
+
+endloop
+
+statement ok
+CHECKPOINT
+
+loop r 0 3
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE contains(s, 'gopher')
+----
+61477	61477	https://example.com/gopher/0024bd2092a4f3eaa6bd8c1728d3e007/page	https://updated.example.com/gopher/99001
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 3 AND NOT contains(s, '.gopher.')
+----
+375	375	(empty)	https://updated.example.com/gopher/256001
+
+endloop
+
+# the same table name dropped and reloaded with other strings: code k means another string
+statement ok
+DROP TABLE t_v
+
+statement ok
+CREATE TABLE t_v AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://other.example.org/' || CASE WHEN (i // 3) % 11 = 0 THEN 'gopher/' ELSE 'x/' END || md5(((i // 3) + 7)::VARCHAR) END AS s FROM range(200000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+loop r 0 3
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE contains(s, 'gopher')
+----
+17996	17996	https://other.example.org/gopher/0006dd05ea1e999ddaa041a7091b7b36	https://other.example.org/gopher/fffe56994e6be696722539f962415cd2
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 3 AND contains(s, 'gopher')
+----
+25	25	https://other.example.org/gopher/069853553a93eb5096a7edfb603b4607	https://other.example.org/gopher/e9fd517b70fc6eb73427f2a01e672d22
+
+endloop
+
+restart
+
+loop r 0 3
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE contains(s, 'gopher')
+----
+17996	17996	https://other.example.org/gopher/0006dd05ea1e999ddaa041a7091b7b36	https://other.example.org/gopher/fffe56994e6be696722539f962415cd2
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_v WHERE k < 3 AND NOT contains(s, '.gopher.')
+----
+290	290	https://other.example.org/gopher/069853553a93eb5096a7edfb603b4607	https://other.example.org/x/ff5eb3449d63c62a5cf39e171bb717a3
+
+endloop

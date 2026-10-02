@@ -1,6 +1,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 
 #include "duckdb/execution/adaptive_filter.hpp"
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/row_group.hpp"
@@ -173,8 +174,16 @@ TableScanOptions &CollectionScanState::GetOptions() {
 	return parent.options;
 }
 
+optional_ptr<RunAggregatePartial> CollectionScanState::GetRunAggregate() {
+	if (this != &parent.table_state) {
+		return nullptr;
+	}
+	return parent.run_aggregate.get();
+}
+
 ParallelCollectionScanState::ParallelCollectionScanState()
-    : collection(nullptr), current_row_group(nullptr), processed_rows(0) {
+    : collection(nullptr), current_row_group(nullptr), processed_rows(0), pieces_decided(false), pieces_allowed(false),
+      donation_cap(0), donated(0) {
 }
 
 optional_ptr<SegmentNode<RowGroup>> ParallelCollectionScanState::GetRootSegment(RowGroupSegmentTree &row_groups) const {
@@ -222,6 +231,11 @@ bool CollectionScanState::Scan(DuckTransaction &transaction, DataChunk &result) 
 		row_group->GetNode().Scan(TransactionData(transaction), *this, result);
 		if (result.size() > 0) {
 			return true;
+		}
+		auto run_aggregate = GetRunAggregate();
+		if (run_aggregate) {
+			// this row group is exhausted: publish the thread's run-path partial into the shared states
+			run_aggregate->CombineIntoShared();
 		}
 		if (max_row <= row_group->GetRowStart() + row_group->GetNode().count) {
 			row_group = nullptr;

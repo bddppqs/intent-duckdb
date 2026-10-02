@@ -96,6 +96,7 @@ OptionValueSet GetValueForOption(const string &name, const LogicalType &type) {
 	    {"memory_limit", {"4.0 GiB"}},
 	    {"storage_compatibility_version", {"v0.10.0"}},
 	    {"ordered_aggregate_threshold", {Value::UBIGINT(idx_t(1) << 12)}},
+	    {"zstd_block_compression_level", {Value::UBIGINT(3)}},
 	    {"null_order", {"NULLS_FIRST"}},
 	    {"debug_verify_vector", {"dictionary_expression"}},
 	    {"debug_physical_table_scan_execution_strategy", {"default"}},

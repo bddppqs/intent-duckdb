@@ -33,6 +33,14 @@ public:
 	//! range (sparse file support). Reads to the range will succeed but will return
 	//! undefined data.
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override;
+	//! Ask the operating system to start reading [location, location + nr_bytes) of a local file into the page cache
+	//! without waiting for it (POSIX_FADV_WILLNEED); a later read of the range finds it cached or in flight. Returns
+	//! false (and does nothing) for a handle that is not a local file or where the hint is not available.
+	DUCKDB_API static bool ReadAheadHint(FileHandle &handle, idx_t location, idx_t nr_bytes);
+	//! Tell the operating system that a local file is read at random offsets (POSIX_FADV_RANDOM): a read fetches the
+	//! requested range only, with no sequential read-ahead past it. Returns false (and does nothing) for a handle that is
+	//! not a local file or where the hint is not available.
+	DUCKDB_API static bool RandomAccessHint(FileHandle &handle);
 
 	//! Returns the file size of a file handle, returns -1 on error
 	int64_t GetFileSize(FileHandle &handle) override;

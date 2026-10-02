@@ -241,6 +241,8 @@ struct GetPartitionStatsInput {
 
 	const TableFunction &table_function;
 	optional_ptr<const FunctionData> bind_data;
+	//! The caller needs no partition granularity: one partition covering the whole input is enough
+	bool whole_table = false;
 };
 
 enum class ScanType : uint8_t { TABLE, PARQUET, EXTERNAL };

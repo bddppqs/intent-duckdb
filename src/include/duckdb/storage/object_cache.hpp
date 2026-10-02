@@ -16,7 +16,13 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/buffer/buffer_pool.hpp"
 #include "duckdb/storage/buffer/buffer_pool_reservation.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -64,6 +70,12 @@ public:
 	}
 
 	ObjectCache(idx_t max_memory, BufferPool &buffer_pool_p) : lru_cache(max_memory), buffer_pool(buffer_pool_p) {
+	}
+
+	//! The capacity DatabaseInstance::Initialize constructs the cache with: max(DEFAULT_MAX_MEMORY, max_memory / 2)
+	static idx_t DictionaryCacheCapacity(BufferPool &buffer_pool) {
+		const idx_t max_memory = buffer_pool.GetMaxMemory();
+		return MaxValue<idx_t>(DEFAULT_MAX_MEMORY, max_memory / 2);
 	}
 
 	shared_ptr<ObjectCacheEntry> GetObject(const string &key) {

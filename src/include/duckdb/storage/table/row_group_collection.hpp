@@ -134,6 +134,18 @@ public:
 	void CommitDropTable();
 
 	vector<PartitionStatistics> GetPartitionStats() const;
+	//! Whether total_rows and the table statistics are exact for the rows: no delete, update or reverted append has
+	//! touched the collection since it was created empty or loaded with exact statistics (the value checkpointed)
+	bool StatsExact() const {
+		return stats_exact;
+	}
+	//! The row count, when the statistics are exact and nothing was written since the table was loaded from storage
+	//! (so every transaction sees exactly the stored rows); false otherwise
+	bool TryGetExactLoadedCount(idx_t &count) const;
+	//! Whether StatsExact holds and nothing was written since the table was loaded from storage
+	bool ExactSinceLoad() const {
+		return exact_since_load;
+	}
 	vector<ColumnSegmentInfo> GetColumnSegmentInfo(const QueryContext &context) const;
 	bool SupportsPerColumnWrites();
 	const vector<LogicalType> &GetTypes() const;
@@ -173,6 +185,10 @@ public:
 
 	//! Get a ptr to the raw segment tree. This can be useful for some extensions to have directly exposed.
 	shared_ptr<RowGroupSegmentTree> GetRowGroups() const;
+	//! Read-ahead of the column metadata (data pointers, statistics) of the given columns in every row group whose
+	//! column is not loaded yet, issued once per column: their metadata blocks are requested together instead of
+	//! one block at a time as each row group loads the column
+	void ReadAheadColumnMetadata(const vector<storage_t> &columns);
 
 private:
 	optional_ptr<SegmentNode<RowGroup>> NextUpdateRowGroup(RowGroupSegmentTree &row_groups, row_t *ids, idx_t &pos,
@@ -207,6 +223,13 @@ private:
 	RowGroupAppendMode row_group_append_mode;
 	//! Whether or not we can append to a checkpointed row group
 	bool can_append_to_checkpointed_row_group = true;
+	//! See StatsExact (cleared by a delete, update or reverted append; never set again)
+	atomic<bool> stats_exact {false};
+	//! See ExactSinceLoad (set only by Initialize from exact stored data; cleared by any write)
+	atomic<bool> exact_since_load {false};
+	//! The columns whose metadata read-ahead has been issued (ReadAheadColumnMetadata)
+	mutex metadata_read_ahead_lock;
+	vector<bool> metadata_read_ahead_issued;
 };
 
 class RowGroupIterationHelper {

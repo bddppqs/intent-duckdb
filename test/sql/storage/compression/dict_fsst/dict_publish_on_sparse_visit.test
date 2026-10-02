@@ -1,0 +1,223 @@
+# name: test/sql/storage/compression/dict_fsst/dict_publish_on_sparse_visit.test
+# description: A DICT_FSST segment first reached by the selection-aware (sparse) filter publishes its whole decoded dictionary through EnsureDictionary; the sparse-first statements, their repeats (served from the cache), a dense filter and a whole-column payload after them, the DICTIONARY- and FSST_ONLY-mode columns the publish never reaches, NULL and empty strings, and an UPDATE with a checkpoint; the answers are the plain engine answers at threads 1 and 8, each block in a fresh database instance (cold cache)
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load {TEST_DIR}/dict_publish_on_sparse_visit.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_pub AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://example.com/search/' || md5((i // 3)::VARCHAR) || '/page' END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS d, 'u' || i::VARCHAR || repeat('z', 30) || i::VARCHAR AS f FROM range(368640) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the modes read from segment_info (never inferred)
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICT_FSST:%') FROM pragma_storage_info('t_pub') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICTIONARY:%') FROM pragma_storage_info('t_pub') WHERE column_name = 'd' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT bool_or(compression = 'DICT_FSST' AND segment_info LIKE 'FSST_ONLY:%') FROM pragma_storage_info('t_pub') WHERE column_name = 'f' AND segment_type = 'VARCHAR'
+----
+true
+
+# ---- threads 1, a fresh instance (cold cache) ----
+
+restart
+
+statement ok
+SET threads = 1
+
+# sparse-first contains on the DICT_FSST column (the segment publishes on this visit)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	https://example.com/search/00160fe81ef1540ab98b6f4a0cc21a35/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# the same statement again: the segments are served from the cache
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	https://example.com/search/00160fe81ef1540ab98b6f4a0cc21a35/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# sparse-first NOT contains with a payload column
+query IIII
+SELECT count(*), min(i), max(i), min(s) FROM t_pub WHERE k < 300 AND NOT contains(s, '0')
+----
+7355	12	366881	(empty)
+
+# sparse-first equality (one entry)
+query III
+SELECT count(*), min(i), max(i) FROM t_pub WHERE k < 1000 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+1	999	999
+
+# sparse-first IS NULL and empty string
+query II
+SELECT count(*) FILTER (WHERE s IS NULL), count(*) FILTER (WHERE s = '') FROM t_pub WHERE k < 700 AND (s IS NULL OR s = '')
+----
+1299	1399
+
+# one row per vector, prefix
+query III
+SELECT count(*), min(s), max(s) FROM t_pub WHERE k = 5 AND s LIKE 'https://example.com/search/a%'
+----
+8	https://example.com/search/a14404ebc4ea86cc65ac48f671cc203e/page	https://example.com/search/ae56d2a9a2f304ea950d052938966137/page
+
+# a dense filter after the sparse visits reads the published dictionaries
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE contains(s, 'ab')
+----
+41245	41245	https://example.com/search/00029153d12ae1c9abe59c17ff2e0895/page	https://example.com/search/fffee5badc626a2ab8086120712e5639/page
+
+# the whole column as payload after the sparse visits
+query IIIII
+SELECT count(*), count(s), min(s), max(s), sum(length(s)) FROM t_pub
+----
+368640	364839	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page	23087296
+
+# sparse-first on the DICTIONARY-mode column (never cached; the publish does not fire)
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_pub WHERE k < 512 AND contains(d, '1')
+----
+50231	50231	d01	d19
+
+# sparse-first on the FSST_ONLY column (the sparse branch is not taken)
+query III
+SELECT count(*), min(f), max(f) FROM t_pub WHERE k < 512 AND contains(f, 'zz1')
+----
+27759	u100352zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100352	u1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1
+
+# two string filters, the second under the first's sparse survivors
+query III
+SELECT count(*), min(i), max(i) FROM t_pub WHERE k < 900 AND contains(s, 'a') AND contains(d, '0')
+----
+86311	1	367490
+
+# ---- threads 8, a fresh instance (cold cache) ----
+
+restart
+
+statement ok
+SET threads = 8
+
+# sparse-first contains on the DICT_FSST column (the segment publishes on this visit)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	https://example.com/search/00160fe81ef1540ab98b6f4a0cc21a35/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# the same statement again: the segments are served from the cache
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	https://example.com/search/00160fe81ef1540ab98b6f4a0cc21a35/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# sparse-first NOT contains with a payload column
+query IIII
+SELECT count(*), min(i), max(i), min(s) FROM t_pub WHERE k < 300 AND NOT contains(s, '0')
+----
+7355	12	366881	(empty)
+
+# sparse-first equality (one entry)
+query III
+SELECT count(*), min(i), max(i) FROM t_pub WHERE k < 1000 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+1	999	999
+
+# sparse-first IS NULL and empty string
+query II
+SELECT count(*) FILTER (WHERE s IS NULL), count(*) FILTER (WHERE s = '') FROM t_pub WHERE k < 700 AND (s IS NULL OR s = '')
+----
+1299	1399
+
+# one row per vector, prefix
+query III
+SELECT count(*), min(s), max(s) FROM t_pub WHERE k = 5 AND s LIKE 'https://example.com/search/a%'
+----
+8	https://example.com/search/a14404ebc4ea86cc65ac48f671cc203e/page	https://example.com/search/ae56d2a9a2f304ea950d052938966137/page
+
+# a dense filter after the sparse visits reads the published dictionaries
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE contains(s, 'ab')
+----
+41245	41245	https://example.com/search/00029153d12ae1c9abe59c17ff2e0895/page	https://example.com/search/fffee5badc626a2ab8086120712e5639/page
+
+# the whole column as payload after the sparse visits
+query IIIII
+SELECT count(*), count(s), min(s), max(s), sum(length(s)) FROM t_pub
+----
+368640	364839	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page	23087296
+
+# sparse-first on the DICTIONARY-mode column (never cached; the publish does not fire)
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_pub WHERE k < 512 AND contains(d, '1')
+----
+50231	50231	d01	d19
+
+# sparse-first on the FSST_ONLY column (the sparse branch is not taken)
+query III
+SELECT count(*), min(f), max(f) FROM t_pub WHERE k < 512 AND contains(f, 'zz1')
+----
+27759	u100352zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100352	u1zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1
+
+# two string filters, the second under the first's sparse survivors
+query III
+SELECT count(*), min(i), max(i) FROM t_pub WHERE k < 900 AND contains(s, 'a') AND contains(d, '0')
+----
+86311	1	367490
+
+# ---- an UPDATE, then a checkpoint ----
+
+restart
+
+statement ok
+SET threads = 8
+
+statement ok
+UPDATE t_pub SET s = 'changed-' || s WHERE i % 1000 = 7
+
+# after an UPDATE (transient data beside the persistent segments): sparse-first contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	changed-https://example.com/search/1f52b7bdabb7a0e1c30be5b920ac647f/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# after an UPDATE: the changed rows
+query III
+SELECT count(*), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'changed-')
+----
+87	changed-	changed-https://example.com/search/fc322c6bd467dc6e4a70ece4ce0245f8/page
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads = 8
+
+# after an UPDATE (transient data beside the persistent segments): sparse-first contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'ab')
+----
+10343	10343	changed-https://example.com/search/1f52b7bdabb7a0e1c30be5b920ac647f/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# after an UPDATE: the changed rows
+query III
+SELECT count(*), min(s), max(s) FROM t_pub WHERE k < 512 AND contains(s, 'changed-')
+----
+87	changed-	changed-https://example.com/search/fc322c6bd467dc6e4a70ece4ce0245f8/page

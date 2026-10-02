@@ -8,7 +8,6 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar/string_functions.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "utf8proc_wrapper.hpp"
 
 namespace duckdb {
@@ -199,71 +198,6 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 			    return StringVector::AddString(result, sstring);
 		    });
 	}
-}
-
-
-bool TryGetRegexpReplaceDictionaryMemoKey(const BoundFunctionExpression &expr, string &key) {
-	using callback_t = void (*)(DataChunk &, ExpressionState &, Vector &);
-	auto callback = expr.function.GetFunctionCallback();
-	auto target = callback.target<callback_t>();
-	if (!target || *target != RegexReplaceFunction || expr.function.GetBindCallback() != RegexReplaceBind ||
-	    expr.function.GetInitStateCallback() != RegexInitLocalState ||
-	    !expr.bind_info || (expr.children.size() != 3 && expr.children.size() != 4) ||
-	    expr.return_type.id() != LogicalTypeId::VARCHAR || !StringType::GetCollation(expr.return_type).empty()) {
-		return false;
-	}
-	for (const auto &child : expr.children) {
-		if (child->return_type.id() != LogicalTypeId::VARCHAR || !StringType::GetCollation(child->return_type).empty()) {
-			return false;
-		}
-	}
-	string candidate = "regexp-replace-domain-v1/" + to_string(expr.children.size()) + "/";
-	for (idx_t i = 1; i < expr.children.size(); i++) {
-		if (expr.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
-			return false;
-		}
-		auto &value = expr.children[i]->Cast<BoundConstantExpression>().value;
-		if (value.IsNull()) {
-			return false;
-		}
-		const auto &bytes = StringValue::Get(value);
-		static constexpr idx_t MAX_KEY_BYTES = 8ULL * 1024 * 1024;
-		if (candidate.size() > MAX_KEY_BYTES - 32 || bytes.size() > MAX_KEY_BYTES - candidate.size() - 32) {
-			return false;
-		}
-		candidate += to_string(bytes.size()) + ":";
-		candidate += bytes;
-	}
-	const auto &info = expr.bind_info->Cast<RegexpReplaceBindData>();
-	if (!info.constant_pattern || info.constant_string != StringValue::Get(expr.children[1]->Cast<BoundConstantExpression>().value)) {
-		return false;
-	}
-	duckdb_re2::RE2::Options expected;
-	bool global_replace = false;
-	if (expr.children.size() == 4) {
-		ParseRegexOptions(StringValue::Get(expr.children[3]->Cast<BoundConstantExpression>().value), expected, &global_replace);
-	}
-	expected.set_log_errors(false);
-	if (global_replace != info.global_replace) {
-		return false;
-	}
-#define D099_OPTION_EQUALS(name) if (expected.name() != info.options.name()) return false
-	D099_OPTION_EQUALS(max_mem);
-	D099_OPTION_EQUALS(encoding);
-	D099_OPTION_EQUALS(posix_syntax);
-	D099_OPTION_EQUALS(longest_match);
-	D099_OPTION_EQUALS(log_errors);
-	D099_OPTION_EQUALS(literal);
-	D099_OPTION_EQUALS(never_nl);
-	D099_OPTION_EQUALS(dot_nl);
-	D099_OPTION_EQUALS(never_capture);
-	D099_OPTION_EQUALS(case_sensitive);
-	D099_OPTION_EQUALS(perl_classes);
-	D099_OPTION_EQUALS(word_boundary);
-	D099_OPTION_EQUALS(one_line);
-#undef D099_OPTION_EQUALS
-	key = std::move(candidate);
-	return true;
 }
 
 //===--------------------------------------------------------------------===//

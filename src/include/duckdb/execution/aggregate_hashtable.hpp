@@ -11,16 +11,23 @@
 #include "duckdb/common/row_operations/row_matcher.hpp"
 #include "duckdb/common/types/row/partitioned_tuple_data.hpp"
 #include "duckdb/execution/base_aggregate_hashtable.hpp"
+#include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/storage/arena_allocator.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/types/hyperloglog.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 namespace duckdb {
 
 class BlockHandle;
 
 struct FlushMoveState;
+
+//! Whether the aggregate sink keeps owned-dictionary string keys by reference, holding their owner; off, every sink
+//! append copies the string to the heap
+bool BorrowedStringKeysEnabled();
 
 //! GroupedAggregateHashTable is a linear probing HT that is used for computing
 //! aggregates
@@ -77,6 +84,11 @@ public:
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	idx_t AddChunk(DataChunk &groups, DataChunk &payload, AggregateType filter);
+	//! Add one batch of (group value, run length) pairs: one probe and one grouped run update per run instead of one
+	//! per row. `groups` holds run_count group rows, `run_counts[i]` the length of run i, and `run_updates` the
+	//! grouped run update of every aggregate in layout order. Returns the number of new groups
+	idx_t AddRunChunk(DataChunk &groups, const uint16_t *run_counts, idx_t run_count,
+	                  const vector<aggregate_grouped_run_update_t> &run_updates);
 	optional_idx TryAddCompressedGroups(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	optional_idx TryAddDictionaryGroups(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
 	optional_idx TryAddConstantGroups(DataChunk &groups, DataChunk &payload, const unsafe_vector<idx_t> &filter);
@@ -125,6 +137,23 @@ public:
 	//! Executes the filter(if any) and update the aggregates
 	void Combine(GroupedAggregateHashTable &other);
 	void Combine(TupleDataCollection &other_data, optional_ptr<atomic<double>> progress = nullptr);
+
+	//! the sink's external state, read by the sink before each chunk; from the first external chunk on no key
+	//! is borrowed
+	void SetSinkExternal(bool external);
+
+	//! destroys a collection's aggregate states without throwing (a destructor's caller); returns the states it
+	//! could not reach (a chunk it could not pin), which are skipped
+	static idx_t GlobalDictionaryDestroyStates(TupleDataCollection &data_collection, TupleDataLayout &layout,
+	                                           RowOperationsState &row_state);
+
+	//! the published dictionaries whose strings this table's rows borrow (kept alive with the rows: a later
+	//! storage epoch's publish may retire a dictionary while borrowed rows still point into it)
+	vector<buffer_ptr<VectorBuffer>> global_dictionary_pins;
+
+private:
+	//! The borrowed column of the next append (or INVALID_INDEX)
+	idx_t GlobalDictionaryBeginAppend(DataChunk &groups);
 
 private:
 	ClientContext &context;
@@ -222,6 +251,16 @@ private:
 	//! Does the actual group matching / creation
 	idx_t FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes, Vector &addresses,
 	                                 SelectionVector &new_groups);
+
+	//! the layout's single variable-size column when it is a VARCHAR group key, else INVALID_INDEX (a second
+	//! variable-size column means no borrow at all: a borrowed row carries no heap)
+	idx_t borrowable_key_column = DConstants::INVALID_INDEX;
+	//! whether the sink has gone external
+	bool sink_external = false;
+	//! the borrow mask of the current group chunk - the key column when its vector is a dictionary vector whose child's
+	//! string buffer owns all of its strings (with kBorrowedStringGroupKeys set and the sink not external), else
+	//! INVALID_INDEX; `owner` receives that buffer
+	idx_t BorrowedKeyColumn(buffer_ptr<VectorBuffer> &owner);
 
 	//! Verify the pointer table of the HT
 	void Verify();

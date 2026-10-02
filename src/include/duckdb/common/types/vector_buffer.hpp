@@ -229,6 +229,12 @@ public:
 		references.push_back(std::move(heap));
 	}
 
+public:
+	//! every non-inlined string of the vector this buffer belongs to points into this buffer's own arena
+	//! (set by a DICT_FSST-mode dictionary's decode before it is published, never cleared); an aggregate sink may then
+	//! store such a string without copying it, holding this buffer for as long as the rows live
+	bool owns_all_strings = false;
+
 private:
 	//! The string heap of this buffer
 	StringHeap heap;

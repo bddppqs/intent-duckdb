@@ -1,0 +1,87 @@
+# name: test/sql/storage/compression/dict_fsst/dict_global_string_types.test
+# description: Grouping by BLOB and BIT columns, whose values are stored as strings: they are not given the published
+#              VARCHAR dictionary, and the answers equal the plain aggregate's, in memory and in a database file whose
+#              segments are dictionary-compressed
+# group: [dict_fsst]
+
+statement ok
+CREATE TABLE blobs (b BLOB, g INTEGER);
+
+statement ok
+INSERT INTO blobs VALUES ('hello', 0), ('\x00whatisgoingon', 1), (NULL, 0), ('\xFF\xFE\xFB', 1)
+
+statement ok
+INSERT INTO blobs VALUES ('hello', 3), ('\x00whatisgoingon', 9), (NULL, 0), ('\xFF\xFE\xFB', 19)
+
+query II
+SELECT b, SUM(g) FROM blobs GROUP BY b ORDER BY b NULLS FIRST
+----
+NULL	0
+\x00whatisgoingon	10
+hello	3
+\xFF\xFE\xFB	20
+
+query II
+SELECT count(DISTINCT b), count(*) FROM blobs
+----
+3	8
+
+statement ok
+CREATE TABLE bits (b BIT, g INTEGER);
+
+statement ok
+INSERT INTO bits VALUES ('0101'::BIT, 1), ('1100'::BIT, 2), (NULL, 4)
+
+statement ok
+INSERT INTO bits VALUES ('0101'::BIT, 8), ('1100'::BIT, 16), (NULL, 32)
+
+query II
+SELECT b, SUM(g) FROM bits GROUP BY b ORDER BY b NULLS FIRST
+----
+NULL	36
+0101	9
+1100	18
+
+statement ok
+CREATE TABLE strs (s VARCHAR, g INTEGER);
+
+statement ok
+INSERT INTO strs VALUES ('hello', 0), ('world', 1), (NULL, 0)
+
+statement ok
+INSERT INTO strs VALUES ('hello', 3), ('world', 9), (NULL, 0)
+
+query II
+SELECT s, SUM(g) FROM strs GROUP BY s ORDER BY s NULLS FIRST
+----
+NULL	0
+hello	3
+world	10
+
+# a database file with dictionary-compressed segments, grouped after a checkpoint
+statement ok
+ATTACH '__TEST_DIR__/dict_global_string_types.db' AS f (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE f.fb AS SELECT ('key ' || (i % 1000)::VARCHAR)::BLOB AS b, (i % 1000)::BIGINT AS g FROM range(300000) r(i);
+
+statement ok
+CREATE TABLE f.fbit AS SELECT (CASE WHEN i % 3 = 0 THEN '0101' WHEN i % 3 = 1 THEN '1100' ELSE '111000' END)::BIT AS b, 1 AS g FROM range(300000) r(i);
+
+statement ok
+CHECKPOINT f
+
+query III
+SELECT count(*), sum(c), sum(s) FROM (SELECT b, count(*) AS c, sum(g) AS s FROM f.fb GROUP BY b)
+----
+1000	300000	149850000
+
+query II
+SELECT b, sum(g) FROM f.fbit GROUP BY b ORDER BY b
+----
+111000	100000
+0101	100000
+1100	100000

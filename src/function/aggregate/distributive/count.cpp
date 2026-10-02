@@ -210,6 +210,15 @@ struct CountFunction : public BaseCountFunction {
 		}
 		}
 	}
+
+	//! Run-aware update: the runs are known to hold no NULL values, so every row counts
+	static void CountRunUpdate(Vector &, const uint16_t *run_counts, idx_t run_count, AggregateInputData &,
+	                           data_ptr_t state_p) {
+		auto &result = *reinterpret_cast<STATE *>(state_p);
+		for (idx_t i = 0; i < run_count; i++) {
+			result += UnsafeNumericCast<STATE>(run_counts[i]);
+		}
+	}
 };
 
 unique_ptr<BaseStatistics> CountPropagateStats(ClientContext &context, BoundAggregateExpression &expr,
@@ -232,6 +241,7 @@ AggregateFunction CountFunctionBase::GetFunction() {
 	                      AggregateFunction::StateFinalize<int64_t, int64_t, CountFunction>,
 	                      FunctionNullHandling::SPECIAL_HANDLING, CountFunction::CountUpdate);
 	fun.name = "count";
+	AggregateFunction::SetRunUpdate(fun, CountFunction::CountRunUpdate);
 	fun.SetOrderDependent(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 	return fun;
 }

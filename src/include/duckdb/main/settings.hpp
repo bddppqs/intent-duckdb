@@ -1654,6 +1654,19 @@ struct WriteBufferRowGroupMemoryLimitSetting {
 	static Value GetSetting(const ClientContext &context);
 };
 
+struct ZstdBlockCompressionLevelSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "zstd_block_compression_level";
+	static constexpr const char *Description = "The zstd level at which a database file that stores compressed blocks "
+	                                           "compresses each block (1 to 22; 0 = automatic: 9 with at least 64 "
+	                                           "threads, else 3)";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "0";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = 96;
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct ZstdMinStringLengthSetting {
 	using RETURN_TYPE = idx_t;
 	static constexpr const char *Name = "zstd_min_string_length";
@@ -1662,11 +1675,11 @@ struct ZstdMinStringLengthSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "4096";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 96;
+	static constexpr idx_t SettingIndex = 97;
 };
 
 struct GeneratedSettingInfo {
-	static constexpr idx_t MaxSettingIndex = 97;
+	static constexpr idx_t MaxSettingIndex = 98;
 };
 
 //===----------------------------------------------------------------------===//

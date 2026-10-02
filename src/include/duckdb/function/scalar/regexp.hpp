@@ -15,8 +15,6 @@
 
 namespace duckdb {
 
-bool TryGetRegexpReplaceDictionaryMemoKey(const BoundFunctionExpression &expr, string &key);
-
 namespace regexp_util {
 
 bool TryParseConstantPattern(ClientContext &context, Expression &expr, string &constant_string);

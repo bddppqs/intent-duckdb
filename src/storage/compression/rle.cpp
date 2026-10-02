@@ -5,7 +5,9 @@
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 
+#include <cstdlib>
 #include <functional>
 
 namespace duckdb {
@@ -300,6 +302,41 @@ struct RLEScanState : public SegmentScanState {
 		SkipInternal(skip_count);
 	}
 
+	//! With kLateMaterializedRowIdFetch: SkipInternal from a fresh state (entry 0, position 0), consuming
+	//! whole blocks of SKIP_BLOCK runs while their summed length stays below skip_count - so skip_count stays positive
+	//! and every run of the block would have been consumed whole by SkipInternal's one-run steps - then single runs
+	//! exactly as SkipInternal does (the same stopping run and position, the same bounds check and exception)
+	static constexpr idx_t SKIP_BLOCK = 16;
+	void SkipFromStart(idx_t skip_count) {
+		D_ASSERT(entry_pos == 0 && position_in_entry == 0);
+		idx_t pos = 0;
+		while (pos + SKIP_BLOCK <= max_entry_pos) {
+			idx_t block = 0;
+			for (idx_t i = 0; i < SKIP_BLOCK; i++) {
+				block += index_pointer[pos + i];
+			}
+			if (block >= skip_count) {
+				break;
+			}
+			skip_count -= block;
+			pos += SKIP_BLOCK;
+		}
+		while (skip_count > 0) {
+			const idx_t run = index_pointer[pos];
+			if (skip_count < run) {
+				break;
+			}
+			skip_count -= run;
+			pos++;
+			if (pos > max_entry_pos) {
+				throw IOException(
+				    "Corrupted RLE segment: index_pointer[entry_pos] would reach outside of the blocks memory");
+			}
+		}
+		entry_pos = pos;
+		position_in_entry = skip_count;
+	}
+
 	inline void ForwardToNextRun() {
 		// handled all entries in this RLE value
 		// move to the next entry
@@ -421,8 +458,37 @@ void RLEScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, V
 }
 
 //===--------------------------------------------------------------------===//
+// Scan runs
+//===--------------------------------------------------------------------===//
+template <class T>
+void RLEScanRuns(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, RunSink &sink) {
+	auto &scan_state = state.scan_state->Cast<RLEScanState<T>>();
+	// the runs of the next scan_count rows, the first and last clipped; the state advances as RLEScanPartialInternal
+	idx_t remaining = scan_count;
+	while (remaining > 0) {
+		rle_count_t run_end = scan_state.index_pointer[scan_state.entry_pos];
+		idx_t run_count = run_end - scan_state.position_in_entry;
+		T element = scan_state.data_pointer[scan_state.entry_pos];
+		if (DUCKDB_UNLIKELY(run_count > remaining)) {
+			sink.Push<T>(element, remaining);
+			scan_state.position_in_entry += remaining;
+			break;
+		}
+		sink.Push<T>(element, run_count);
+		remaining -= run_count;
+		scan_state.ForwardToNextRun();
+	}
+}
+
+//===--------------------------------------------------------------------===//
 // Select
 //===--------------------------------------------------------------------===//
+// The select as one merged walk over the runs and the selection (instead of one SkipInternal per selected row); off,
+// the per-row loop runs.
+static bool RleMergedSelectEnabled() {
+	return kRleMergedSelect;
+}
+
 template <class T>
 void RLESelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
                const SelectionVector &sel, idx_t sel_count) {
@@ -438,6 +504,30 @@ void RLESelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_coun
 	auto result_data = FlatVector::GetData<T>(result);
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 
+	if (RleMergedSelectEnabled()) {
+		// one walk over the runs and the selection together: run_end is the vector-relative end of the current
+		// run; a selected row takes the value of the run it falls in, and a run is stepped only when the next row
+		// lies past it
+		idx_t prev_idx = 0;
+		idx_t run_end = scan_state.index_pointer[scan_state.entry_pos] - scan_state.position_in_entry;
+		for (idx_t i = 0; i < sel_count; i++) {
+			auto next_idx = sel.get_index(i);
+			if (next_idx < prev_idx) {
+				throw InternalException("Error in RLESelect - selection vector indices are not ordered");
+			}
+			while (next_idx >= run_end) {
+				scan_state.ForwardToNextRun();
+				run_end += scan_state.index_pointer[scan_state.entry_pos];
+			}
+			result_data[i] = scan_state.data_pointer[scan_state.entry_pos];
+			prev_idx = next_idx;
+		}
+		// leave the state where per-row skipping leaves it (at prev_idx in the current run), then skip the tail
+		// as that path does
+		scan_state.position_in_entry = scan_state.index_pointer[scan_state.entry_pos] - (run_end - prev_idx);
+		scan_state.SkipInternal(vector_count - prev_idx);
+		return;
+	}
 	idx_t prev_idx = 0;
 	for (idx_t i = 0; i < sel_count; i++) {
 		auto next_idx = sel.get_index(i);
@@ -569,10 +659,21 @@ void RLEFilter(ColumnSegment &segment, ColumnScanState &state, idx_t vector_coun
 //===--------------------------------------------------------------------===//
 // Fetch
 //===--------------------------------------------------------------------===//
+//! A fetch skips from the segment start to its row one run at a time - on a large RLE segment the bulk of a
+//! late-materialised row fetch - so with kLateMaterializedRowIdFetch it skips whole blocks of runs (SkipFromStart);
+//! off, the one-run walk is kept
+static bool RleFetchBlockSkip() {
+	return kLateMaterializedRowIdFetch;
+}
+
 template <class T>
 void RLEFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t row_id, Vector &result, idx_t result_idx) {
 	RLEScanState<T> scan_state(segment);
-	scan_state.Skip(segment, NumericCast<idx_t>(row_id));
+	if (RleFetchBlockSkip()) {
+		scan_state.SkipFromStart(NumericCast<idx_t>(row_id));
+	} else {
+		scan_state.Skip(segment, NumericCast<idx_t>(row_id));
+	}
 
 	auto data = scan_state.handle.Ptr() + segment.GetBlockOffset();
 	auto data_pointer = reinterpret_cast<T *>(data + RLEConstants::RLE_HEADER_SIZE);
@@ -585,12 +686,14 @@ void RLEFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t row_id, 
 //===--------------------------------------------------------------------===//
 template <class T, bool WRITE_STATISTICS = true>
 CompressionFunction GetRLEFunction(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_RLE, data_type, RLEInitAnalyze<T>, RLEAnalyze<T>,
-	                           RLEFinalAnalyze<T>, RLEInitCompression<T, WRITE_STATISTICS>,
-	                           RLECompress<T, WRITE_STATISTICS>, RLEFinalizeCompress<T, WRITE_STATISTICS>,
-	                           RLEInitScan<T>, RLEScan<T>, RLEScanPartial<T>, RLEFetchRow<T>, RLESkip<T>, nullptr,
-	                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, RLESelect<T>,
-	                           RLEFilter<T>);
+	auto function = CompressionFunction(CompressionType::COMPRESSION_RLE, data_type, RLEInitAnalyze<T>, RLEAnalyze<T>,
+	                                    RLEFinalAnalyze<T>, RLEInitCompression<T, WRITE_STATISTICS>,
+	                                    RLECompress<T, WRITE_STATISTICS>, RLEFinalizeCompress<T, WRITE_STATISTICS>,
+	                                    RLEInitScan<T>, RLEScan<T>, RLEScanPartial<T>, RLEFetchRow<T>, RLESkip<T>,
+	                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+	                                    nullptr, RLESelect<T>, RLEFilter<T>);
+	function.scan_runs = RLEScanRuns<T>;
+	return function;
 }
 
 CompressionFunction RLEFun::GetFunction(PhysicalType type) {

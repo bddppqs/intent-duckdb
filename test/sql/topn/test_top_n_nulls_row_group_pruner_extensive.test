@@ -140,10 +140,11 @@ restart
 statement ok
 ATTACH '__TEST_DIR__/top_n_nulls_row_group_pruner_extensive_data.duckdb' AS db
 
+# the scan row counts reflect the row-wise Top-N bound, which drops rows inside a vector once the bound is known
 query II
 EXPLAIN ANALYZE SELECT i FROM db.ints ORDER BY i NULLS LAST LIMIT 2
 ----
-analyzed_plan	<REGEX>:.*TABLE_SCAN.*4,096 rows.*
+analyzed_plan	<REGEX>:.*TABLE_SCAN.*2,049 rows.*
 
 query I
 SELECT i FROM db.ints ORDER BY i NULLS LAST LIMIT 2

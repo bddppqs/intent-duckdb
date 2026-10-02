@@ -37,6 +37,8 @@
 #include "duckdb/optimizer/topn_window_elimination.hpp"
 #include "duckdb/optimizer/unnest_rewriter.hpp"
 #include "duckdb/optimizer/late_materialization.hpp"
+#include "duckdb/optimizer/count_first_topk.hpp"
+#include "duckdb/optimizer/first_keys_aggregate.hpp"
 #include "duckdb/optimizer/common_subplan_optimizer.hpp"
 #include "duckdb/optimizer/window_self_join.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
@@ -261,6 +263,16 @@ void Optimizer::RunBuiltInOptimizers() {
 		plan = limit_pushdown.Optimize(std::move(plan));
 	});
 
+	// rewrites GROUP BY ... LIMIT k without ORDER BY into a first-k-keys pass under the unchanged aggregate.
+	// Run directly instead of through RunOptimizer: the profiler's optimizer metric table ends at WINDOW_SELF_JOIN
+	// (MetricsUtils::GetOptimizerMetricByType throws for any later OptimizerType), so no phase metric exists for
+	// this pass; the disabled_optimizers switch ('first_keys_aggregate') applies exactly as for every other optimizer.
+	if (!OptimizerDisabled(OptimizerType::FIRST_KEYS_AGGREGATE)) {
+		FirstKeysAggregate first_keys_aggregate(*this);
+		plan = first_keys_aggregate.Optimize(std::move(plan));
+		Verify(*plan);
+	}
+
 	RunOptimizer(OptimizerType::ROW_GROUP_PRUNER, [&]() {
 		RowGroupPruner row_group_pruner(context);
 		plan = row_group_pruner.Optimize(std::move(plan));
@@ -278,6 +290,16 @@ void Optimizer::RunBuiltInOptimizers() {
 		plan = topn.Optimize(std::move(plan));
 	});
 
+	// rewrites TOP_N(ORDER BY count DESC LIMIT k) over a GROUP BY with other aggregates into the same aggregate over a
+	// SEMI join of its input against the top-k keys of a count-only pass. Run directly, as the first-keys pass
+	// above: the profiler's optimizer metric table ends at WINDOW_SELF_JOIN. CountFirstTopK::Enabled() false
+	// keeps it from running at all; disabled_optimizers ('count_first_topk') applies as for every other optimizer.
+	if (CountFirstTopK::Enabled() && !OptimizerDisabled(OptimizerType::COUNT_FIRST_TOPK)) {
+		CountFirstTopK count_first_topk(*this);
+		plan = count_first_topk.Optimize(std::move(plan));
+		Verify(*plan);
+	}
+
 	// try to use late materialization
 	RunOptimizer(OptimizerType::LATE_MATERIALIZATION, [&]() {
 		LateMaterialization late_materialization(*this);
@@ -290,6 +312,10 @@ void Optimizer::RunBuiltInOptimizers() {
 		StatisticsPropagator propagator(*this, *plan);
 		propagator.PropagateStatistics(plan);
 		statistics_map = propagator.GetStatisticsMap();
+	});
+
+	RunOptimizer(OptimizerType::DUPLICATE_GROUPS, [&]() {
+		RemoveDuplicateGroups::RemoveDependentGroups(*this, plan, statistics_map);
 	});
 
 	// rewrite row_number window function + filter on row_number to aggregate

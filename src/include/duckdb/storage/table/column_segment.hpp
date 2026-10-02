@@ -70,6 +70,8 @@ public:
 	//! Scan one vector while applying a filter to the vector, returning only the matching elements
 	void Filter(ColumnScanState &state, idx_t scan_count, Vector &result, SelectionVector &sel, idx_t &sel_count,
 	            const TableFilter &filter, TableFilterState &filter_state);
+	//! Check whether any value of this segment's domain can satisfy a filter (FILTER_ALWAYS_FALSE when none can)
+	FilterPropagateResult CheckDomain(ColumnScanState &state, const TableFilter &filter);
 	//! Fetch a value of the specific row id and append it to the result
 	void FetchRow(ColumnFetchState &state, row_t row_id, Vector &result, idx_t result_idx);
 
@@ -79,6 +81,12 @@ public:
 
 	//! Skip a scan forward to the row_index specified in the scan state
 	void Skip(ColumnScanState &state);
+	//! Whether the compression function can scan (value, run length) pairs
+	bool CanScanRuns() const {
+		return function.get().scan_runs != nullptr;
+	}
+	//! Scan scan_count rows as (value, run length) pairs into the sink, advancing the state as Scan would
+	void ScanRuns(ColumnScanState &state, idx_t scan_count, RunSink &sink);
 
 	// The maximum size of the buffer (in bytes)
 	idx_t SegmentSize() const;

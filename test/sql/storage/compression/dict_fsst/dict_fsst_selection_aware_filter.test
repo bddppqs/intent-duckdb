@@ -1,0 +1,540 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_selection_aware_filter.test
+# description: Selection-aware DICT_FSST filter evaluation: a selective constant filter on an INTEGER column followed by contains / NOT contains / LIKE with _ / prefix / = / IS NULL on DICT_FSST-, DICTIONARY- and FSST_ONLY-mode string columns, with selections of 0, 1, a few, 1024, 1025, 2047 and every row per vector, NULLs at referenced and unreferenced codes, an all-NULL segment, tables shorter than a vector, exactly 2048 and 2049 rows, whole-domain readers after a sparse selection; the answers are the plain engine answers at threads 1 and 8
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load {TEST_DIR}/dict_fsst_selection_aware_filter.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_sel AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://example.com/search/' || md5((i // 3)::VARCHAR) || '/page' END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS d, 'u' || i::VARCHAR || repeat('z', 30) || i::VARCHAR AS f FROM range(368640) tbl(i)
+
+statement ok
+CREATE TABLE t_two AS SELECT i::BIGINT AS i, CASE WHEN i % 500 = 0 THEN 'needle-' || (i // 500)::VARCHAR ELSE 'https://example.com/search/' || md5((i // 5)::VARCHAR) || '/page' END AS a, CASE WHEN i % 91 = 0 THEN NULL ELSE 'https://example.com/search/' || md5((i // 7)::VARCHAR) || '/page' END AS b FROM range(245760) tbl(i)
+
+statement ok
+CREATE TABLE t_short AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 7 = 0 THEN '' ELSE 'v' || lpad(((i * 31) % 1000)::VARCHAR, 4, '0') END AS s FROM range(100) tbl(i)
+
+statement ok
+CREATE TABLE t_2048 AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://example.com/search/' || md5((i // 3)::VARCHAR) || '/page' END AS s FROM range(2048) tbl(i)
+
+statement ok
+CREATE TABLE t_2049 AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://example.com/search/' || md5((i // 3)::VARCHAR) || '/page' END AS s FROM range(2049) tbl(i)
+
+statement ok
+CREATE TABLE t_allnull AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i < 250000 THEN NULL ELSE 'v' || lpad(i::VARCHAR, 6, '0') END AS s FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the modes read from segment_info (never inferred); s carries a segment boundary inside a vector
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICT_FSST:%') FROM pragma_storage_info('t_sel') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICTIONARY:%') FROM pragma_storage_info('t_sel') WHERE column_name = 'd' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT bool_or(compression = 'DICT_FSST' AND segment_info LIKE 'FSST_ONLY:%') FROM pragma_storage_info('t_sel') WHERE column_name = 'f' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('t_sel') WHERE column_name = 's' AND segment_type = 'VARCHAR' AND start > 0 AND start % 2048 <> 0
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# no row of any vector; contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND contains(s, 'abc')
+----
+0	0	NULL	NULL
+
+# no row of any vector; NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND NOT contains(s, 'abc')
+----
+0	0	NULL	NULL
+
+# no row of any vector; LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND s LIKE '%ab_c%'
+----
+0	0	NULL	NULL
+
+# no row of any vector; prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND s LIKE 'https://example.com/search/a%'
+----
+0	0	NULL	NULL
+
+# no row of any vector; equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+0	0	NULL	NULL
+
+# no row of any vector; IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND s IS NULL
+----
+0	0	NULL	NULL
+
+# no row of any vector; IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 0 AND s IS NOT NULL
+----
+0	0	NULL	NULL
+
+# no row of any vector; contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 0 AND contains(d, '1')
+----
+0	0	NULL	NULL
+
+# no row of any vector; contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 0 AND contains(f, 'zz1')
+----
+0	NULL
+
+# one row per vector; contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND contains(s, 'abc')
+----
+1	1	https://example.com/search/152894198d7e083e9d974cabceba0829/page	https://example.com/search/152894198d7e083e9d974cabceba0829/page
+
+# one row per vector; NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND NOT contains(s, 'abc')
+----
+177	177	(empty)	https://example.com/search/ff6dec2c39768126491474050424b2ed/page
+
+# one row per vector; LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND s LIKE '%ab_c%'
+----
+1	1	https://example.com/search/6964e9d5cd1aab8c7c72b12b77f2fd20/page	https://example.com/search/6964e9d5cd1aab8c7c72b12b77f2fd20/page
+
+# one row per vector; prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND s LIKE 'https://example.com/search/a%'
+----
+8	8	https://example.com/search/a08c938c1e7c76d8fb83eee1a8b95f02/page	https://example.com/search/acab21c58776fe2a721e74dbbb1199c9/page
+
+# one row per vector; equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+0	0	NULL	NULL
+
+# one row per vector; IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND s IS NULL
+----
+2	0	NULL	NULL
+
+# one row per vector; IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k = 0 AND s IS NOT NULL
+----
+178	178	(empty)	https://example.com/search/ff6dec2c39768126491474050424b2ed/page
+
+# one row per vector; contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k = 0 AND contains(d, '1')
+----
+72	72	d12	d16
+
+# one row per vector; contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k = 0 AND contains(f, 'zz1')
+----
+54	u100352zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100352
+
+# a few rows per vector; contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND contains(s, 'abc')
+----
+8	8	https://example.com/search/152894198d7e083e9d974cabceba0829/page	https://example.com/search/c57b154910d8aabc830dbc7bae791182/page
+
+# a few rows per vector; NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND NOT contains(s, 'abc')
+----
+883	883	(empty)	https://example.com/search/ff6dec2c39768126491474050424b2ed/page
+
+# a few rows per vector; LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND s LIKE '%ab_c%'
+----
+3	3	https://example.com/search/6964e9d5cd1aab8c7c72b12b77f2fd20/page	https://example.com/search/6964e9d5cd1aab8c7c72b12b77f2fd20/page
+
+# a few rows per vector; prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND s LIKE 'https://example.com/search/a%'
+----
+37	37	https://example.com/search/a08c938c1e7c76d8fb83eee1a8b95f02/page	https://example.com/search/ad6ef80344efaf6f632432640463941a/page
+
+# a few rows per vector; equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+0	0	NULL	NULL
+
+# a few rows per vector; IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND s IS NULL
+----
+9	0	NULL	NULL
+
+# a few rows per vector; IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 5 AND s IS NOT NULL
+----
+891	891	(empty)	https://example.com/search/ff6dec2c39768126491474050424b2ed/page
+
+# a few rows per vector; contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 5 AND contains(d, '1')
+----
+464	464	d01	d19
+
+# a few rows per vector; contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 5 AND contains(f, 'zz1')
+----
+271	u100352zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100352
+
+# exactly 1024 rows per vector (the engage threshold); contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND contains(s, 'abc')
+----
+1361	1361	https://example.com/search/00053f5e11d1fe4e49a221165b39abc9/page	https://example.com/search/ffc429fc7480e41b43abc45bcd0da35c/page
+
+# exactly 1024 rows per vector (the engage threshold); NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND NOT contains(s, 'abc')
+----
+181060	181060	(empty)	https://example.com/search/ffffda8ada4827900cbf65fd20281080/page
+
+# exactly 1024 rows per vector (the engage threshold); LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND s LIKE '%ab_c%'
+----
+1213	1213	https://example.com/search/003dc1fa10fab92dcab78ab2c2620bfb/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# exactly 1024 rows per vector (the engage threshold); prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND s LIKE 'https://example.com/search/a%'
+----
+11366	11366	https://example.com/search/a0047dd10de05b51faafcdc011513375/page	https://example.com/search/afff9420ec03574fa84c6bb85b54a3e3/page
+
+# exactly 1024 rows per vector (the engage threshold); equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+3	3	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page
+
+# exactly 1024 rows per vector (the engage threshold); IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND s IS NULL
+----
+1899	0	NULL	NULL
+
+# exactly 1024 rows per vector (the engage threshold); IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1024 AND s IS NOT NULL
+----
+182421	182421	(empty)	https://example.com/search/ffffda8ada4827900cbf65fd20281080/page
+
+# exactly 1024 rows per vector (the engage threshold); contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 1024 AND contains(d, '1')
+----
+100374	100374	d01	d19
+
+# exactly 1024 rows per vector (the engage threshold); contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 1024 AND contains(f, 'zz1')
+----
+55431	u1000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1000
+
+# 1025 rows per vector (above the threshold); contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND contains(s, 'abc')
+----
+1362	1362	https://example.com/search/00053f5e11d1fe4e49a221165b39abc9/page	https://example.com/search/ffc429fc7480e41b43abc45bcd0da35c/page
+
+# 1025 rows per vector (above the threshold); NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND NOT contains(s, 'abc')
+----
+181237	181237	(empty)	https://example.com/search/ffffda8ada4827900cbf65fd20281080/page
+
+# 1025 rows per vector (above the threshold); LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND s LIKE '%ab_c%'
+----
+1213	1213	https://example.com/search/003dc1fa10fab92dcab78ab2c2620bfb/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# 1025 rows per vector (above the threshold); prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND s LIKE 'https://example.com/search/a%'
+----
+11375	11375	https://example.com/search/a0047dd10de05b51faafcdc011513375/page	https://example.com/search/afff9420ec03574fa84c6bb85b54a3e3/page
+
+# 1025 rows per vector (above the threshold); equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+3	3	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page
+
+# 1025 rows per vector (above the threshold); IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND s IS NULL
+----
+1901	0	NULL	NULL
+
+# 1025 rows per vector (above the threshold); IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 1025 AND s IS NOT NULL
+----
+182599	182599	(empty)	https://example.com/search/ffffda8ada4827900cbf65fd20281080/page
+
+# 1025 rows per vector (above the threshold); contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 1025 AND contains(d, '1')
+----
+100445	100445	d01	d19
+
+# 1025 rows per vector (above the threshold); contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 1025 AND contains(f, 'zz1')
+----
+55486	u1000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz1000
+
+# all but one row per vector; contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND contains(s, 'abc')
+----
+2682	2682	https://example.com/search/00053f5e11d1fe4e49a221165b39abc9/page	https://example.com/search/ffc429fc7480e41b43abc45bcd0da35c/page
+
+# all but one row per vector; NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND NOT contains(s, 'abc')
+----
+361979	361979	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# all but one row per vector; LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND s LIKE '%ab_c%'
+----
+2519	2519	https://example.com/search/003dc1fa10fab92dcab78ab2c2620bfb/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# all but one row per vector; prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND s LIKE 'https://example.com/search/a%'
+----
+22329	22329	https://example.com/search/a000405abd2de9430b0ed3b7231ec1b6/page	https://example.com/search/afff9420ec03574fa84c6bb85b54a3e3/page
+
+# all but one row per vector; equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+3	3	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page
+
+# all but one row per vector; IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND s IS NULL
+----
+3799	0	NULL	NULL
+
+# all but one row per vector; IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2047 AND s IS NOT NULL
+----
+364661	364661	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# all but one row per vector; contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 2047 AND contains(d, '1')
+----
+200641	200641	d01	d19
+
+# all but one row per vector; contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 2047 AND contains(f, 'zz1')
+----
+111057	u100000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100000
+
+# every row; contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND contains(s, 'abc')
+----
+2683	2683	https://example.com/search/00053f5e11d1fe4e49a221165b39abc9/page	https://example.com/search/ffc429fc7480e41b43abc45bcd0da35c/page
+
+# every row; NOT contains
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND NOT contains(s, 'abc')
+----
+362156	362156	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# every row; LIKE with _ (not rewritten)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND s LIKE '%ab_c%'
+----
+2519	2519	https://example.com/search/003dc1fa10fab92dcab78ab2c2620bfb/page	https://example.com/search/fff855cddcd8ab3cc1c1b4958b6c95cd/page
+
+# every row; prefix
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND s LIKE 'https://example.com/search/a%'
+----
+22339	22339	https://example.com/search/a000405abd2de9430b0ed3b7231ec1b6/page	https://example.com/search/afff9420ec03574fa84c6bb85b54a3e3/page
+
+# every row; equality
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND s = 'https://example.com/search/' || md5('333') || '/page'
+----
+3	3	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page	https://example.com/search/310dcbbf4cce62f762a2aaa148d556bd/page
+
+# every row; IS NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND s IS NULL
+----
+3801	0	NULL	NULL
+
+# every row; IS NOT NULL
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel WHERE k < 2048 AND s IS NOT NULL
+----
+364839	364839	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# every row; contains on the DICTIONARY-mode column
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_sel WHERE k < 2048 AND contains(d, '1')
+----
+200749	200749	d01	d19
+
+# every row; contains on the FSST_ONLY column
+query II
+SELECT count(*), min(f) FROM t_sel WHERE k < 2048 AND contains(f, 'zz1')
+----
+111111	u100000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100000
+
+# NOT contains over NULL entries never passes
+query II
+SELECT count(*), count(d) FROM t_sel WHERE k < 300 AND NOT contains(d, '1')
+----
+24023	24023
+
+# two contains filters: the second sees a sparse selection
+query III
+SELECT count(*), min(a), max(b) FROM t_two WHERE contains(a, 'needle') AND contains(b, 'a')
+----
+486	needle-1	https://example.com/search/fff574293a6252f4029a9413f364b2e6/page
+
+# two contains filters, reversed
+query II
+SELECT count(*), min(b) FROM t_two WHERE contains(b, 'ab') AND contains(a, 'needle-1')
+----
+12	https://example.com/search/0bcc8ab4a61a1d1f3f102846d9617eb8/page
+
+# NOT contains over NULLs after a sparse selection
+query II
+SELECT count(*), count(b) FROM t_two WHERE contains(a, 'needle') AND NOT contains(b, 'q')
+----
+486	486
+
+# a table shorter than a vector
+query II
+SELECT count(*), min(s) FROM t_short WHERE k < 10 AND contains(s, '1')
+----
+4	v0031
+
+# exactly 2048 rows
+query II
+SELECT count(*), min(s) FROM t_2048 WHERE k < 10 AND contains(s, 'a')
+----
+9	https://example.com/search/c4ca4238a0b923820dcc509a6f75849b/page
+
+# 2049 rows (a one-row partial vector)
+query II
+SELECT count(*), min(s) FROM t_2049 WHERE k < 10 AND contains(s, 'a')
+----
+10	https://example.com/search/08d98638c6fcd194a4b1e6992063e944/page
+
+# 2049 rows, every row
+query I
+SELECT count(*) FROM t_2049 WHERE contains(s, 'a')
+----
+2027
+
+# an all-NULL segment before the values
+query II
+SELECT count(*), min(s) FROM t_allnull WHERE k < 7 AND contains(s, '9')
+----
+75	v251904
+
+# an all-NULL segment, IS NULL
+query I
+SELECT count(*) FROM t_allnull WHERE k < 7 AND s IS NULL
+----
+861
+
+# an all-NULL segment, NOT contains
+query I
+SELECT count(*) FROM t_allnull WHERE k < 7 AND NOT contains(s, '9')
+----
+93
+
+# a GROUP BY on the filtered column after a sparse selection (the flat survivor vector is hashed whole)
+query TI
+SELECT s, count(*) AS c FROM t_sel WHERE k < 5 AND contains(s, 'a') GROUP BY s ORDER BY c DESC, s LIMIT 5
+----
+https://example.com/search/051928341be67dcba03f0e04104d9047/page	3
+https://example.com/search/061c8b4347d970f009ea500be31c577d/page	3
+https://example.com/search/07f7c54efad6f9f39a42a86c30defbe4/page	3
+https://example.com/search/08f38e0434442128fab5ead6217ca759/page	3
+https://example.com/search/0c383e8deecbd58d5cbdfd324132b91f/page	3
+
+# COUNT(DISTINCT) on the filtered column after a sparse selection
+query II
+SELECT count(DISTINCT s), count(*) FROM t_sel WHERE k < 300 AND contains(s, 'ab')
+----
+2079	6066
+
+# a hash join on the filtered column after a sparse selection
+query II
+SELECT count(*), min(a.s) FROM t_sel a JOIN t_two b ON a.s = b.b WHERE a.k < 5 AND contains(a.s, 'a')
+----
+1780	https://example.com/search/01cc1da1d5e00d6c7fb60943b4b03f68/page
+
+# a whole scan of the column after the sparse selections (materialisation on demand)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_sel
+----
+368640	364839	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# the projection of every string column under a sparse selection
+query IIII
+SELECT count(*), min(s), min(d), min(f) FROM t_sel WHERE k < 2 AND contains(s, 'ab')
+----
+35	https://example.com/search/054ab897023645cd7ad69525c46992a0/page	d00	u100352zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz100352
+
+endloop

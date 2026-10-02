@@ -43,6 +43,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "PERFECT_HASH_GROUP_BY";
 	case PhysicalOperatorType::PARTITIONED_AGGREGATE:
 		return "PARTITIONED_AGGREGATE";
+	case PhysicalOperatorType::STREAMING_FIRST_KEYS:
+		return "STREAMING_FIRST_KEYS";
 	case PhysicalOperatorType::FILTER:
 		return "FILTER";
 	case PhysicalOperatorType::PROJECTION:

@@ -8,6 +8,7 @@
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/partition_stats.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/optimizer/statistics_propagator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
@@ -28,6 +29,8 @@ struct ValueComparator {
 	virtual ~ValueComparator() = default;
 	virtual bool Compare(Value &lhs, Value &rhs) const = 0;
 	virtual Value GetVal(BaseStatistics &stats) const = 0;
+	//! The bound's value in empty numeric statistics (NumericStats::CreateEmpty)
+	virtual Value EmptyVal(const LogicalType &type) const = 0;
 };
 
 template <typename StatsType>
@@ -38,6 +41,9 @@ struct MinValueComp : public ValueComparator {
 	Value GetVal(BaseStatistics &stats) const override {
 		return StatsType::Min(stats);
 	}
+	Value EmptyVal(const LogicalType &type) const override {
+		return Value::MaximumValue(type);
+	}
 };
 
 template <typename StatsType>
@@ -47,6 +53,9 @@ struct MaxValueComp : public ValueComparator {
 	}
 	Value GetVal(BaseStatistics &stats) const override {
 		return StatsType::Max(stats);
+	}
+	Value EmptyVal(const LogicalType &type) const override {
+		return Value::MinimumValue(type);
 	}
 };
 
@@ -99,6 +108,12 @@ bool TryGetValueFromStats(const PartitionStatistics &stats, const StorageIndex &
 		}
 	}
 	result = comparator.GetVal(*column_stats);
+	if (column_stats->GetStatsType() == StatisticsType::NUMERIC_STATS &&
+	    result == comparator.EmptyVal(column_stats->GetType())) {
+		// a bound still at its empty-statistics value may never have moved: values outside the type's
+		// [MinimumValue, MaximumValue] (NaN, an infinite date or timestamp) leave it there
+		return false;
+	}
 	return true;
 }
 
@@ -173,14 +188,6 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 		return;
 	}
 
-	// we can do the rewrite! get the stats
-	GetPartitionStatsInput input(get.function, get.bind_data.get());
-	auto partition_stats = get.function.get_partition_stats(context, input);
-	if (partition_stats.empty()) {
-		// no partition stats found
-		return;
-	}
-
 	vector<StorageIndex> min_max_storage_indexes(min_max_bindings.size());
 	for (idx_t i = 0; i < min_max_bindings.size(); i++) {
 		auto &binding = min_max_bindings[i];
@@ -190,6 +197,29 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			//! This happens when we're dealing with a generated column for example
 			return;
 		}
+	}
+
+	// we can do the rewrite! get the stats
+	GetPartitionStatsInput input(get.function, get.bind_data.get());
+	// Without a filter the rewrite needs no per-partition statistics; the scan may answer for the whole table
+	input.whole_table = get.table_filters.filters.empty();
+	auto partition_stats = get.function.get_partition_stats(context, input);
+	if (input.whole_table && partition_stats.size() == 1) {
+		// a MIN or MAX the whole-table statistics cannot answer (a type whose table-level bounds are not exact, strings of
+		// unequal lengths) gives way to the per-partition statistics
+		for (idx_t agg_idx = 0; agg_idx < min_max_storage_indexes.size(); agg_idx++) {
+			Value value;
+			if (!TryGetValueFromStats(partition_stats[0], min_max_storage_indexes[agg_idx], *comparators[agg_idx],
+			                          value)) {
+				input.whole_table = false;
+				partition_stats = get.function.get_partition_stats(context, input);
+				break;
+			}
+		}
+	}
+	if (partition_stats.empty()) {
+		// no partition stats found
+		return;
 	}
 
 	vector<LogicalType> types;
@@ -294,6 +324,9 @@ void StatisticsPropagator::TryExecuteAggregates(LogicalAggregate &aggr, unique_p
 			types.insert(types.begin() + NumericCast<int64_t>(count_star_idx), LogicalType::BIGINT);
 		}
 	}
+
+	DUCKDB_LOG_DEBUG(context, "ungrouped aggregate answered from the statistics of %llu partition(s)",
+	                 partition_stats.size());
 
 	// Set column names
 	for (idx_t expr_idx = 0; expr_idx < agg_results.size(); expr_idx++) {

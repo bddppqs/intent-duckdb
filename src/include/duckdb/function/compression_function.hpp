@@ -10,6 +10,7 @@
 
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/enums/compression_type.hpp"
+#include "duckdb/common/enums/filter_propagate_result.hpp"
 #include "duckdb/common/map.hpp"
 #include "duckdb/common/insertion_order_preserving_map.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -33,6 +34,7 @@ struct ColumnFetchState;
 struct ColumnScanState;
 struct PrefetchState;
 struct SegmentScanState;
+struct RunSink;
 
 class CompressionInfo {
 public:
@@ -185,6 +187,11 @@ typedef void (*compression_select_t)(ColumnSegment &segment, ColumnScanState &st
 typedef void (*compression_filter_t)(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
                                      SelectionVector &sel, idx_t &sel_count, const TableFilter &filter,
                                      TableFilterState &filter_state);
+//! Function prototype used for checking whether any value of a segment's domain (e.g. its dictionary) can satisfy a
+//! filter under the segment's current scan state: FILTER_ALWAYS_FALSE when no value can, NO_PRUNING_POSSIBLE
+//! otherwise (optional; consulted after the statistics could not decide)
+typedef FilterPropagateResult (*compression_check_domain_t)(ColumnSegment &segment, ColumnScanState &state,
+                                                            const TableFilter &filter);
 //! Function prototype used for reading a single value
 typedef void (*compression_fetch_row_t)(ColumnSegment &segment, ColumnFetchState &state, row_t row_id, Vector &result,
                                         idx_t result_idx);
@@ -219,6 +226,38 @@ typedef void (*compression_visit_block_ids_t)(const ColumnSegment &segment, Bloc
 //! Function prototype for retrieving segment information straight from the column segment
 typedef InsertionOrderPreservingMap<string> (*compression_get_segment_info_t)(QueryContext context,
                                                                               ColumnSegment &segment);
+
+//===--------------------------------------------------------------------===//
+// Scan runs (optional)
+//===--------------------------------------------------------------------===//
+//! Sink for run-aware scans: (value, run length) pairs, the value in the segment's physical type
+struct RunSink {
+	virtual ~RunSink() {
+	}
+	//! Called when the buffer is full: consumes the buffered runs and resets run_count
+	virtual void Flush() = 0;
+
+	template <class T>
+	inline void Push(T value, idx_t count) {
+		D_ASSERT(count > 0 && count <= 65535);
+		if (run_count == capacity) {
+			Flush();
+		}
+		reinterpret_cast<T *>(values)[run_count] = value;
+		counts[run_count] = static_cast<uint16_t>(count);
+		run_count++;
+	}
+
+	//! Buffered run values (capacity entries of the segment's physical type) and run lengths
+	data_ptr_t values = nullptr;
+	uint16_t *counts = nullptr;
+	idx_t run_count = 0;
+	idx_t capacity = 0;
+};
+//! Function prototype for scanning scan_count rows as (value, run length) pairs instead of materializing them,
+//! advancing the scan state exactly as scan_vector would
+typedef void (*compression_scan_runs_t)(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count,
+                                        RunSink &sink);
 
 enum class CompressionValidity : uint8_t { REQUIRES_VALIDITY, NO_VALIDITY_REQUIRED };
 
@@ -287,6 +326,8 @@ public:
 	compression_select_t select;
 	//! Scan and apply a filter to a vector while scanning
 	compression_filter_t filter;
+	//! Check whether any value of the segment's domain can satisfy a filter (optional)
+	compression_check_domain_t check_domain = nullptr;
 	//! fetch an individual row from the compressed vector
 	//! used for index lookups
 	compression_fetch_row_t fetch_row;
@@ -323,6 +364,9 @@ public:
 
 	//! Get stringified segment information directly from reading the column segment
 	compression_get_segment_info_t get_segment_info = nullptr;
+
+	//! Scan (value, run length) pairs instead of rows (optional; RLE and Constant)
+	compression_scan_runs_t scan_runs = nullptr;
 
 	//! Whether the validity mask should be separately compressed
 	//! or this compression function can also be used to decompress the validity

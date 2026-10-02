@@ -1,12 +1,16 @@
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/function/compression_function.hpp"
+#include "duckdb/storage/compression/dict_fsst/decompression.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
 #include "duckdb/storage/table/list_column_data.hpp"
 #include "duckdb/storage/table/standard_column_data.hpp"
+#include "duckdb/storage/table/validity_column_data.hpp"
 #include "duckdb/storage/table/array_column_data.hpp"
 #include "duckdb/storage/table/struct_column_data.hpp"
 #include "duckdb/storage/table/variant_column_data.hpp"
@@ -18,6 +22,11 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/variant/variant_shredding.hpp"
 #include "duckdb/storage/table/geo_column_data.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/compression/dict_fsst/decompression.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -97,6 +106,7 @@ void ColumnData::InitializeScan(ColumnScanState &state) {
 	state.offset_in_column = state.current ? state.current->GetRowStart() : 0;
 	state.internal_index = state.offset_in_column;
 	state.initialized = false;
+	state.segment_checked = false;
 	state.scan_state.reset();
 	state.last_offset = 0;
 }
@@ -110,6 +120,7 @@ void ColumnData::InitializeScanWithOffset(ColumnScanState &state, idx_t row_idx)
 	state.offset_in_column = row_idx;
 	state.internal_index = state.current->GetRowStart();
 	state.initialized = false;
+	state.segment_checked = false;
 	state.scan_state.reset();
 	state.last_offset = 0;
 }
@@ -222,6 +233,75 @@ idx_t ColumnData::ScanVector(ColumnScanState &state, Vector &result, idx_t remai
 	}
 	state.internal_index = state.offset_in_column;
 	return initial_remaining - remaining;
+}
+
+bool ColumnData::TryScanGlobalDictionary(ColumnScanState &state, Vector &result, idx_t count) {
+	if (count == 0 || !state.current || type.InternalType() != PhysicalType::VARCHAR ||
+	    result.GetVectorType() != VectorType::FLAT_VECTOR || HasUpdates() ||
+	    (state.scan_options && state.scan_options->force_fetch_row)) {
+		return false;
+	}
+	// walk the spanned segments without side effects: each must carry a translation into the same dictionary
+	vector<shared_ptr<dict_global::SegmentTranslation>> translations;
+	auto node = state.current;
+	idx_t offset = state.offset_in_column;
+	idx_t remaining = count;
+	while (remaining > 0) {
+		auto &segment = node->GetNode();
+		auto translation = dict_global::FindScanTranslation(segment);
+		if (!translation || (!translations.empty() && translation->dict != translations[0]->dict)) {
+			return false;
+		}
+		const idx_t piece = MinValue<idx_t>(remaining, node->GetRowStart() + segment.count - offset);
+		remaining -= piece;
+		offset += piece;
+		translations.push_back(std::move(translation));
+		if (remaining > 0) {
+			node = data.GetNextSegment(*node);
+			if (!node) {
+				return false;
+			}
+		}
+	}
+	const bool straddled = translations.size() > 1;
+	if (!straddled && count >= STANDARD_VECTOR_SIZE) {
+		// a whole vector inside one segment: the segment's own scan emits it over the global dictionary
+		return false;
+	}
+	BeginScanVectorInternal(state);
+	SelectionVector global_sel(count);
+	auto out = global_sel.data();
+	remaining = count;
+	idx_t written = 0;
+	idx_t piece_idx = 0;
+	while (remaining > 0) {
+		auto &current = state.current->GetNode();
+		auto current_start = state.current->GetRowStart();
+		const idx_t piece = MinValue<idx_t>(remaining, current_start + current.count - state.offset_in_column);
+		if (piece > 0) {
+			auto &segment_state = state.scan_state->Cast<dict_fsst::CompressedStringScanState>();
+			auto &local = segment_state.GetSelVec(state.offset_in_column - current_start, piece);
+			auto codes = translations[piece_idx]->codes.get();
+			for (idx_t i = 0; i < piece; i++) {
+				out[written + i] = UnsafeNumericCast<sel_t>(codes[local.get_index(i)]);
+			}
+			written += piece;
+			state.offset_in_column += piece;
+			remaining -= piece;
+		}
+		if (remaining > 0) {
+			auto next = data.GetNextSegment(*state.current);
+			D_ASSERT(next);
+			state.previous_states.emplace_back(std::move(state.scan_state));
+			state.current = next;
+			state.current->GetNode().InitializeScan(state);
+			state.segment_checked = false;
+			piece_idx++;
+		}
+	}
+	state.internal_index = state.offset_in_column;
+	result.Dictionary(translations[0]->VectorChild(), global_sel);
+	return true;
 }
 
 void ColumnData::SelectVector(ColumnScanState &state, Vector &result, idx_t target_count, const SelectionVector &sel,
@@ -345,13 +425,71 @@ idx_t ColumnData::ScanCount(ColumnScanState &state, Vector &result, idx_t scan_c
 	return ScanVector(state, result, scan_count, ScanVectorType::SCAN_FLAT_VECTOR, result_offset);
 }
 
+//! A flat-scanned filter across segment pieces reads the verdicts; off, every flat-scanned filter runs row by row
+static bool VerdictStraddleEnabled() {
+	return kVerdictStraddleFilter;
+}
+
 void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                         SelectionVector &sel, idx_t &s_count, const TableFilter &filter,
                         TableFilterState &filter_state) {
+	// the segment and row this vector starts at, to map its rows to the segment pieces Scan reads
+	const auto first_segment = state.current;
+	const auto first_row = state.offset_in_column;
 	idx_t scan_count = Scan(transaction, vector_index, state, result);
 
 	UnifiedVectorFormat vdata;
 	result.ToUnifiedFormat(scan_count, vdata);
+	if (VerdictStraddleEnabled() && first_segment && type.InternalType() == PhysicalType::VARCHAR &&
+	    result.GetVectorType() == VectorType::FLAT_VECTOR && !HasUpdates() &&
+	    !(state.scan_options && state.scan_options->force_fetch_row)) {
+		// the pieces as ScanVector reads them: piece i < the last is previous_states[i], the last is scan_state
+		SegmentScanState *piece_states[16];
+		idx_t piece_starts[16];
+		idx_t piece_counts[16];
+		idx_t piece_count = 0;
+		auto node = first_segment;
+		idx_t row = first_row;
+		idx_t remaining = scan_count;
+		bool mapped = true;
+		while (true) {
+			if (piece_count == 16 || row < node->GetRowStart() || row > node->GetRowEnd()) {
+				mapped = false;
+				break;
+			}
+			const idx_t count = MinValue<idx_t>(remaining, node->GetRowEnd() - row);
+			SegmentScanState *piece_state = nullptr;
+			if (piece_count < state.previous_states.size()) {
+				piece_state = state.previous_states[piece_count].get();
+			} else if (piece_count == state.previous_states.size()) {
+				piece_state = state.scan_state.get();
+			} else {
+				mapped = false;
+				break;
+			}
+			auto &segment = node->GetNode();
+			piece_states[piece_count] =
+			    segment.GetCompressionFunction().type == CompressionType::COMPRESSION_DICT_FSST ? piece_state : nullptr;
+			piece_starts[piece_count] = row - node->GetRowStart();
+			piece_counts[piece_count] = count;
+			piece_count++;
+			row += count;
+			remaining -= count;
+			if (remaining == 0) {
+				break;
+			}
+			node = data.GetNextSegment(*node);
+			if (!node) {
+				mapped = false;
+				break;
+			}
+		}
+		if (mapped && node == state.current && piece_count == state.previous_states.size() + 1 &&
+		    dict_fsst::StraddleVerdictFilter(piece_states, piece_starts, piece_counts, piece_count, result, vdata, sel,
+		                                     scan_count, s_count, filter, filter_state)) {
+			return;
+		}
+	}
 	ColumnSegment::FilterSelection(sel, result, vdata, filter, filter_state, scan_count, s_count);
 }
 
@@ -363,6 +501,111 @@ void ColumnData::Select(TransactionData transaction, idx_t vector_index, ColumnS
 
 void ColumnData::Skip(ColumnScanState &state, idx_t s_count) {
 	state.Next(s_count);
+}
+
+//===--------------------------------------------------------------------===//
+// Scan runs
+//===--------------------------------------------------------------------===//
+static bool IsRunAwarePhysicalType(PhysicalType type) {
+	switch (type) {
+	case PhysicalType::INT8:
+	case PhysicalType::INT16:
+	case PhysicalType::INT32:
+	case PhysicalType::INT64:
+	case PhysicalType::UINT8:
+	case PhysicalType::UINT16:
+	case PhysicalType::UINT32:
+	case PhysicalType::UINT64:
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool ColumnData::SegmentsRunEligible(ColumnScanState &state, idx_t scan_count, bool validity_column) const {
+	auto node = state.current;
+	if (!node) {
+		return false;
+	}
+	idx_t offset = state.offset_in_column;
+	idx_t remaining = scan_count;
+	while (remaining > 0) {
+		auto &segment = node->GetNode();
+		idx_t segment_end = node->GetRowStart() + segment.count;
+		if (offset < segment_end) {
+			if (validity_column) {
+				if (segment.stats.statistics.CanHaveNull()) {
+					return false;
+				}
+			} else {
+				auto compression_type = segment.GetCompressionFunction().type;
+				if ((compression_type != CompressionType::COMPRESSION_RLE &&
+				     compression_type != CompressionType::COMPRESSION_CONSTANT) ||
+				    !segment.CanScanRuns()) {
+					return false;
+				}
+			}
+			idx_t count = MinValue<idx_t>(remaining, segment_end - offset);
+			offset += count;
+			remaining -= count;
+		}
+		if (remaining > 0) {
+			node = data.GetNextSegment(*node);
+			if (!node) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool ColumnData::RunEligible(ColumnScanState &state, idx_t scan_count) {
+	if (!IsRunAwarePhysicalType(type.InternalType()) || type.id() == LogicalTypeId::VALIDITY) {
+		return false;
+	}
+	if (state.scan_options && state.scan_options->force_fetch_row) {
+		return false;
+	}
+	if (state.child_states.empty() || HasUpdates()) {
+		return false;
+	}
+	if (!SegmentsRunEligible(state, scan_count, false)) {
+		return false;
+	}
+	auto &validity = Cast<StandardColumnData>().GetValidityData();
+	if (validity.HasUpdates()) {
+		return false;
+	}
+	return validity.SegmentsRunEligible(state.child_states[0], scan_count, true);
+}
+
+void ColumnData::ScanRuns(ColumnScanState &state, idx_t scan_count, RunSink &sink) {
+	BeginScanVectorInternal(state);
+	idx_t remaining = scan_count;
+	while (remaining > 0) {
+		auto &current = state.current->GetNode();
+		auto current_start = state.current->GetRowStart();
+		D_ASSERT(state.offset_in_column >= current_start && state.offset_in_column <= current_start + current.count);
+		idx_t count = MinValue<idx_t>(remaining, current_start + current.count - state.offset_in_column);
+		if (count > 0) {
+			current.ScanRuns(state, count, sink);
+			state.offset_in_column += count;
+			remaining -= count;
+		}
+		if (remaining > 0) {
+			auto next = data.GetNextSegment(*state.current);
+			if (!next) {
+				throw InternalException("ColumnData::ScanRuns: ran out of segments");
+			}
+			state.previous_states.emplace_back(std::move(state.scan_state));
+			state.current = next;
+			state.current->GetNode().InitializeScan(state);
+			state.segment_checked = false;
+		}
+	}
+	state.internal_index = state.offset_in_column;
+	// the validity column holds no NULL values in this range (RunEligible): move its state forward in step
+	Cast<StandardColumnData>().GetValidityData().Skip(state.child_states[0], scan_count);
 }
 
 void ColumnData::Append(BaseStatistics &append_stats, ColumnAppendState &state, Vector &vector, idx_t append_count) {
@@ -379,6 +622,35 @@ void ColumnData::Append(ColumnAppendState &state, Vector &vector, idx_t append_c
 	Append(stats->statistics, state, vector, append_count);
 }
 
+static bool ContainsDynamicFilter(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::DYNAMIC_FILTER:
+		return true;
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &optional_filter = filter.Cast<OptionalFilter>();
+		return optional_filter.child_filter && ContainsDynamicFilter(*optional_filter.child_filter);
+	}
+	case TableFilterType::CONJUNCTION_AND: {
+		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+			if (ContainsDynamicFilter(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		for (auto &child : filter.Cast<ConjunctionOrFilter>().child_filters) {
+			if (ContainsDynamicFilter(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	default:
+		return false;
+	}
+}
+
 FilterPropagateResult ColumnData::CheckZonemap(ColumnScanState &state, TableFilter &filter) {
 	if (state.segment_checked) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
@@ -386,28 +658,40 @@ FilterPropagateResult ColumnData::CheckZonemap(ColumnScanState &state, TableFilt
 	if (!state.current) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
-	// for dynamic filters we never consider the segment being "checked" as it can always change
-	state.segment_checked = filter.filter_type != TableFilterType::DYNAMIC_FILTER;
-	FilterPropagateResult prune_result;
-	{
-		lock_guard<mutex> l(stats_lock);
-		prune_result = filter.CheckStatistics(state.current->GetNode().stats.statistics);
-		if (prune_result == FilterPropagateResult::NO_PRUNING_POSSIBLE) {
-			return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	// for filters carrying a dynamic filter we never consider the segment being "checked" as it can always change
+	state.segment_checked = !ContainsDynamicFilter(filter);
+	auto check = [&]() -> FilterPropagateResult {
+		FilterPropagateResult prune_result;
+		{
+			lock_guard<mutex> l(stats_lock);
+			prune_result = filter.CheckStatistics(state.current->GetNode().stats.statistics);
 		}
-	}
-	lock_guard<mutex> l(update_lock);
-	if (!updates) {
-		// no updates - return original result
-		return prune_result;
-	}
-	auto update_stats = updates->GetStatistics();
-	// combine the update and original prune result
-	FilterPropagateResult update_result = filter.CheckStatistics(*update_stats);
-	if (prune_result == update_result) {
-		return prune_result;
-	}
-	return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		if (prune_result == FilterPropagateResult::NO_PRUNING_POSSIBLE) {
+			// the statistics cannot decide - ask the segment whether any value of its domain can satisfy the filter
+			// (never when the column carries updates: updated values are not part of the segment's domain)
+			{
+				lock_guard<mutex> l(update_lock);
+				if (updates) {
+					return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+				}
+			}
+			return state.current->GetNode().CheckDomain(state, filter);
+		}
+		lock_guard<mutex> l(update_lock);
+		if (!updates) {
+			// no updates - return original result
+			return prune_result;
+		}
+		auto update_stats = updates->GetStatistics();
+		// combine the update and original prune result
+		FilterPropagateResult update_result = filter.CheckStatistics(*update_stats);
+		if (prune_result == update_result) {
+			return prune_result;
+		}
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	};
+	auto result = check();
+	return result;
 }
 
 FilterPropagateResult ColumnData::CheckZonemap(const StorageIndex &index, TableFilter &filter) {

@@ -50,6 +50,7 @@ unique_ptr<TableFilterState> TableFilterState::Initialize(ClientContext &context
 	case TableFilterType::CONSTANT_COMPARISON:
 	case TableFilterType::IS_NULL:
 	case TableFilterType::IS_NOT_NULL:
+	case TableFilterType::DYNAMIC_FILTER:
 		// root nodes - create an empty filter state
 		return make_uniq<TableFilterState>();
 	default:

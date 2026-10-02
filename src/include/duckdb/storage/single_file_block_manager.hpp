@@ -13,14 +13,19 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/common/map.hpp"
+#include "duckdb/storage/storage_info.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/encryption_functions.hpp"
+
+#include <condition_variable>
 
 namespace duckdb {
 
 class DatabaseInstance;
 struct MetadataHandle;
+struct BlockWriteback;
 enum class FreeBlockType { NEWLY_USED_BLOCK, CHECKPOINTED_BLOCK };
 
 struct EncryptionOptions {
@@ -124,6 +129,10 @@ public:
 	bool IsRemote() override;
 	//! Whether or not to prefetch
 	bool Prefetch() override;
+	//! Read-ahead: ask the operating system to start reading the given blocks that are not loaded, without waiting for
+	//! them: each block's slot, or in a compressed file its extent, in pieces the kernel reads in full. A no-op for
+	//! direct IO, a remote file or a handle that cannot take the hint
+	void ReadAhead(const vector<shared_ptr<BlockHandle>> &handles);
 
 	//! Return the checkpoint iteration of the file.
 	uint64_t GetCheckpointIteration() const {
@@ -134,6 +143,10 @@ public:
 	//! Return the database identifier.
 	data_ptr_t GetDBIdentifier() {
 		return options.db_identifier;
+	}
+	//! Whether blocks are stored compressed, one variable-length extent per block (storage version BLOCK_COMPRESSION_VERSION_NUMBER)
+	bool BlockCompression() const {
+		return block_compression;
 	}
 
 private:
@@ -171,6 +184,42 @@ private:
 	void TrimFreeBlockRange(block_id_t start, block_id_t end);
 
 	void IncreaseBlockReferenceCountInternal(block_id_t block_id);
+
+	//! Block compression: the file position of a block is its extent (offset, stored length), not its id
+	struct BlockExtent {
+		//! The file offset of the extent (page-aligned); 0 = the block has no extent
+		uint64_t offset = 0;
+		//! The bytes stored after the block header: a zstd frame, or the raw payload when it equals the block size
+		uint32_t length = 0;
+	};
+	void ReadCompressedBlock(QueryContext context, data_ptr_t internal_buffer, block_id_t block_id);
+	void ReadExtent(QueryContext context, data_ptr_t internal_buffer, block_id_t block_id, const BlockExtent &extent);
+	void WriteCompressedBlock(QueryContext context, FileBuffer &buffer, block_id_t block_id);
+	//! Extent allocation: the best-fitting free range, else at the end of the file
+	uint64_t AllocateExtent(idx_t bytes);
+	uint64_t AllocateExtentLocked(idx_t size);
+	//! Free space bookkeeping (extent_lock held): replace it, or remove [offset, offset + size) from it
+	void SetFreeSpaceLocked(const vector<pair<uint64_t, idx_t>> &ranges);
+	void TakeFreeSpaceLocked(uint64_t offset, idx_t size);
+	//! After a commit: the free space is every byte no live extent and no committed extent map holds; a free tail is cut
+	void RebuildFreeExtents();
+	//! Write the extent map of blocks [0, block_count) as one raw extent; its position goes into the database header
+	void WriteExtentMap(QueryContext context, idx_t block_count, const set<block_id_t> &free_blocks,
+	                    optional_idx at_offset = optional_idx());
+	//! After a commit: an extent map that ends the file moves into the lowest free range that holds it (map, sync,
+	//! in-place header), so the rebuild can cut the free tail before it
+	void RelocateExtentMapLow(QueryContext context, const set<block_id_t> &free_blocks);
+	void LoadExtentMap(QueryContext context, idx_t map_offset, idx_t map_entries);
+	//! After a commit: move the live extents at the end of the file into the free space before them, then make the new
+	//! placement durable (extent map, sync, the active header rewritten in place, sync); the next rebuild cuts the tail
+	void CompactAfterCommit(QueryContext context, const set<block_id_t> &free_blocks);
+	//! Rewrite the active database header in place with the current extent map position (same iteration), then sync
+	void WriteActiveHeaderInPlace(QueryContext context);
+	//! Leave the extent IO section (see extent_io)
+	void EndExtentIO();
+
+	//! Early writeback: start the device writes of written blocks in the background (no-op where unsupported)
+	void NotifyBlockWritten(idx_t bytes);
 
 	//! Verify the block usage count
 	void VerifyBlocks(const unordered_map<block_id_t, idx_t> &block_usage_count) override;
@@ -215,5 +264,34 @@ private:
 	StorageManagerOptions options;
 	//! Lock for performing various operations in the single file block manager
 	mutex single_file_block_lock;
+	//! Whether blocks are stored compressed (a file created at storage version BLOCK_COMPRESSION_VERSION_NUMBER)
+	bool block_compression = false;
+	//! Lock for the extent map and the extent allocator
+	mutex extent_lock;
+	//! The extent of each block id
+	vector<BlockExtent> extents;
+	//! The next free (page-aligned) file offset of the append-only extent allocator
+	uint64_t next_extent_offset = BLOCK_START;
+	//! The position of the extent map written with the last database header
+	idx_t extent_map_offset = 0;
+	idx_t extent_map_entries = 0;
+	//! The active database header as last written or loaded (the base of an in-place rewrite)
+	DatabaseHeader durable_header;
+	//! Serializes the header writers: WriteHeader and FileSync's extent map commit
+	mutex header_lock;
+	//! Block reads and writes in flight (between taking an extent and finishing its IO), and whether a compaction runs;
+	//! a compaction waits for the IO in flight and holds back new IO until it is done
+	idx_t extent_io = 0;
+	bool extent_compacting = false;
+	std::condition_variable extent_cv;
+	//! The free space: ranges no committed state and no live block references, reusable now (by offset and by size)
+	map<uint64_t, idx_t> free_by_offset;
+	multimap<idx_t, uint64_t> free_by_size;
+	//! The extents the last compaction moved
+	idx_t compact_moved = 0;
+	//! Early writeback state, created at the first block write of a writable on-disk file
+	unique_ptr<BlockWriteback> writeback;
+	bool writeback_checked = false;
+	mutex writeback_lock;
 };
 } // namespace duckdb

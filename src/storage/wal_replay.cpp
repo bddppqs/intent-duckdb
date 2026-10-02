@@ -63,6 +63,19 @@ public:
 		string table_name;
 	};
 	vector<ReplayIndexInfo> replay_index_infos;
+
+	//! The ROW_GROUP_DATA entries of the transaction being replayed. They take effect at its WAL_FLUSH (its commit), so
+	//! a WAL that ends before the flush (a writer stopped while committing) leaves neither the rows nor their blocks
+	//! in use, like every other entry of an uncommitted transaction
+	struct ReplayRowGroupInfo {
+		ReplayRowGroupInfo(optional_ptr<TableCatalogEntry> table, PersistentCollectionData data)
+		    : table(table), data(std::move(data)) {
+		}
+
+		optional_ptr<TableCatalogEntry> table;
+		PersistentCollectionData data;
+	};
+	vector<ReplayRowGroupInfo> replay_row_group_infos;
 };
 
 class WriteAheadLogDeserializer {
@@ -201,6 +214,7 @@ public:
 		auto wal_type = deserializer.ReadProperty<WALType>(100, "wal_type");
 		if (wal_type == WALType::WAL_FLUSH) {
 			deserializer.End();
+			ApplyRowGroupData();
 			return true;
 		}
 		ReplayEntry(wal_type);
@@ -248,6 +262,7 @@ protected:
 	void ReplayUseTable();
 	void ReplayInsert();
 	void ReplayRowGroupData();
+	void ApplyRowGroupData();
 	void ReplayDelete();
 	void ReplayUpdate();
 	void ReplayCheckpoint();
@@ -1082,53 +1097,65 @@ void WriteAheadLogDeserializer::ReplayRowGroupData() {
 	deserializer.ReadProperty(101, "row_group_data", data);
 	deserializer.Unset<const CompressionInfo>();
 	deserializer.Unset<DatabaseInstance>();
-	if (DeserializeOnly()) {
-		// label blocks in data as used - they will be used after the WAL replay is finished
-		// we need to do this during the deserialization phase to ensure the blocks will not be overwritten
-		// by previous deserialization steps
-		for (auto &block_id : data.GetBlockIds()) {
-			block_manager.MarkBlockAsUsed(block_id);
-		}
-		return;
-	}
-	if (!state.current_table) {
+	if (!DeserializeOnly() && !state.current_table) {
 		throw InternalException("Corrupt WAL: insert without table");
 	}
-	auto &storage = state.current_table->GetStorage();
-	auto &table_info = storage.GetDataTableInfo();
-	auto base_row = storage.GetTotalRows();
-	RowGroupCollection new_row_groups(table_info, table_info->GetIOManager(), storage.GetTypes(), base_row);
-	new_row_groups.Initialize(data);
+	// applied when the transaction commits (ApplyRowGroupData at its WAL_FLUSH)
+	state.replay_row_group_infos.emplace_back(state.current_table, std::move(data));
+}
 
-	// if we have any indexes - scan the row groups and add data to the indexes
-	auto &indexes = table_info->GetIndexes();
-	if (!indexes.Empty()) {
-		auto &transaction = DuckTransaction::Get(context, db);
-		// we have indexes - append
-		vector<StorageIndex> column_ids;
-		for (auto &col : state.current_table->GetColumns().Physical()) {
-			column_ids.emplace_back(col.StorageOid());
-		}
-		Vector row_id_vector(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE);
-		auto row_ids = FlatVector::GetData<row_t>(row_id_vector);
-		auto current_row_id = storage.GetTotalRows();
-		for (auto &chunk : new_row_groups.Chunks(transaction, column_ids)) {
-			for (idx_t r = 0; r < chunk.size(); r++) {
-				row_ids[r] = NumericCast<row_t>(current_row_id + r);
+void WriteAheadLogDeserializer::ApplyRowGroupData() {
+	auto infos = std::move(state.replay_row_group_infos);
+	state.replay_row_group_infos.clear();
+	for (auto &info : infos) {
+		auto &data = info.data;
+		if (DeserializeOnly()) {
+			// label blocks in data as used - they will be used after the WAL replay is finished
+			// we need to do this during the deserialization phase to ensure the blocks will not be overwritten
+			// by previous deserialization steps
+			auto &block_manager = db.GetStorageManager().GetBlockManager();
+			for (auto &block_id : data.GetBlockIds()) {
+				block_manager.MarkBlockAsUsed(block_id);
 			}
-			current_row_id += chunk.size();
-			for (auto &index : indexes.Indexes()) {
-				if (!index.IsBound()) {
-					auto &unbound_index = index.Cast<UnboundIndex>();
-					unbound_index.BufferChunk(chunk, row_id_vector, column_ids, BufferedIndexReplay::INSERT_ENTRY);
-					continue;
+			continue;
+		}
+		auto &table = *info.table;
+		auto &storage = table.GetStorage();
+		auto &table_info = storage.GetDataTableInfo();
+		auto base_row = storage.GetTotalRows();
+		RowGroupCollection new_row_groups(table_info, table_info->GetIOManager(), storage.GetTypes(), base_row);
+		new_row_groups.Initialize(data);
+
+		// if we have any indexes - scan the row groups and add data to the indexes
+		auto &indexes = table_info->GetIndexes();
+		if (!indexes.Empty()) {
+			auto &transaction = DuckTransaction::Get(context, db);
+			// we have indexes - append
+			vector<StorageIndex> column_ids;
+			for (auto &col : table.GetColumns().Physical()) {
+				column_ids.emplace_back(col.StorageOid());
+			}
+			Vector row_id_vector(LogicalType::ROW_TYPE, STANDARD_VECTOR_SIZE);
+			auto row_ids = FlatVector::GetData<row_t>(row_id_vector);
+			auto current_row_id = storage.GetTotalRows();
+			for (auto &chunk : new_row_groups.Chunks(transaction, column_ids)) {
+				for (idx_t r = 0; r < chunk.size(); r++) {
+					row_ids[r] = NumericCast<row_t>(current_row_id + r);
 				}
-				auto &bound_index = index.Cast<BoundIndex>();
-				bound_index.Append(chunk, row_id_vector);
+				current_row_id += chunk.size();
+				for (auto &index : indexes.Indexes()) {
+					if (!index.IsBound()) {
+						auto &unbound_index = index.Cast<UnboundIndex>();
+						unbound_index.BufferChunk(chunk, row_id_vector, column_ids, BufferedIndexReplay::INSERT_ENTRY);
+						continue;
+					}
+					auto &bound_index = index.Cast<BoundIndex>();
+					bound_index.Append(chunk, row_id_vector);
+				}
 			}
 		}
+		storage.MergeStorage(new_row_groups, nullptr);
 	}
-	storage.MergeStorage(new_row_groups, nullptr);
 }
 
 void WriteAheadLogDeserializer::ReplayDelete() {

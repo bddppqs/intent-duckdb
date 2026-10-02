@@ -1,0 +1,60 @@
+# name: test/sql/aggregate/group/string_predicate_build_guard.test
+# description: String-predicate build guard: an aggregate whose table scan carries a pushed expression filter on a VARCHAR column (contains / LIKE / NOT LIKE) leaves the scan unmarked, so it builds and emits nothing over a global dictionary and types no code key; every answer equals the same query with its string filter written as strpos (never pushed as a contains), and the unguarded shapes (a constant filter, no filter) still group over the published column; threads 1 and 8, twice each
+# group: [group]
+
+statement ok
+ATTACH '__TEST_DIR__/string_predicate_build_guard.db' AS guarded (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE guarded
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE docs AS SELECT i AS id, (hash(i) % 5000)::BIGINT AS owner, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://www.example.org/guard/' || CASE WHEN (i // 3) % 17 = 0 THEN 'gopher/' ELSE 'site/' END || (hash(i // 3) % 20000)::VARCHAR || CASE WHEN (i // 3) % 23 = 0 THEN '/.gopher./' ELSE '/page' END END AS addr, CASE WHEN i % 5 = 0 THEN '' ELSE 'catalogue item number ' || (hash(i // 2) % 3000)::VARCHAR END AS word, CASE WHEN i % 7 = 0 THEN 'The Gopher page ' || (i % 211)::VARCHAR ELSE 'topic-of-the-page-number-' || (i % 211)::VARCHAR END AS label FROM range(400000) r(i)
+
+statement ok
+CHECKPOINT
+
+loop r 0 4
+
+statement ok
+SET threads = CASE WHEN ${r} < 2 THEN 1 ELSE 8 END
+
+# GROUP BY word with MIN(addr), a pushed addr LIKE and word <> ''
+query I
+SELECT (SELECT string_agg(word || ':' || m || ':' || c, ',' ORDER BY c DESC, word) FROM (SELECT word, min(addr) AS m, count(*) AS c FROM docs WHERE addr LIKE '%gopher%' AND word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 10)) = (SELECT string_agg(word || ':' || m || ':' || c, ',' ORDER BY c DESC, word) FROM (SELECT word, min(addr) AS m, count(*) AS c FROM docs WHERE strpos(addr, 'gopher') > 0 AND word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 10))
+----
+true
+
+# a LIKE, NOT LIKE and <> '' filter shape: label LIKE, addr NOT LIKE, word <> '', MIN(addr), MIN(label), COUNT(DISTINCT owner)
+query I
+SELECT (SELECT string_agg(word || ':' || mu || ':' || mt || ':' || c || ':' || d, ',' ORDER BY c DESC, word) FROM (SELECT word, min(addr) AS mu, min(label) AS mt, count(*) AS c, count(DISTINCT owner) AS d FROM docs WHERE label LIKE '%Gopher%' AND addr NOT LIKE '%.gopher.%' AND word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 10)) = (SELECT string_agg(word || ':' || mu || ':' || mt || ':' || c || ':' || d, ',' ORDER BY c DESC, word) FROM (SELECT word, min(addr) AS mu, min(label) AS mt, count(*) AS c, count(DISTINCT owner) AS d FROM docs WHERE strpos(label, 'Gopher') > 0 AND strpos(addr, '.gopher.') = 0 AND word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 10))
+----
+true
+
+# a DISTINCT argument over an admitted column under a pushed LIKE
+query I
+SELECT (SELECT count(*) || '|' || count(DISTINCT addr) FROM docs WHERE addr LIKE '%gopher%') = (SELECT count(*) || '|' || count(DISTINCT addr) FROM docs WHERE strpos(addr, 'gopher') > 0)
+----
+true
+
+# the whole grouped result under the LIKE, NOT LIKE and <> '' filter shape (every group, not only the top ten)
+query I
+SELECT (SELECT count(*) || '|' || sum(c) || '|' || sum(d) FROM (SELECT word, count(*) AS c, count(DISTINCT owner) AS d FROM docs WHERE label LIKE '%Gopher%' AND addr NOT LIKE '%.gopher.%' AND word <> '' GROUP BY word)) = (SELECT count(*) || '|' || sum(c) || '|' || sum(d) FROM (SELECT word, count(*) AS c, count(DISTINCT owner) AS d FROM docs WHERE strpos(label, 'Gopher') > 0 AND strpos(addr, '.gopher.') = 0 AND word <> '' GROUP BY word))
+----
+true
+
+# unguarded shapes: a constant filter only, and no filter (the scan publishes the group column as before)
+query I
+SELECT (SELECT string_agg(word || ':' || c, ',' ORDER BY c DESC, word) FROM (SELECT word, count(*) AS c FROM docs WHERE word <> '' GROUP BY word ORDER BY c DESC, word LIMIT 10)) = (SELECT string_agg(word || ':' || c, ',' ORDER BY c DESC, word) FROM (SELECT word, count(*) AS c FROM docs WHERE length(word) > 0 GROUP BY word ORDER BY c DESC, word LIMIT 10))
+----
+true
+
+query I
+SELECT (SELECT count(*) FROM (SELECT addr FROM docs GROUP BY addr)) = (SELECT count(DISTINCT addr) + 1 FROM docs)
+----
+true
+
+endloop

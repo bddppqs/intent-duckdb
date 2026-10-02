@@ -144,9 +144,14 @@ public:
 	//! Initialize a scan over this row_group
 	bool InitializeScan(CollectionScanState &state, SegmentNode<RowGroup> &node);
 	bool InitializeScanWithOffset(CollectionScanState &state, SegmentNode<RowGroup> &node, idx_t vector_offset);
+	//! The metadata pointers of the given columns that are not loaded yet
+	void CollectUnloadedColumnPointers(const vector<storage_t> &columns, vector<MetaBlockPointer> &result) const;
 	//! Checks the given set of table filters against the row-group statistics. Returns false if the entire row group
 	//! can be skipped.
 	bool CheckZonemap(ScanFilterInfo &filters);
+	//! Read-ahead of the blocks an initialized scan of this row group reads for every vector the zone maps keep: every
+	//! scanned column without filters, else the column of the filter evaluated first
+	void ReadAheadScan(CollectionScanState &state, idx_t row_number);
 	//! Checks the given set of table filters against the per-segment statistics. Returns false if any segments were
 	//! skipped.
 	bool CheckZonemapSegments(CollectionScanState &state);
@@ -187,6 +192,9 @@ public:
 	RowGroupPointer Checkpoint(RowGroupWriteData write_data, RowGroupWriter &writer, TableStatistics &global_stats,
 	                           idx_t row_group_start);
 	bool IsPersistent() const;
+	//! Whether every row of this row group is already on disk unchanged: no deletes, and no column holds in-memory
+	//! (transient) data or updates. Unloaded columns are on disk by construction.
+	bool IsUnchangedOnDisk();
 	PersistentRowGroupData SerializeRowGroupInfo(idx_t row_group_start) const;
 
 	void InitializeAppend(RowGroupAppendState &append_state);

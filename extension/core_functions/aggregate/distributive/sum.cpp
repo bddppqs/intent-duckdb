@@ -26,6 +26,11 @@ struct SumSetOperation {
 };
 
 struct IntegerSumOperation : public BaseSumOperation<SumSetOperation, RegularAdd> {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void RunOperation(STATE &state, const INPUT_TYPE &input, idx_t count) {
+		RunOperationInternal<INPUT_TYPE, STATE, OP>(state, input, count);
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.isset) {
@@ -37,6 +42,11 @@ struct IntegerSumOperation : public BaseSumOperation<SumSetOperation, RegularAdd
 };
 
 struct SumToHugeintOperation : public BaseSumOperation<SumSetOperation, AddToHugeint> {
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void RunOperation(STATE &state, const INPUT_TYPE &input, idx_t count) {
+		RunOperationInternal<INPUT_TYPE, STATE, OP>(state, input, count);
+	}
+
 	template <class T, class STATE>
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (!state.isset) {

@@ -2,10 +2,13 @@
 
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/operator/subtract.hpp"
+#include "duckdb/execution/operator/aggregate/fused_integer_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_perfecthash_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/execution/operator/aggregate/physical_partitioned_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/physical_streaming_first_keys.hpp"
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -15,6 +18,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -235,8 +239,32 @@ static bool CanUsePerfectHashAggregate(ClientContext &context, LogicalAggregate 
 PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 	D_ASSERT(op.children.size() == 1);
 
+	if (op.first_keys) {
+		// first-keys rewrite: emit the first k distinct group keys of the input (FirstKeysAggregate)
+		D_ASSERT(op.expressions.empty());
+		auto &child = CreatePlan(*op.children[0]);
+		auto &info = *op.first_keys;
+		// compressed materialization (run by the statistics propagator after the rewrite) may have replaced the key
+		// columns by compressed values of narrower types; the pushed row-level filters must hold raw column values,
+		// so push nothing in that case (the SEMI join keeps the result exact without the probe-side filter)
+		for (idx_t i = 0; i < op.groups.size(); i++) {
+			if (i >= info.probe_storage_types.size() || op.types[i] != info.probe_storage_types[i] ||
+			    op.groups[i]->return_type != info.probe_storage_types[i]) {
+				info.probe_filters.reset();
+				break;
+			}
+		}
+		auto &first_keys = Make<PhysicalStreamingFirstKeys>(op.types, std::move(op.groups), std::move(op.first_keys),
+		                                                    op.estimated_cardinality);
+		first_keys.children.push_back(child);
+		return first_keys;
+	}
+
 	reference<PhysicalOperator> plan = CreatePlan(*op.children[0]);
 	plan = ExtractAggregateExpressions(plan, op.expressions, op.groups, op.grouping_sets);
+	// the scan below publishes only the admitted columns a group item or a
+	// DISTINCT argument resolves to, each under the memory gate
+	dict_global::MarkKeyConsumers(context, plan.get(), op.groups, op.expressions);
 
 	bool can_use_simple_aggregation = true;
 	for (auto &expression : op.expressions) {
@@ -268,6 +296,11 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 			auto &group_by = Make<PhysicalUngroupedAggregate>(op.types, std::move(op.expressions),
 			                                                  op.estimated_cardinality, op.distinct_validity);
 			group_by.children.push_back(plan);
+			if (op.grouping_functions.empty()) {
+				// run-aware ungrouped aggregation over an unfiltered seq_scan of RLE/Constant integer columns
+				RunAggregateData::TryAttach(context, group_by.Cast<PhysicalUngroupedAggregate>());
+				FusedIntegerAggregate::TryAttachUngrouped(context, group_by.Cast<PhysicalUngroupedAggregate>());
+			}
 			return group_by;
 		}
 		auto &group_by =
@@ -296,10 +329,24 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 		return group_by;
 	}
 
+	// a group key over a published admitted column is typed as its 4-byte global code (the group BOUND_REF
+	// becomes INTEGER; the operator converts its input and re-emits the strings at its output)
+	auto global_code_keys = dict_global::PlanCodeKeys(context, plan.get(), op.groups, op.types, op.expressions,
+	                                                  op.grouping_sets.size());
 	auto &group_by = Make<PhysicalHashAggregate>(context, op.types, std::move(op.expressions), std::move(op.groups),
 	                                             std::move(op.grouping_sets), std::move(op.grouping_functions),
 	                                             op.estimated_cardinality, group_validity, op.distinct_validity);
 	group_by.children.push_back(plan);
+	auto &hash_aggregate = group_by.Cast<PhysicalHashAggregate>();
+	if (global_code_keys) {
+		// kept beside the operator, never inside it (a prebuilt extension reads the operator at upstream offsets)
+		dict_global::RegisterCodeKeys(&hash_aggregate,
+		                              shared_ptr<dict_global::CodeKeys>(std::move(global_code_keys)));
+	}
+	// run-aware grouped aggregation over an unfiltered seq_scan of one RLE/Constant integer group column
+	RunAggregateData::TryAttachGrouped(context, hash_aggregate);
+	// the fused integer aggregate, after the run channel, which keeps precedence on its shapes
+	FusedIntegerAggregate::TryAttach(context, hash_aggregate, group_validity);
 	return group_by;
 }
 

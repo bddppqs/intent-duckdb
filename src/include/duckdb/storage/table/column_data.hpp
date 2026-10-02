@@ -35,6 +35,7 @@ struct TableScanOptions;
 struct TransactionData;
 struct PersistentColumnData;
 class ValidityColumnData;
+struct RunSink;
 
 using column_segment_vector_t = vector<SegmentNode<ColumnSegment>>;
 
@@ -151,6 +152,16 @@ public:
 	//! Skip the scan forward by "count" rows
 	virtual void Skip(ColumnScanState &state, idx_t count = STANDARD_VECTOR_SIZE);
 
+	//! Whether the next scan_count rows can be consumed as (value, run length) pairs: a standard integer column
+	//! without updates whose covering data segments are RLE or Constant and whose covering validity segments
+	//! cannot hold NULL values. Touches no scan state.
+	bool RunEligible(ColumnScanState &state, idx_t scan_count);
+	//! Scan the next scan_count rows as runs into the sink (only after RunEligible), advancing the data and validity
+	//! scan states exactly as Scan would
+	void ScanRuns(ColumnScanState &state, idx_t scan_count, RunSink &sink);
+	//! Whether every segment covering the next scan_count rows is run-scannable (data) or NULL-free (validity)
+	bool SegmentsRunEligible(ColumnScanState &state, idx_t scan_count, bool validity_column) const;
+
 	//! Initialize an appending phase for this column
 	virtual void InitializeAppend(ColumnAppendState &state);
 	//! Append a vector of type [type] to the end of the column
@@ -217,6 +228,10 @@ protected:
 	void AppendSegment(SegmentLock &l, unique_ptr<ColumnSegment> segment);
 
 	void BeginScanVectorInternal(ColumnScanState &state);
+	//! scan a vector that straddles segments, or a partial vector, of a published column as one dictionary
+	//! vector over the global dictionary when every spanned segment carries a translation; false (nothing consumed)
+	//! otherwise
+	bool TryScanGlobalDictionary(ColumnScanState &state, Vector &result, idx_t count);
 	//! Scans a base vector from the column
 	idx_t ScanVector(ColumnScanState &state, Vector &result, idx_t remaining, ScanVectorType scan_type,
 	                 idx_t result_offset = 0);

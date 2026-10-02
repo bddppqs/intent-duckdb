@@ -10,8 +10,54 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/temporary_memory_manager.hpp"
+#include "duckdb/common/printer.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
+
+// Upstream's finalize-side merge materialises every distinct VARCHAR group key a second time: the sink had
+// already stored the key in its own TupleDataCollection string heap, and
+// GroupedAggregateHashTable::Combine re-scattered it into the merged table's heap
+// (TupleDataValueStore<string_t> -> FastMemcpy).  While the merge below is active, a new group is
+// appended by copying only the fixed-width row it was created from, so the key bytes stay where the
+// sink wrote them; the collection that holds them, and the pins that keep it resident and at a
+// stable address, are released together with the merged data that borrows from it.
+static bool BorrowedGroupKeysDisabled() {
+	return !kBorrowedGroupKeysInCombine;
+}
+
+static thread_local vector<BufferHandle> *borrowed_group_key_pins = nullptr;
+
+vector<BufferHandle> *ArmBorrowedGroupKeys(vector<BufferHandle> *pins) {
+	const auto previous = borrowed_group_key_pins;
+	borrowed_group_key_pins = pins;
+	return previous;
+}
+
+vector<BufferHandle> *BorrowedGroupKeyPins() {
+	return borrowed_group_key_pins;
+}
+
+namespace {
+
+//! Arms the borrow for one GroupedAggregateHashTable::Combine and restores the previous arming on
+//! every exit, including the InterruptException that Combine can throw.  Never active when the
+//! aggregate went external, whose blocks the temporary memory reservation expects to be evictable;
+//! nullptr is the unborrowed path, as with kBorrowedGroupKeysInCombine false.
+struct BorrowedGroupKeyGuard {
+	BorrowedGroupKeyGuard(vector<BufferHandle> &pins, const bool external)
+	    : previous(ArmBorrowedGroupKeys((BorrowedGroupKeysDisabled() || external) ? nullptr : &pins)) {
+	}
+	~BorrowedGroupKeyGuard() {
+		ArmBorrowedGroupKeys(previous);
+	}
+	vector<BufferHandle> *const previous;
+};
+
+} // namespace
 
 RadixPartitionedHashTable::RadixPartitionedHashTable(GroupingSet &grouping_set_p, const GroupedAggregateData &op_p,
                                                      TupleDataValidityType group_validity_p)
@@ -94,6 +140,11 @@ struct AggregatePartition : StateWithBlockableTasks {
 	AggregatePartitionState state;
 
 	unique_ptr<TupleDataCollection> data;
+	//! the partial rows this partition was finalized from, and the pins that keep them
+	//! resident, kept because the rows in "data" borrow their group keys' bytes from them.  Both
+	//! stay empty when nothing was borrowed.
+	unique_ptr<TupleDataCollection> borrowed_data;
+	vector<BufferHandle> borrowed_pins;
 	atomic<double> progress;
 };
 
@@ -173,6 +224,8 @@ public:
 	bool finalized;
 	//! Whether we are doing an external aggregation
 	atomic<bool> external;
+	//! The published dictionaries the combined rows borrow strings from (kept until this state dies)
+	vector<buffer_ptr<VectorBuffer>> global_dictionary_pins;
 	//! Threads that have called Sink
 	atomic<idx_t> active_threads;
 	//! Number of threads (from TaskScheduler)
@@ -262,12 +315,7 @@ void RadixHTGlobalSinkState::Destroy() {
 		if (data_collection.Count() == 0) {
 			continue;
 		}
-		TupleDataChunkIterator iterator(data_collection, TupleDataPinProperties::DESTROY_AFTER_DONE, false);
-		auto &row_locations = iterator.GetChunkState().row_locations;
-		do {
-			RowOperations::DestroyStates(row_state, layout, row_locations, iterator.GetCurrentChunkCount());
-		} while (iterator.Next());
-		data_collection.Reset();
+		GroupedAggregateHashTable::GlobalDictionaryDestroyStates(data_collection, layout, row_state);
 	}
 }
 // LCOV_EXCL_STOP
@@ -404,6 +452,10 @@ unique_ptr<GlobalSinkState> RadixPartitionedHashTable::GetGlobalSinkState(Client
 
 unique_ptr<LocalSinkState> RadixPartitionedHashTable::GetLocalSinkState(ExecutionContext &context) const {
 	return make_uniq<RadixHTLocalSinkState>(context.client, *this);
+}
+
+unique_ptr<LocalSinkState> RadixPartitionedHashTable::GetLocalSinkState(ClientContext &context) const {
+	return make_uniq<RadixHTLocalSinkState>(context, *this);
 }
 
 void RadixPartitionedHashTable::PopulateGroupChunk(DataChunk &group_chunk, DataChunk &input_chunk) const {
@@ -566,6 +618,7 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 	PopulateGroupChunk(group_chunk, chunk);
 
 	auto &ht = *lstate.ht;
+	ht.SetSinkExternal(gstate.external);
 	ht.AddChunk(group_chunk, payload_input, filter);
 
 	// Decide whether we should adapt our strategy to the data
@@ -602,7 +655,53 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 	// TODO: combine early and often
 }
 
+void RadixPartitionedHashTable::SinkRuns(ClientContext &context, GlobalSinkState &gstate_p, LocalSinkState &lstate_p,
+                                         DataChunk &groups, const uint16_t *run_counts, idx_t run_count,
+                                         const vector<aggregate_grouped_run_update_t> &run_updates) const {
+	if (run_count == 0) {
+		return;
+	}
+	auto &gstate = gstate_p.Cast<RadixHTGlobalSinkState>();
+	auto &lstate = lstate_p.Cast<RadixHTLocalSinkState>();
+	if (!lstate.ht) {
+		lstate.local_sink_capacity = gstate.config.sink_capacity;
+		lstate.ht = CreateHT(context, lstate.local_sink_capacity, gstate.config.GetRadixBits());
+		// the run path performs one probe per run and never adapts its strategy: the HLL would cost a hash per run
+		// and the skip-lookup adaptation is decided from a per-row deduplication rate the run path does not have
+		lstate.adapted = true;
+		gstate.active_threads++;
+	}
+
+	auto &ht = *lstate.ht;
+	ht.SetSinkExternal(gstate.external);
+	ht.AddRunChunk(groups, run_counts, run_count, run_updates);
+
+	if (ht.Count() + STANDARD_VECTOR_SIZE < GroupedAggregateHashTable::ResizeThreshold(lstate.local_sink_capacity)) {
+		return; // We can fit another chunk
+	}
+
+	if (gstate.number_of_threads > RadixHTConfig::GROW_STRATEGY_THREAD_THRESHOLD || gstate.external) {
+		ht.Abandon();
+	}
+
+	const auto radix_bits_before = ht.GetRadixBits();
+	MaybeRepartition(context, gstate, lstate, false);
+	const auto repartitioned = radix_bits_before != ht.GetRadixBits();
+
+	if (repartitioned && ht.Count() != 0) {
+		ht.Abandon();
+		if (gstate.external) {
+			ht.Resize(lstate.local_sink_capacity);
+		}
+	}
+}
+
 void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkState &gstate_p,
+                                        LocalSinkState &lstate_p) const {
+	Combine(context.client, gstate_p, lstate_p);
+}
+
+void RadixPartitionedHashTable::Combine(ClientContext &context, GlobalSinkState &gstate_p,
                                         LocalSinkState &lstate_p) const {
 	auto &gstate = gstate_p.Cast<RadixHTGlobalSinkState>();
 	auto &lstate = lstate_p.Cast<RadixHTLocalSinkState>();
@@ -612,14 +711,14 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
 
 	// Set any_combined, then check one last time whether we need to repartition
 	gstate.any_combined = true;
-	MaybeRepartition(context.client, gstate, lstate, true);
+	MaybeRepartition(context, gstate, lstate, true);
 
 	auto &ht = *lstate.ht;
 	auto lstate_data = ht.AcquirePartitionedData();
 	if (lstate.abandoned_data) {
 		D_ASSERT(gstate.external);
 		// The global radix bits may have grown after we last sized abandoned_data - grow it to match before combining
-		GrowAbandonedDataToRadixBits(context.client, gstate, lstate, gstate.config.GetRadixBits());
+		GrowAbandonedDataToRadixBits(context, gstate, lstate, gstate.config.GetRadixBits());
 		D_ASSERT(lstate.abandoned_data->PartitionCount() == lstate.ht->GetPartitionedData().PartitionCount());
 		D_ASSERT(lstate.abandoned_data->PartitionCount() ==
 		         RadixPartitioning::NumberOfPartitions(gstate.config.GetRadixBits()));
@@ -629,12 +728,16 @@ void RadixPartitionedHashTable::Combine(ExecutionContext &context, GlobalSinkSta
 	}
 
 	auto aggregate_allocator = ht.GetAggregateAllocator();
+	auto global_dictionary_pins = std::move(ht.global_dictionary_pins);
 
 	// Eagerly destroy the HT
 	lstate.ht.reset();
 
 	auto guard = gstate.Lock();
 	D_ASSERT(!gstate.finalized);
+	for (auto &pin : global_dictionary_pins) {
+		gstate.global_dictionary_pins.push_back(std::move(pin));
+	}
 	if (gstate.uncombined_data) {
 		gstate.uncombined_data->Combine(*lstate.abandoned_data);
 	} else {
@@ -876,13 +979,24 @@ void RadixHTLocalSourceState::Finalize(RadixHTGlobalSinkState &sink, RadixHTGlob
 	}
 
 	// Now combine the uncombined data using this thread's HT
-	ht->Combine(*partition.data, &partition.progress);
+	vector<BufferHandle> borrowed_pins;
+	{
+		const BorrowedGroupKeyGuard borrowed_group_key_state(borrowed_pins, sink.external);
+		ht->Combine(*partition.data, &partition.progress);
+	}
 	partition.progress = 1;
 
 	// Move the combined data back to the partition
+	auto combined_from = std::move(partition.data);
 	partition.data = make_uniq<TupleDataCollection>(BufferManager::GetBufferManager(gstate.context),
 	                                                sink.radix_ht.GetLayoutPtr(), MemoryTag::HASH_TABLE);
 	partition.data->Combine(*ht->AcquirePartitionedData()->GetPartitions()[0]);
+	if (!borrowed_pins.empty()) {
+		// the combined rows point at group keys that still live in the rows they were
+		// combined from, so those rows outlive this merge and are released with the combined data
+		partition.borrowed_pins = std::move(borrowed_pins);
+		partition.borrowed_data = std::move(combined_from);
+	}
 
 	// Update thread-global state
 	auto guard = sink.Lock();
@@ -923,6 +1037,8 @@ void RadixHTLocalSourceState::Scan(RadixHTGlobalSinkState &sink, RadixHTGlobalSo
 	if (!data_collection.Scan(scan_state, scan_chunk)) {
 		if (sink.scan_pin_properties == TupleDataPinProperties::DESTROY_AFTER_DONE) {
 			data_collection.Reset();
+			partition.borrowed_data.reset();
+			partition.borrowed_pins.clear();
 		}
 		scan_status = RadixHTScanStatus::DONE;
 		auto guard = sink.Lock();

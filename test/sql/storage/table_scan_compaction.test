@@ -1,0 +1,110 @@
+# name: test/sql/storage/table_scan_compaction.test
+# description: Filtered scans at 1, 10, 50 and 100 % selectivity over bitpacked, RLE and dictionary columns with and without NULLs: aggregates, the rows in rowid order, a TopN, grouping by a VARCHAR column across segments, rowid, and LIMIT / OFFSET prefixes at threads 1; the answers are the plain engine answers at threads 1 and 8
+# group: [storage]
+
+require vector_size 2048
+
+load {TEST_DIR}/table_scan_compaction.db readwrite v1.5.0
+
+statement ok
+CREATE TABLE t_scan AS SELECT i::BIGINT AS i, (i % 1000)::INTEGER AS sel, (i % 7)::SMALLINT AS bp, (i // 1000)::INTEGER AS rl, CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 17)::INTEGER END AS bn, CASE WHEN i % 29 = 0 THEN NULL ELSE 'k' || lpad((i % 300)::VARCHAR, 3, '0') END AS v FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# 1 %
+query IIIIIIIII
+SELECT count(*), sum(bp), min(rl), max(rl), count(bn), sum(bn), count(v), min(v), max(v) FROM t_scan WHERE sel < 10
+----
+3000	9003	0	299	2769	22163	2895	k000	k209
+
+# 10 %
+query IIIIIIIII
+SELECT count(*), sum(bp), min(rl), max(rl), count(bn), sum(bn), count(v), min(v), max(v) FROM t_scan WHERE sel < 100
+----
+30000	90003	0	299	27692	221551	28965	k000	k299
+
+# 50 %
+query IIIIIIIII
+SELECT count(*), sum(bp), min(rl), max(rl), count(bn), sum(bn), count(v), min(v), max(v) FROM t_scan WHERE sel < 500
+----
+150000	450003	0	299	138461	1107712	144825	k000	k299
+
+# 100 %
+query IIIIIIIII
+SELECT count(*), sum(bp), min(rl), max(rl), count(bn), sum(bn), count(v), min(v), max(v) FROM t_scan WHERE sel >= 0
+----
+300000	899997	0	299	276923	2215382	289655	k000	k299
+
+# grouped by the VARCHAR column
+query III
+SELECT v, count(*), sum(bp) FROM t_scan WHERE sel < 100 AND v IS NOT NULL GROUP BY v ORDER BY v LIMIT 5
+----
+k000	96	288
+k001	97	290
+k002	96	290
+k003	96	285
+k004	97	291
+
+# the rows in rowid order
+query I
+SELECT string_agg(i::VARCHAR, ',' ORDER BY rowid) FROM t_scan WHERE sel = 7 AND i < 20000
+----
+7,1007,2007,3007,4007,5007,6007,7007,8007,9007,10007,11007,12007,13007,14007,15007,16007,17007,18007,19007
+
+# a TopN
+query II
+SELECT i, v FROM t_scan WHERE sel < 10 ORDER BY v, i LIMIT 10
+----
+3000	k000
+6000	k000
+9000	k000
+12000	k000
+15000	k000
+18000	k000
+21000	k000
+24000	k000
+27000	k000
+30000	k000
+
+# rowid under a filter
+query III
+SELECT min(rowid), max(rowid), count(*) FROM t_scan WHERE sel = 999
+----
+999	299999	300
+
+endloop
+
+statement ok
+SET threads = 1
+
+# scan order at threads 1: LIMIT and LIMIT / OFFSET prefixes
+query III
+SELECT i, bp, v FROM t_scan WHERE sel = 3 LIMIT 5
+----
+3	3	k003
+1003	2	k103
+2003	1	k203
+3003	0	k003
+4003	6	k103
+
+query III
+SELECT i, bp, v FROM t_scan WHERE sel = 3 LIMIT 5 OFFSET 5
+----
+5003	5	k203
+6003	4	NULL
+7003	3	k103
+8003	2	k203
+9003	1	k003
+
+query I
+SELECT string_agg(i::VARCHAR, ',') FROM t_scan WHERE sel = 11 AND i < 30000
+----
+11,1011,2011,3011,4011,5011,6011,7011,8011,9011,10011,11011,12011,13011,14011,15011,16011,17011,18011,19011,20011,21011,22011,23011,24011,25011,26011,27011,28011,29011

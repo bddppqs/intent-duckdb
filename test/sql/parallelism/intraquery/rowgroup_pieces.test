@@ -1,0 +1,154 @@
+# name: test/sql/parallelism/intraquery/rowgroup_pieces.test
+# description: Row-group pieces in pipelines without a batch index: every row once, insertion order kept
+# group: [intraquery]
+
+statement ok
+PRAGMA threads=8
+
+# 16 full row groups of 122880 rows
+statement ok
+CREATE TABLE t_pieces AS SELECT k, k // 122880 AS g, (k % 7)::VARCHAR AS s FROM range(0, 16 * 122880) t(k)
+
+# 8 scattered admitted row groups into an aggregate sink (the targets' shape): pieces allowed
+query III
+SELECT count(*), sum(k), count(DISTINCT s) FROM t_pieces WHERE g IN (1, 3, 5, 7, 9, 11, 13, 15)
+----
+983040	1026765127680	7
+
+query IIIII
+SELECT s, count(*), sum(k) * 100, min(k), max(k) FROM t_pieces WHERE g IN (1, 3, 5, 7, 9, 11, 13, 15) GROUP BY s ORDER BY s
+----
+0	140434	14667971437700	122885	1966076
+1	140434	14668071497100	122886	1966077
+2	140435	14668183844500	122880	1966078
+3	140435	14668111872000	122881	1966079
+4	140434	14668015323500	122882	1966073
+5	140434	14668115382900	122883	1966074
+6	140434	14668043410300	122884	1966075
+
+# every row group admitted: the first 8 donated, the rest whole
+query III
+SELECT count(*), sum(k), count(DISTINCT k) FROM t_pieces
+----
+1966080	1932734300160	1966080
+
+query III
+SELECT g, count(*), sum(k) * 100 FROM t_pieces WHERE g BETWEEN 4 AND 11 GROUP BY g ORDER BY g
+----
+4	122880	6794766336000
+5	122880	8304715776000
+6	122880	9814665216000
+7	122880	11324614656000
+8	122880	12834564096000
+9	122880	14344513536000
+10	122880	15854462976000
+11	122880	17364412416000
+
+# insertion order across a piece boundary (a batch-index or order-dependent sink keeps whole row groups)
+query I
+SELECT k FROM t_pieces WHERE g = 2 LIMIT 5 OFFSET 30718
+----
+276478
+276479
+276480
+276481
+276482
+
+query I
+SELECT k FROM t_pieces LIMIT 4 OFFSET 92158
+----
+92158
+92159
+92160
+92161
+
+statement ok
+CREATE TABLE t_cp AS SELECT k FROM t_pieces WHERE g BETWEEN 4 AND 7
+
+query IIII
+SELECT count(*), min(k), max(k), bool_and(k = 4 * 122880 + rowid) FROM t_cp
+----
+491520	491520	983039	true
+
+# the piece rule's boundaries: 1, 2, 3 and 4 pieces, and a partial last row group
+statement ok
+CREATE TABLE t_rg30720 AS SELECT k FROM range(0, 30720) t(k)
+
+statement ok
+CREATE TABLE t_rg30721 AS SELECT k FROM range(0, 30721) t(k)
+
+statement ok
+CREATE TABLE t_rg92160 AS SELECT k FROM range(0, 92160) t(k)
+
+statement ok
+CREATE TABLE t_rg92161 AS SELECT k FROM range(0, 92161) t(k)
+
+statement ok
+CREATE TABLE t_partial AS SELECT k FROM range(0, 3 * 122880 + 100000) t(k)
+
+query IIIII
+SELECT count(*), sum(k), count(DISTINCT k), min(k), max(k) FROM t_rg30720
+----
+30720	471843840	30720	0	30719
+
+query IIIII
+SELECT count(*), sum(k), count(DISTINCT k), min(k), max(k) FROM t_rg30721
+----
+30721	471874560	30721	0	30720
+
+query III
+SELECT k % 3 AS m, count(*), sum(k) FROM t_rg30721 GROUP BY m ORDER BY m
+----
+0	10241	157301760
+1	10240	157281280
+2	10240	157291520
+
+query IIIII
+SELECT count(*), sum(k), count(DISTINCT k), min(k), max(k) FROM t_rg92160
+----
+92160	4246686720	92160	0	92159
+
+query IIIII
+SELECT count(*), sum(k), count(DISTINCT k), min(k), max(k) FROM t_rg92161
+----
+92161	4246778880	92161	0	92160
+
+query III
+SELECT k % 3 AS m, count(*), sum(k) FROM t_rg92161 GROUP BY m ORDER BY m
+----
+0	30721	1415623680
+1	30720	1415562240
+2	30720	1415592960
+
+query IIIII
+SELECT count(*), sum(k) * 100, count(DISTINCT k), min(k), max(k) FROM t_partial
+----
+468640	10981149048000	468640	0	468639
+
+query III
+SELECT k % 3 AS m, count(*), sum(k) FROM t_partial GROUP BY m ORDER BY m
+----
+0	156214	36603986373
+1	156213	36603673947
+2	156213	36603830160
+
+# verify_parallelism keeps its one-vector hand-out
+statement ok
+PRAGMA verify_parallelism
+
+query III
+SELECT count(*), sum(k), count(DISTINCT s) FROM t_pieces WHERE g IN (1, 3, 5, 7, 9, 11, 13, 15)
+----
+983040	1026765127680	7
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+# one thread: never split
+statement ok
+PRAGMA threads=1
+
+query IIIII
+SELECT count(*), sum(k) * 100, count(DISTINCT k), min(k), max(k) FROM t_partial
+----
+468640	10981149048000	468640	0	468639

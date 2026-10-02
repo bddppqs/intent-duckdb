@@ -1,0 +1,30 @@
+# name: test/sql/storage/vacuum/vacuum_skip_unchanged_row_groups.test_slow
+# description: The commit checkpoint does not merge row groups that a bulk insert has already written unchanged
+# group: [vacuum]
+
+require parquet
+
+load __TEST_DIR__/vacuum_skip_unchanged_row_groups.db
+
+# 6 parquet row groups of about 150000 rows (one full row group and a partial one each) and a smaller last one: the batch
+# insert writes every batch's row groups to disk before the commit, partial row groups included
+statement ok
+COPY (FROM range(1000000) t(i)) TO '__TEST_DIR__/vacuum_skip_unchanged.parquet' (ROW_GROUP_SIZE 150000)
+
+statement ok
+CREATE TABLE t AS FROM '__TEST_DIR__/vacuum_skip_unchanged.parquet'
+
+statement ok
+CHECKPOINT
+
+# no row group was rewritten by the checkpoint: no block was freed, and every batch keeps its row groups
+query II
+SELECT free_blocks, (SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('t')) FROM pragma_database_size()
+----
+0	13
+
+# the sum modulo a prime keeps the expected value short
+query III
+SELECT count(*), sum(i) % 1000000007, min(i) + max(i) FROM t
+----
+1000000	999496507	999999

@@ -1,0 +1,162 @@
+# name: test/sql/optimizer/count_first_topk.test
+# description: GROUP BY keys ... ORDER BY count DESC LIMIT k with other aggregates is rewritten into a count-first top-k pass (CountFirstTopK)
+# group: [optimizer]
+
+# The pass engages on an unfiltered scan of at least 2^20 rows in which one group key is near-unique by its own
+# distinct-count statistic. The engaged table has 2,097,152 rows and k1 is near-unique: 21,621 hot rows (i % 97 = 0)
+# form 148 keys (m, NULL) for even m and (m, 0) for odd m holding 2m + 1 rows each (m < 147; m = 147 holds 12), a head
+# of distinct counts 293, 291, ... with no tie at 10 or 11; the other rows are singletons whose k2 is never NULL and
+# never meets a hot key.
+
+statement ok
+CREATE TABLE cf AS SELECT CASE WHEN i % 97 = 0 THEN floor(sqrt(i // 97))::BIGINT ELSE (i * 2654435761) % 1099511627776 END AS k1, CASE WHEN i % 97 = 0 THEN (CASE WHEN floor(sqrt(i // 97))::BIGINT % 2 = 0 THEN NULL ELSE 0 END)::INTEGER ELSE (i % 1000003)::INTEGER END AS k2, (i % 3)::SMALLINT AS x, (i % 2000)::SMALLINT AS y FROM range(2097152) r(i);
+
+# the pass is listed and can be named in disabled_optimizers
+query I
+SELECT count(*) FROM duckdb_optimizers() WHERE name = 'count_first_topk'
+----
+1
+
+# the rewrite engages: a SEMI hash join against an inner Top-N
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Join Type: SEMI.*TOP_N.*
+
+# exact payloads for the top-10 keys (NULL keys included: k2 is nullable, so the join matches IS NOT DISTINCT FROM)
+query IIIIIIII
+SELECT k1, k2, count(*) AS c, sum(x), sum(y), min(y), max(y), count(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+146	NULL	293	294	297502	8	1999	293
+145	0	291	291	291590	3	1998	291
+144	NULL	289	288	289040	2	1993	289
+143	0	287	288	286688	6	1997	287
+142	NULL	285	285	281370	1	1996	285
+141	0	283	282	283922	0	1991	283
+140	NULL	281	282	283180	4	1995	281
+139	0	279	279	275980	8	1999	279
+138	NULL	277	276	281158	3	1998	277
+137	0	275	276	273550	2	1993	275
+
+# count(column) as the ordering count
+query IIII
+SELECT k1, k2, count(x) AS c, sum(y) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 3
+----
+146	NULL	293	297502
+145	0	291	291590
+144	NULL	289	289040
+
+# LIMIT 1
+query IIII
+SELECT k1, k2, count(*) AS c, sum(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 1
+----
+146	NULL	293	294
+
+# non-decomposable payloads are exact: every top-10 row equals the plain aggregate over the hot keys
+query I
+SELECT count(*) FROM (SELECT k1, k2, count(*) AS c, avg(y) AS a, count(DISTINCT y) AS d, median(y) AS m FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10) l JOIN (SELECT k1, k2, count(*) AS c, avg(y) AS a, count(DISTINCT y) AS d, median(y) AS m FROM cf WHERE k1 < 1000 AND (k2 = 0 OR k2 IS NULL) GROUP BY k1, k2) r ON l.k1 = r.k1 AND l.k2 IS NOT DISTINCT FROM r.k2 AND l.c = r.c AND l.a = r.a AND l.d = r.d AND l.m = r.m
+----
+10
+
+# LIMIT 1024 ties at the boundary (count 1): k rows, distinct, each a member of the full grouped relation
+query II
+SELECT count(*), sum(c) FROM (SELECT k1, k2, count(*) AS c, sum(x) AS sx FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 1024)
+----
+1024	22497
+
+query I
+SELECT count(*) FROM (SELECT k1, k2, count(*) AS c, sum(x) AS sx FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 1024) l JOIN (SELECT k1, k2, count(*) AS c, sum(x) AS sx FROM cf GROUP BY k1, k2) r ON l.k1 = r.k1 AND l.k2 IS NOT DISTINCT FROM r.k2 AND l.c = r.c AND l.sx = r.sx
+----
+1024
+
+# refused shapes keep the plan: no other aggregate, a payload below 16 bytes, OFFSET, ASC, an order on a non-count,
+# COUNT(DISTINCT) as the ordering aggregate, a computed projection above the aggregate, LIMIT above 1024
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, min(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10 OFFSET 5
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x) FROM cf GROUP BY k1, k2 ORDER BY c ASC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x) AS s FROM cf GROUP BY k1, k2 ORDER BY s DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(DISTINCT x) AS c, sum(y) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1 + 1 AS k, k2, count(*) AS c, sum(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 1025
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# a filtered input: refused (its row count is a selectivity estimate, and the copy would filter twice). On 6,291,456 rows
+# the filtered estimate stays above 2^20 and the same query without the filter engages, so only the filter rule refuses it
+statement ok
+CREATE TABLE fb AS SELECT (i * 2654435761) % 1099511627776 AS k1, (i % 7)::INTEGER AS k2, (i % 3)::SMALLINT AS x, (i % 2000)::SMALLINT AS y FROM range(6291456) r(i);
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM fb GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Join Type: SEMI.*TOP_N.*
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM fb WHERE y < 1999 GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# a composite key whose columns are each far from unique (4,096 groups over 2,097,152 rows; the product of the two
+# columns' distinct counts exceeds the row count): refused, no key column is near-unique by its own statistic
+statement ok
+CREATE TABLE corr AS SELECT (i % 4096)::BIGINT AS k1, (3 * (i % 4096) + 7)::BIGINT AS k2, (i % 3)::SMALLINT AS x, (i % 2000)::SMALLINT AS y FROM range(2097152) r(i);
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM corr GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# a table below 2^20 rows: refused
+statement ok
+CREATE TABLE small AS SELECT i AS k1, (i % 7)::INTEGER AS k2, (i % 3)::SMALLINT AS x FROM range(10000) r(i);
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x) FROM small GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# disabled_optimizers restores the plain plan with the same answer
+statement ok
+SET disabled_optimizers='count_first_topk'
+
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+query IIIII
+SELECT k1, k2, count(*) AS c, sum(x), sum(y) FROM cf GROUP BY k1, k2 ORDER BY c DESC LIMIT 3
+----
+146	NULL	293	294	297502
+145	0	291	291	291590
+144	NULL	289	288	289040

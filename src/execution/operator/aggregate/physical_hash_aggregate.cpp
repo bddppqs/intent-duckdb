@@ -1,5 +1,8 @@
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
 
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
+#include "duckdb/execution/operator/aggregate/fused_integer_aggregate.hpp"
+
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/optional_idx.hpp"
@@ -16,6 +19,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -187,6 +191,10 @@ PhysicalHashAggregate::PhysicalHashAggregate(PhysicalPlan &physical_plan, Client
 	}
 }
 
+PhysicalHashAggregate::~PhysicalHashAggregate() {
+	dict_global::ReleaseCodeKeys(this);
+}
+
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
@@ -216,6 +224,8 @@ public:
 	vector<LogicalType> payload_types;
 	//! Whether or not the aggregate is finished
 	bool finished = false;
+	//! The fused path's state; null when the operator has no fused path
+	unique_ptr<FusedAggregateGlobalState> fused;
 };
 
 class HashAggregateLocalSinkState : public LocalSinkState {
@@ -239,11 +249,24 @@ public:
 		}
 
 		filter_set.Initialize(context.client, aggregate_objects, payload_types);
+		global_code_keys = dict_global::FindCodeKeys(&op);
+		if (global_code_keys) {
+			code_key_chunk.InitializeEmpty(global_code_keys->input_types);
+			for (idx_t k = 0; k < global_code_keys->keys.size(); k++) {
+				global_code_vectors.emplace_back(LogicalType::INTEGER, STANDARD_VECTOR_SIZE);
+			}
+		}
 	}
 
 	DataChunk aggregate_input_chunk;
 	vector<HashAggregateGroupingLocalState> grouping_states;
 	AggregateFilterDataSet filter_set;
+	//! The fused path's state; null when the operator has no fused path
+	unique_ptr<FusedAggregateLocalState> fused;
+	//! the operator's code keys (null when none), the typed input chunk and its code vectors
+	shared_ptr<dict_global::CodeKeys> global_code_keys;
+	DataChunk code_key_chunk;
+	vector<Vector> global_code_vectors;
 };
 
 void PhysicalHashAggregate::SetMultiScan(GlobalSinkState &state) {
@@ -257,10 +280,35 @@ void PhysicalHashAggregate::SetMultiScan(GlobalSinkState &state) {
 // Sink
 //===--------------------------------------------------------------------===//
 unique_ptr<GlobalSinkState> PhysicalHashAggregate::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<HashAggregateGlobalSinkState>(*this, context);
+	if (fused) {
+		// the standard state (the drain's target) carries the fused path's state
+		auto state = make_uniq<HashAggregateGlobalSinkState>(*this, context);
+		state->fused = fused->GetGlobalSinkState(context);
+		if (fused->run_kind) {
+			// the run kind is fed by the run channel: the descriptor takes the fused state beside the radix
+			// state, which is the drain's target
+			state->fused->run_radix_global = state->grouping_states[0].table_state.get();
+			run_aggregate->ResetGrouped(*state->grouping_states[0].table_state, state->fused.get());
+		}
+		return std::move(state);
+	}
+	auto state = make_uniq<HashAggregateGlobalSinkState>(*this, context);
+	if (run_aggregate) {
+		// the run-aware scan sinks straight into this execution's radix table; the descriptor is shared with the scan
+		run_aggregate->ResetGrouped(*state->grouping_states[0].table_state);
+	}
+	return std::move(state);
 }
 
 unique_ptr<LocalSinkState> PhysicalHashAggregate::GetLocalSinkState(ExecutionContext &context) const {
+	if (fused) {
+		auto state = make_uniq<HashAggregateLocalSinkState>(*this, context);
+		state->fused = fused->GetLocalSinkState(context);
+		if (fused->run_kind) {
+			state->fused->run_radix_local = state->grouping_states[0].table_state.get();
+		}
+		return std::move(state);
+	}
 	return make_uniq<HashAggregateLocalSinkState>(*this, context);
 }
 
@@ -353,16 +401,45 @@ void PhysicalHashAggregate::SinkDistinct(ExecutionContext &context, DataChunk &c
 	}
 }
 
-SinkResultType PhysicalHashAggregate::Sink(ExecutionContext &context, DataChunk &chunk,
+SinkResultType PhysicalHashAggregate::Sink(ExecutionContext &context, DataChunk &input_chunk,
                                            OperatorSinkInput &input) const {
+	// a mixed DISTINCT shape's drain re-sinks by table (the rebuilt (g, x) chunks to the distinct table alone, the
+	// re-expanded companion rows to the regular sink alone)
+	bool resinking_distinct_only = false;
+	bool resinking_regular_only = false;
+	optional_ptr<DataChunk> converted;
+	if (dict_global::DictGlobalEnabled()) {
+		// with code keys, the typed input chunk
+		auto &code_key_sink_state = input.local_state.Cast<HashAggregateLocalSinkState>();
+		if (code_key_sink_state.global_code_keys) {
+			// a rebuilt chunk of this thread's fused drain is already coded (FusedDrain builds it
+			// with the code keys' input types) - not converted again, and the converted chunk of the Sink call
+			// that started the drain is left untouched
+			if (!code_key_sink_state.fused || !code_key_sink_state.fused->resinking) {
+				code_key_sink_state.global_code_keys->ConvertInput(input_chunk, code_key_sink_state.code_key_chunk,
+				                                             code_key_sink_state.global_code_vectors);
+				converted = &code_key_sink_state.code_key_chunk;
+			}
+		}
+	}
+	DataChunk &chunk = converted ? *converted : input_chunk;
+	if (fused) {
+		auto &fused_gstate = *input.global_state.Cast<HashAggregateGlobalSinkState>().fused;
+		auto &fused_lstate = *input.local_state.Cast<HashAggregateLocalSinkState>().fused;
+		if (fused->Sink(context, chunk, input, *this, fused_gstate, fused_lstate)) {
+			return SinkResultType::NEED_MORE_INPUT;
+		}
+		resinking_distinct_only = fused_lstate.resinking_distinct_only;
+		resinking_regular_only = fused_lstate.resinking_regular_only;
+	}
 	auto &local_state = input.local_state.Cast<HashAggregateLocalSinkState>();
 	auto &global_state = input.global_state.Cast<HashAggregateGlobalSinkState>();
 
-	if (distinct_collection_info) {
+	if (distinct_collection_info && !resinking_regular_only) {
 		SinkDistinct(context, chunk, input);
 	}
 
-	if (CanSkipRegularSink()) {
+	if (resinking_distinct_only || CanSkipRegularSink()) {
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
@@ -442,6 +519,14 @@ void PhysicalHashAggregate::CombineDistinct(ExecutionContext &context, OperatorS
 }
 
 SinkCombineResultType PhysicalHashAggregate::Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const {
+	if (fused) {
+		auto &fused_gstate = *input.global_state.Cast<HashAggregateGlobalSinkState>().fused;
+		auto &fused_lstate = *input.local_state.Cast<HashAggregateLocalSinkState>().fused;
+		OperatorSinkInput sink_input {input.global_state, input.local_state, input.interrupt_state};
+		if (fused->Combine(context, sink_input, *this, fused_gstate, fused_lstate)) {
+			return SinkCombineResultType::FINISHED;
+		}
+	}
 	auto &gstate = input.global_state.Cast<HashAggregateGlobalSinkState>();
 	auto &llstate = input.local_state.Cast<HashAggregateLocalSinkState>();
 
@@ -798,6 +883,27 @@ SinkFinalizeType PhysicalHashAggregate::FinalizeInternal(Pipeline &pipeline, Eve
 
 SinkFinalizeType PhysicalHashAggregate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                                  OperatorSinkFinalizeInput &input) const {
+	if (fused) {
+		// phase 2 owns the source, unless the operator was abandoned: then every row is in the standard states
+		auto &fused_gstate = *input.global_state.Cast<HashAggregateGlobalSinkState>().fused;
+		if (fused->run_kind) {
+			// every scan thread has finished: each run partial's lists go to the kernel (or are drained into its
+			// radix state when the kernel is abandoned) before phase 2 is decided
+			run_aggregate->CombineFusedPartials(context);
+		}
+		if (fused->Finalize(fused_gstate)) {
+			return SinkFinalizeType::READY;
+		}
+	}
+	if (run_aggregate) {
+		// every scan thread has finished, so its run-path hash table is complete: combine them all exactly once
+		auto &gstate = input.global_state.Cast<HashAggregateGlobalSinkState>();
+		auto partials = run_aggregate->TakeGroupedPartials();
+		auto &table = groupings[0].table_data;
+		for (auto &partial : partials) {
+			table.Combine(context, *gstate.grouping_states[0].table_state, *partial);
+		}
+	}
 	return FinalizeInternal(pipeline, event, context, input.global_state, true);
 }
 
@@ -836,7 +942,25 @@ public:
 	}
 };
 
+//! The fused sink state when phase 2 owns the source (a fused path that was not abandoned), else null
+static optional_ptr<FusedAggregateGlobalState> FusedSourceState(const PhysicalHashAggregate &op) {
+	if (!op.fused || !op.sink_state) {
+		return nullptr;
+	}
+	auto &fused_gstate = *op.sink_state->Cast<HashAggregateGlobalSinkState>().fused;
+	if (fused_gstate.abandoned) {
+		return nullptr;
+	}
+	return &fused_gstate;
+}
+
 unique_ptr<GlobalSourceState> PhysicalHashAggregate::GetGlobalSourceState(ClientContext &context) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetGlobalSourceState(context, *fused_gstate);
+		}
+	}
 	return make_uniq<HashAggregateGlobalSourceState>(context, *this);
 }
 
@@ -853,13 +977,63 @@ public:
 	vector<unique_ptr<LocalSourceState>> radix_states;
 };
 
+//! the local source state of an operator whose typed keys come out as codes - the route's own local state
+//! and this task's chunk the codes are produced into, which the output references until this task's next call
+class CodeKeysLocalSourceState : public LocalSourceState {
+public:
+	explicit CodeKeysLocalSourceState(unique_ptr<LocalSourceState> inner_p) : inner(std::move(inner_p)) {
+	}
+
+	unique_ptr<LocalSourceState> inner;
+	DataChunk internal;
+};
+
 unique_ptr<LocalSourceState> PhysicalHashAggregate::GetLocalSourceState(ExecutionContext &context,
                                                                         GlobalSourceState &gstate) const {
-	return make_uniq<HashAggregateLocalSourceState>(context, *this);
+	unique_ptr<LocalSourceState> result;
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			result = fused->GetLocalSourceState(context);
+		}
+	}
+	if (!result) {
+		result = make_uniq<HashAggregateLocalSourceState>(context, *this);
+	}
+	if (dict_global::FindCodeKeys(this)) {
+		return make_uniq<CodeKeysLocalSourceState>(std::move(result));
+	}
+	return result;
 }
 
-SourceResultType PhysicalHashAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalHashAggregate::GetDataInternal(ExecutionContext &context, DataChunk &output,
                                                         OperatorSourceInput &input) const {
+	auto global_code_keys = dict_global::FindCodeKeys(this);
+	if (global_code_keys) {
+		// the typed keys come out as codes into this task's own chunk and are re-emitted over the pinned
+		// dictionary; the output's other columns reference that chunk, which no other task writes
+		auto &lstate = input.local_state.Cast<CodeKeysLocalSourceState>();
+		auto &internal = lstate.internal;
+		if (internal.data.empty()) {
+			internal.Initialize(Allocator::DefaultAllocator(), global_code_keys->internal_output_types);
+		}
+		internal.Reset();
+		OperatorSourceInput inner_input {input.global_state, *lstate.inner, input.interrupt_state};
+		auto result = GlobalDictionaryGetData(context, internal, inner_input);
+		global_code_keys->ConvertOutput(internal, output);
+		return result;
+	}
+	return GlobalDictionaryGetData(context, output, input);
+}
+
+SourceResultType PhysicalHashAggregate::GlobalDictionaryGetData(ExecutionContext &context, DataChunk &chunk,
+                                                                OperatorSourceInput &input) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetData(context, chunk, *fused_gstate, input);
+		}
+	}
 	auto &sink_gstate = sink_state->Cast<HashAggregateGlobalSinkState>();
 	auto &gstate = input.global_state.Cast<HashAggregateGlobalSourceState>();
 	auto &lstate = input.local_state.Cast<HashAggregateLocalSourceState>();
@@ -900,7 +1074,24 @@ SourceResultType PhysicalHashAggregate::GetDataInternal(ExecutionContext &contex
 	return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
+InsertionOrderPreservingMap<string> PhysicalHashAggregate::ExtraSourceParams(GlobalSourceState &gstate,
+                                                                          LocalSourceState &lstate) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->ExtraSourceParams(gstate);
+		}
+	}
+	return PhysicalOperator::ExtraSourceParams(gstate, lstate);
+}
+
 ProgressData PhysicalHashAggregate::GetProgress(ClientContext &context, GlobalSourceState &gstate_p) const {
+	if (fused) {
+		auto fused_gstate = FusedSourceState(*this);
+		if (fused_gstate) {
+			return fused->GetProgress(*fused_gstate, gstate_p);
+		}
+	}
 	auto &sink_gstate = sink_state->Cast<HashAggregateGlobalSinkState>();
 	auto &gstate = gstate_p.Cast<HashAggregateGlobalSourceState>();
 	ProgressData progress;
@@ -936,6 +1127,25 @@ InsertionOrderPreservingMap<string> PhysicalHashAggregate::ParamsToString() cons
 		}
 	}
 	result["Aggregates"] = aggregate_info;
+	if (run_aggregate) {
+		result["Run Aggregate"] = run_aggregate->column_names;
+	}
+	if (fused) {
+		// the fused path's EXPLAIN text; with a sink state (EXPLAIN ANALYZE) it carries the fused
+		// path's counters
+		optional_ptr<FusedAggregateGlobalState> fused_gstate;
+		if (sink_state) {
+			fused_gstate = sink_state->Cast<HashAggregateGlobalSinkState>().fused.get();
+		}
+		result[fused->distinct ? "Fused Distinct Aggregate" : "Fused Aggregate"] =
+		    fused->ParamsString(fused_gstate, SourceOrder());
+	}
+	if (dict_global::DictGlobalEnabled()) {
+		auto global_code_keys = dict_global::FindCodeKeys(this);
+		if (global_code_keys) {
+			result["Code Keys"] = global_code_keys->column_names;
+		}
+	}
 	SetEstimatedCardinality(result, estimated_cardinality);
 	return result;
 }

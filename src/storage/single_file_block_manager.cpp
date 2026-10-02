@@ -7,13 +7,18 @@
 #include "duckdb/common/encryption_key_manager.hpp"
 #include "duckdb/common/encryption_state.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/storage/buffer/block_handle.hpp"
+#include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/pair.hpp"
 #include "duckdb/common/serializer/memory_stream.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/enums/checkpoint_abort.hpp"
 #include "duckdb/common/enums/storage_block_prefetch.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
@@ -21,14 +26,143 @@
 #include "duckdb/storage/storage_info.hpp"
 #include "duckdb/storage/storage_manager.hpp"
 
+#include "zstd.h"
+
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <thread>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace duckdb {
 
 const char MainHeader::MAGIC_BYTES[] = "DUCK";
 const char MainHeader::CANARY[] = "DUCKKEY";
 static constexpr idx_t ENCRYPTION_METADATA_LEN = 8;
+
+//===--------------------------------------------------------------------===//
+// Block compression (storage version BLOCK_COMPRESSION_VERSION_NUMBER)
+//===--------------------------------------------------------------------===//
+// A file created at this storage version stores every block as one variable-length extent: the block header (the
+// checksum of the uncompressed payload), then the payload as one zstd frame, or raw when the frame does not save at
+// least one page. Extents are page-aligned and appended at the end of the file; an extent map (block id -> offset,
+// stored length) is written as one raw extent before each database header, which records its position. The buffer
+// pool, the block ids and every segment format are unchanged: a block is decompressed when it is read from the file.
+//! A value outside upstream DuckDB's sequential storage-version range, so other readers refuse the file.
+static constexpr uint64_t BLOCK_COMPRESSION_VERSION_NUMBER = 0x40000001;
+static constexpr idx_t BLOCK_EXTENT_ALIGNMENT = 4096;
+//! The automatic block level (zstd_block_compression_level = 0): the high level with at least this many threads
+static constexpr int32_t BLOCK_COMPRESSION_HIGH_LEVEL_THREADS = 64;
+static constexpr int BLOCK_COMPRESSION_HIGH_LEVEL = 9;
+static constexpr int BLOCK_COMPRESSION_LOW_LEVEL = 3;
+static constexpr idx_t EXTENT_MAP_HEADER_SIZE = 32;
+static constexpr idx_t EXTENT_MAP_ENTRY_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
+static constexpr char EXTENT_MAP_MAGIC[] = "DUCKXMAP";
+
+namespace {
+//! Per-thread zstd contexts and a staging buffer for one compressed block
+struct BlockCompressionState {
+	duckdb_zstd::ZSTD_CCtx *cctx = nullptr;
+	duckdb_zstd::ZSTD_DCtx *dctx = nullptr;
+	unsafe_unique_array<data_t> staging;
+	idx_t staging_size = 0;
+
+	~BlockCompressionState() {
+		duckdb_zstd::ZSTD_freeCCtx(cctx);
+		duckdb_zstd::ZSTD_freeDCtx(dctx);
+	}
+	data_ptr_t Staging(idx_t size) {
+		if (size > staging_size) {
+			staging = make_unsafe_uniq_array_uninitialized<data_t>(size);
+			staging_size = size;
+		}
+		return staging.get();
+	}
+};
+
+BlockCompressionState &GetBlockCompressionState() {
+	thread_local BlockCompressionState state;
+	return state;
+}
+} // namespace
+
+// Early writeback
+//===--------------------------------------------------------------------===//
+// Block writes land in the page cache. Left alone, the device writes them only when the checkpoint fsyncs (or when the
+// kernel's dirty-page ageing or thresholds kick in), so a bulk load computes first and writes afterwards. A background
+// thread asks the kernel to start writing back what has been written (sync_file_range(SYNC_FILE_RANGE_WRITE): it
+// initiates writeback and does not wait for it) once a batch has accumulated, so the device writes overlap the
+// producers' work; the writers never block on it. Durability is unchanged: the checkpoint's fsyncs before and after
+// the database header remain the durability points.
+struct BlockWriteback {
+	static constexpr idx_t BATCH_BYTES = 32ULL << 20;
+
+	explicit BlockWriteback(int fd_p) : fd(fd_p), thread([this]() { Run(); }) {
+	}
+	//! Stop and join the thread; the descriptor is closed by the destructor
+	void Stop() {
+		{
+			lock_guard<mutex> guard(lock);
+			stop = true;
+		}
+		cv.notify_all();
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+	~BlockWriteback() {
+		Stop();
+#ifdef __linux__
+		close(fd);
+#endif
+	}
+	void Add(idx_t bytes) {
+		lock_guard<mutex> guard(lock);
+		auto was_idle = pending == 0;
+		pending += bytes;
+		if (was_idle || pending >= BATCH_BYTES) {
+			cv.notify_one();
+		}
+	}
+
+private:
+	void Run() {
+		unique_lock<mutex> guard(lock);
+		while (!stop) {
+			if (pending == 0) {
+				cv.wait(guard);
+				continue;
+			}
+			if (pending < BATCH_BYTES) {
+				// let a batch accumulate, without holding back a small tail for long
+				cv.wait_for(guard, std::chrono::milliseconds(20), [&]() { return stop || pending >= BATCH_BYTES; });
+				if (stop) {
+					break;
+				}
+			}
+			pending = 0;
+			guard.unlock();
+#ifdef __linux__
+			// the whole file: the kernel submits the pages that are dirty and not yet under writeback
+			sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+#endif
+			guard.lock();
+		}
+	}
+
+	int fd;
+	mutex lock;
+	std::condition_variable cv;
+	idx_t pending = 0;
+	bool stop = false;
+	//! declared last: started once the members above exist
+	std::thread thread;
+};
 
 void SerializeVersionNumber(WriteStream &ser, const string &version_str) {
 	data_t version[MainHeader::MAX_VERSION_SIZE];
@@ -215,7 +349,8 @@ MainHeader MainHeader::Read(ReadStream &source) {
 	header.version_number = source.Read<uint64_t>();
 
 	// Check the version number to determine if we can read this file.
-	if (header.version_number < VERSION_NUMBER_LOWER || header.version_number > VERSION_NUMBER_UPPER) {
+	if ((header.version_number < VERSION_NUMBER_LOWER || header.version_number > VERSION_NUMBER_UPPER) &&
+	    header.version_number != BLOCK_COMPRESSION_VERSION_NUMBER) {
 		auto version = GetDuckDBVersions(header.version_number);
 		string version_text;
 		if (!version.empty()) {
@@ -309,6 +444,18 @@ DatabaseHeader DeserializeDatabaseHeader(const MainHeader &main_header, data_ptr
 	return DatabaseHeader::Read(main_header, source);
 }
 
+//! The extent map position (offset, entries) a block-compressed database header stores after its other fields
+pair<idx_t, idx_t> DeserializeExtentMapPosition(const MainHeader &main_header, data_ptr_t ptr) {
+	MemoryStream source(ptr, Storage::FILE_HEADER_SIZE);
+	DatabaseHeader::Read(main_header, source);
+	if (main_header.version_number != BLOCK_COMPRESSION_VERSION_NUMBER) {
+		return make_pair(idx_t(0), idx_t(0));
+	}
+	auto map_offset = source.Read<idx_t>();
+	auto map_entries = source.Read<idx_t>();
+	return make_pair(map_offset, map_entries);
+}
+
 SingleFileBlockManager::SingleFileBlockManager(AttachedDatabase &db_p, const string &path_p,
                                                const StorageManagerOptions &options)
     : BlockManager(BufferManager::GetBufferManager(db_p), options.block_alloc_size, options.block_header_size),
@@ -321,6 +468,36 @@ SingleFileBlockManager::SingleFileBlockManager(AttachedDatabase &db_p, const str
 SingleFileBlockManager::~SingleFileBlockManager() {
 	// flip the flag to not perform UnregisterBlock on the block manager that is being destructed
 	this->in_destruction = true;
+	if (writeback) {
+		// stop the writeback thread, close the database handle, then the writeback descriptor: closing a descriptor of
+		// the file releases the process's POSIX locks on it, so it must not close while the database handle is open
+		writeback->Stop();
+		handle.reset();
+		writeback.reset();
+	}
+}
+
+void SingleFileBlockManager::NotifyBlockWritten(idx_t bytes) {
+#ifdef __linux__
+	BlockWriteback *target;
+	{
+		lock_guard<mutex> guard(writeback_lock);
+		if (!writeback_checked) {
+			// once, at the first block write: a writable file on disk with buffered IO only
+			writeback_checked = true;
+			if (!options.read_only && !options.use_direct_io && handle && handle->OnDiskFile()) {
+				auto fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+				if (fd >= 0) {
+					writeback = make_uniq<BlockWriteback>(fd);
+				}
+			}
+		}
+		target = writeback.get();
+	}
+	if (target) {
+		target->Add(bytes);
+	}
+#endif
 }
 
 FileOpenFlags SingleFileBlockManager::GetFileFlags(bool create_new) const {
@@ -468,9 +645,17 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	// open the RDBMS handle
 	auto &fs = FileSystem::Get(db);
 	handle = fs.OpenFile(path, flags);
+	// the file is read block by block at block offsets: no sequential read-ahead past a requested block
+	LocalFileSystem::RandomAccessHint(*handle);
 	header_buffer.Clear();
 
 	options.version_number = GetVersionNumber();
+	if (kBlockCompression && options.version_number.GetIndex() >= 68 && !encryption_enabled && !options.use_direct_io) {
+		// a new file at the latest storage version stores its blocks compressed
+		block_compression = true;
+		options.version_number = BLOCK_COMPRESSION_VERSION_NUMBER;
+		next_extent_offset = BLOCK_START;
+	}
 	db.GetStorageManager().SetStorageVersion(options.storage_version.GetIndex());
 	AddStorageVersionTag();
 
@@ -540,6 +725,10 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	h1.block_alloc_size = GetBlockAllocSize();
 	h1.vector_size = STANDARD_VECTOR_SIZE;
 	h1.serialization_compatibility = options.storage_version.GetIndex();
+	if (block_compression) {
+		// the extent map position after the header fields reads as none
+		header_buffer.Clear();
+	}
 	SerializeHeaderStructure<DatabaseHeader>(h1, header_buffer.buffer);
 	ChecksumAndWrite(context, header_buffer, Storage::FILE_HEADER_SIZE);
 
@@ -553,6 +742,10 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	h2.block_alloc_size = GetBlockAllocSize();
 	h2.vector_size = STANDARD_VECTOR_SIZE;
 	h2.serialization_compatibility = options.storage_version.GetIndex();
+	if (block_compression) {
+		header_buffer.Clear();
+		durable_header = h2;
+	}
 	SerializeHeaderStructure<DatabaseHeader>(h2, header_buffer.buffer);
 	ChecksumAndWrite(context, header_buffer, Storage::FILE_HEADER_SIZE * 2ULL);
 
@@ -574,6 +767,8 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 		// this can only happen in read-only mode - as that is when we set FILE_FLAGS_NULL_IF_NOT_EXISTS
 		throw IOException("Cannot open database \"%s\" in read-only mode: database does not exist", path);
 	}
+	// the file is read block by block at block offsets: no sequential read-ahead past a requested block
+	LocalFileSystem::RandomAccessHint(*handle);
 
 	MainHeader::CheckMagicBytes(context, *handle);
 	// otherwise, we check the metadata of the file
@@ -644,15 +839,23 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 	}
 
 	options.version_number = main_header.version_number;
+	block_compression = main_header.version_number == BLOCK_COMPRESSION_VERSION_NUMBER;
+	if (block_compression && (main_header.IsEncrypted() || options.use_direct_io)) {
+		throw IOException("Cannot open database \"%s\": compressed blocks (storage version %llu) are not supported "
+		                  "together with encryption or direct IO",
+		                  path, main_header.version_number);
+	}
 
 	// read the database headers from disk
 	DatabaseHeader h1;
 	ReadAndChecksum(context, header_buffer, Storage::FILE_HEADER_SIZE);
 	h1 = DeserializeDatabaseHeader(main_header, header_buffer.buffer);
+	auto h1_map = DeserializeExtentMapPosition(main_header, header_buffer.buffer);
 
 	DatabaseHeader h2;
 	ReadAndChecksum(context, header_buffer, Storage::FILE_HEADER_SIZE * 2ULL);
 	h2 = DeserializeDatabaseHeader(main_header, header_buffer.buffer);
+	auto h2_map = DeserializeExtentMapPosition(main_header, header_buffer.buffer);
 
 	// check the header with the highest iteration count
 	if (h1.iteration > h2.iteration) {
@@ -665,6 +868,12 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 		Initialize(h2, GetOptionalBlockAllocSize());
 	}
 	AddStorageVersionTag();
+	if (block_compression) {
+		// the extent map must be loaded before any block (the free list's metadata first) is read
+		durable_header = active_header == 0 ? h1 : h2;
+		auto &active_map = active_header == 0 ? h1_map : h2_map;
+		LoadExtentMap(context, active_map.first, active_map.second);
+	}
 	LoadFreeList(context);
 }
 
@@ -1086,6 +1295,61 @@ unique_ptr<Block> SingleFileBlockManager::CreateBlock(block_id_t block_id, FileB
 	return result;
 }
 
+void SingleFileBlockManager::ReadAhead(const vector<shared_ptr<BlockHandle>> &handles) {
+	if (!handle || options.use_direct_io || IsRemote()) {
+		return;
+	}
+	vector<block_id_t> block_ids;
+	for (auto &block_handle : handles) {
+		if (!block_handle || block_handle->BlockId() >= MAXIMUM_BLOCK) {
+			continue;
+		}
+		if (block_handle->GetMemory().GetState() == BlockState::BLOCK_LOADED) {
+			// already in memory: nothing to read
+			continue;
+		}
+		block_ids.push_back(block_handle->BlockId());
+	}
+	if (block_ids.empty()) {
+		return;
+	}
+	std::sort(block_ids.begin(), block_ids.end());
+	block_ids.erase(std::unique(block_ids.begin(), block_ids.end()), block_ids.end());
+	// each block's bytes in the file, as Read reads them: in the fixed layout the block's slot; in a compressed file
+	// its extent (the block header, then the stored length), looked up in the extent map
+	vector<pair<idx_t, idx_t>> ranges;
+	ranges.reserve(block_ids.size());
+	if (block_compression) {
+		lock_guard<mutex> guard(extent_lock);
+		if (extent_compacting) {
+			// the extents are moving: the reads after the compaction go to the new places unhinted
+			return;
+		}
+		for (auto block_id : block_ids) {
+			auto index = NumericCast<idx_t>(block_id);
+			if (index >= extents.size() || extents[index].offset == 0) {
+				continue;
+			}
+			ranges.emplace_back(extents[index].offset, GetBlockHeaderSize() + extents[index].length);
+		}
+	} else {
+		for (auto block_id : block_ids) {
+			ranges.emplace_back(GetBlockLocation(block_id), GetBlockAllocSize());
+		}
+	}
+	// Linux caps one read-ahead request at the device's read-ahead window (128 KiB by default) from its start, so a
+	// longer range would be read only in part: hint every range in pieces of at most that window
+	static constexpr idx_t READ_AHEAD_PIECE = 128 * 1024;
+	for (auto &range : ranges) {
+		for (idx_t offset = 0; offset < range.second; offset += READ_AHEAD_PIECE) {
+			if (!LocalFileSystem::ReadAheadHint(*handle, range.first + offset,
+			                                    MinValue(READ_AHEAD_PIECE, range.second - offset))) {
+				return;
+			}
+		}
+	}
+}
+
 idx_t SingleFileBlockManager::GetBlockLocation(block_id_t block_id) const {
 	return BLOCK_START + NumericCast<idx_t>(block_id) * GetBlockAllocSize();
 }
@@ -1121,12 +1385,25 @@ void SingleFileBlockManager::ReadBlock(Block &block, bool skip_block_header) con
 void SingleFileBlockManager::Read(QueryContext context, Block &block) {
 	D_ASSERT(block.id >= 0);
 	D_ASSERT(std::find(free_list.begin(), free_list.end(), block.id) == free_list.end());
+	if (block_compression) {
+		D_ASSERT(block.AllocSize() == GetBlockAllocSize());
+		ReadCompressedBlock(context, block.InternalBuffer(), block.id);
+		return;
+	}
 	ReadAndChecksum(context, block, GetBlockLocation(block.id));
 }
 
 void SingleFileBlockManager::ReadBlocks(FileBuffer &buffer, block_id_t start_block, idx_t block_count) {
 	D_ASSERT(start_block >= 0);
 	D_ASSERT(block_count >= 1);
+	if (block_compression) {
+		// consecutive ids are not contiguous in the file: one read (and decompression) per block
+		for (idx_t i = 0; i < block_count; i++) {
+			ReadCompressedBlock(QueryContext(), buffer.InternalBuffer() + i * GetBlockAllocSize(),
+			                    start_block + NumericCast<block_id_t>(i));
+		}
+		return;
+	}
 
 	// read the buffer from disk
 	auto location = GetBlockLocation(start_block);
@@ -1146,7 +1423,476 @@ void SingleFileBlockManager::Write(FileBuffer &buffer, block_id_t block_id) {
 
 void SingleFileBlockManager::Write(QueryContext context, FileBuffer &buffer, block_id_t block_id) {
 	D_ASSERT(block_id >= 0);
+	if (block_compression) {
+		WriteCompressedBlock(context, buffer, block_id);
+		return;
+	}
 	ChecksumAndWrite(context, buffer, BLOCK_START + NumericCast<idx_t>(block_id) * GetBlockAllocSize());
+	NotifyBlockWritten(buffer.AllocSize());
+}
+
+uint64_t SingleFileBlockManager::AllocateExtent(idx_t bytes) {
+	lock_guard<mutex> guard(extent_lock);
+	return AllocateExtentLocked(AlignValue<idx_t>(bytes, BLOCK_EXTENT_ALIGNMENT));
+}
+
+uint64_t SingleFileBlockManager::AllocateExtentLocked(idx_t size) {
+	// the smallest free range that fits, else the end of the file
+	auto entry = free_by_size.lower_bound(size);
+	if (entry == free_by_size.end()) {
+		auto offset = next_extent_offset;
+		next_extent_offset += size;
+		return offset;
+	}
+	auto offset = entry->second;
+	TakeFreeSpaceLocked(offset, size);
+	return offset;
+}
+
+void SingleFileBlockManager::SetFreeSpaceLocked(const vector<pair<uint64_t, idx_t>> &ranges) {
+	free_by_offset.clear();
+	free_by_size.clear();
+	for (auto &range : ranges) {
+		if (range.second == 0) {
+			continue;
+		}
+		free_by_offset[range.first] = range.second;
+		free_by_size.insert(make_pair(range.second, range.first));
+	}
+}
+
+void SingleFileBlockManager::TakeFreeSpaceLocked(uint64_t offset, idx_t size) {
+	// [offset, offset + size) lies inside one free range: remove it, keeping what is left on either side
+	auto entry = free_by_offset.upper_bound(offset);
+	if (entry == free_by_offset.begin()) {
+		throw InternalException("Extent allocation: %llu is not free", offset);
+	}
+	--entry;
+	auto range_offset = entry->first;
+	auto range_size = entry->second;
+	if (offset + size > range_offset + range_size) {
+		throw InternalException("Extent allocation: [%llu, +%llu) is not free", offset, size);
+	}
+	free_by_offset.erase(entry);
+	auto sized = free_by_size.equal_range(range_size);
+	for (auto it = sized.first; it != sized.second; ++it) {
+		if (it->second == range_offset) {
+			free_by_size.erase(it);
+			break;
+		}
+	}
+	if (offset > range_offset) {
+		free_by_offset[range_offset] = offset - range_offset;
+		free_by_size.insert(make_pair(offset - range_offset, range_offset));
+	}
+	auto tail = range_offset + range_size - (offset + size);
+	if (tail > 0) {
+		free_by_offset[offset + size] = tail;
+		free_by_size.insert(make_pair(tail, offset + size));
+	}
+}
+
+void SingleFileBlockManager::WriteCompressedBlock(QueryContext context, FileBuffer &buffer, block_id_t block_id) {
+	auto header_size = GetBlockHeaderSize();
+	auto payload_size = GetBlockSize();
+	if (buffer.Size() != payload_size || buffer.GetHeaderSize() != header_size) {
+		throw InternalException("Compressed block write of block %lld: buffer size %llu (header %llu) is not the "
+		                        "block size %llu (header %llu)",
+		                        block_id, buffer.Size(), buffer.GetHeaderSize(), payload_size, header_size);
+	}
+
+	// the block header holds the checksum of the uncompressed payload, as in the fixed layout
+	Store<uint64_t>(Checksum(buffer.buffer, payload_size), buffer.InternalBuffer());
+
+	auto &state = GetBlockCompressionState();
+	if (!state.cctx) {
+		state.cctx = duckdb_zstd::ZSTD_createCCtx();
+		if (!state.cctx) {
+			throw InternalException("Failed to create a zstd compression context");
+		}
+	}
+	auto bound = duckdb_zstd::ZSTD_compressBound(payload_size);
+	auto staging = state.Staging(header_size + bound);
+	auto level = NumericCast<int>(Settings::Get<ZstdBlockCompressionLevelSetting>(db.GetDatabase()));
+	if (level == 0) {
+		// automatic: the higher level pays for its compression time only when enough threads write in parallel
+		level = TaskScheduler::GetScheduler(db.GetDatabase()).NumberOfThreads() >= BLOCK_COMPRESSION_HIGH_LEVEL_THREADS
+		            ? BLOCK_COMPRESSION_HIGH_LEVEL
+		            : BLOCK_COMPRESSION_LOW_LEVEL;
+	}
+	auto frame_size = duckdb_zstd::ZSTD_compressCCtx(state.cctx, staging + header_size, bound, buffer.buffer,
+	                                                 payload_size, level);
+
+	data_ptr_t source;
+	idx_t length;
+	if (!duckdb_zstd::ZSTD_isError(frame_size) &&
+	    AlignValue<idx_t>(header_size + frame_size, BLOCK_EXTENT_ALIGNMENT) <
+	        AlignValue<idx_t>(header_size + payload_size, BLOCK_EXTENT_ALIGNMENT)) {
+		// the frame saves at least one page: store it
+		memcpy(staging, buffer.InternalBuffer(), header_size);
+		source = staging;
+		length = frame_size;
+	} else {
+		// store the payload raw (byte-identical to a block of the fixed layout)
+		source = buffer.InternalBuffer();
+		length = payload_size;
+	}
+	auto bytes = header_size + length;
+	uint64_t offset;
+	{
+		unique_lock<mutex> guard(extent_lock);
+		extent_cv.wait(guard, [&]() { return !extent_compacting; });
+		offset = AllocateExtentLocked(AlignValue<idx_t>(bytes, BLOCK_EXTENT_ALIGNMENT));
+		extent_io++;
+	}
+	try {
+		handle->Write(context, source, bytes, offset);
+	} catch (...) {
+		EndExtentIO();
+		throw;
+	}
+	{
+		lock_guard<mutex> guard(extent_lock);
+		auto index = NumericCast<idx_t>(block_id);
+		if (index >= extents.size()) {
+			extents.resize(MaxValue<idx_t>(index + 1, extents.size() * 2));
+		}
+		extents[index].offset = offset;
+		extents[index].length = NumericCast<uint32_t>(length);
+	}
+	EndExtentIO();
+	NotifyBlockWritten(bytes);
+}
+
+void SingleFileBlockManager::EndExtentIO() {
+	lock_guard<mutex> guard(extent_lock);
+	D_ASSERT(extent_io > 0);
+	if (--extent_io == 0 && extent_compacting) {
+		extent_cv.notify_all();
+	}
+}
+
+void SingleFileBlockManager::ReadCompressedBlock(QueryContext context, data_ptr_t internal_buffer,
+                                                 block_id_t block_id) {
+	BlockExtent extent;
+	{
+		unique_lock<mutex> guard(extent_lock);
+		extent_cv.wait(guard, [&]() { return !extent_compacting; });
+		auto index = NumericCast<idx_t>(block_id);
+		if (index < extents.size()) {
+			extent = extents[index];
+		}
+		if (extent.offset == 0) {
+			throw IOException("Corrupt database file: block %lld has no extent in \"%s\"", block_id, path);
+		}
+		extent_io++;
+	}
+	try {
+		ReadExtent(context, internal_buffer, block_id, extent);
+	} catch (...) {
+		EndExtentIO();
+		throw;
+	}
+	EndExtentIO();
+	CheckChecksum(internal_buffer, 0, false);
+}
+
+void SingleFileBlockManager::ReadExtent(QueryContext context, data_ptr_t internal_buffer, block_id_t block_id,
+                                        const BlockExtent &extent) {
+	auto header_size = GetBlockHeaderSize();
+	auto payload_size = GetBlockSize();
+	if (extent.length == payload_size) {
+		// raw extent: read straight into the buffer
+		handle->Read(context, internal_buffer, header_size + payload_size, extent.offset);
+	} else {
+		auto &state = GetBlockCompressionState();
+		if (!state.dctx) {
+			state.dctx = duckdb_zstd::ZSTD_createDCtx();
+			if (!state.dctx) {
+				throw InternalException("Failed to create a zstd decompression context");
+			}
+		}
+		auto staging = state.Staging(header_size + extent.length);
+		handle->Read(context, staging, header_size + extent.length, extent.offset);
+		memcpy(internal_buffer, staging, header_size);
+		auto size = duckdb_zstd::ZSTD_decompressDCtx(state.dctx, internal_buffer + header_size, payload_size,
+		                                             staging + header_size, extent.length);
+		if (duckdb_zstd::ZSTD_isError(size) || size != payload_size) {
+			throw IOException("Corrupt database file: block %lld at location %llu in \"%s\" failed to decompress",
+			                  block_id, extent.offset, path);
+		}
+	}
+}
+
+void SingleFileBlockManager::WriteExtentMap(QueryContext context, idx_t block_count,
+                                            const set<block_id_t> &free_blocks, optional_idx at_offset) {
+	idx_t entries;
+	unsafe_unique_array<data_t> map;
+	idx_t map_size;
+	{
+		lock_guard<mutex> guard(extent_lock);
+		entries = MinValue<idx_t>(block_count, extents.size());
+		map_size = EXTENT_MAP_HEADER_SIZE + entries * EXTENT_MAP_ENTRY_SIZE;
+		map = make_unsafe_uniq_array<data_t>(map_size);
+		auto ptr = map.get() + EXTENT_MAP_HEADER_SIZE;
+		for (idx_t i = 0; i < entries; i++) {
+			// a free id has no extent in the committed state
+			auto is_free = free_blocks.find(NumericCast<block_id_t>(i)) != free_blocks.end();
+			Store<uint64_t>(is_free ? 0 : extents[i].offset, ptr);
+			Store<uint32_t>(is_free ? 0 : extents[i].length, ptr + sizeof(uint64_t));
+			ptr += EXTENT_MAP_ENTRY_SIZE;
+		}
+	}
+	memcpy(map.get(), EXTENT_MAP_MAGIC, sizeof(uint64_t));
+	Store<uint64_t>(entries, map.get() + 8);
+	Store<uint64_t>(Checksum(map.get() + EXTENT_MAP_HEADER_SIZE, entries * EXTENT_MAP_ENTRY_SIZE), map.get() + 16);
+	Store<uint64_t>(GetBlockAllocSize(), map.get() + 24);
+	auto offset = at_offset.IsValid() ? at_offset.GetIndex() : AllocateExtent(map_size);
+	handle->Write(context, map.get(), map_size, offset);
+	extent_map_offset = offset;
+	extent_map_entries = entries;
+}
+
+void SingleFileBlockManager::CompactAfterCommit(QueryContext context, const set<block_id_t> &free_blocks) {
+	{
+		unique_lock<mutex> guard(extent_lock);
+		// hold back new block IO and wait for the IO in flight: no extent is taken, read or written while extents move
+		extent_compacting = true;
+		extent_cv.wait(guard, [&]() { return extent_io == 0; });
+		set<block_id_t> free_ids;
+		{
+			lock_guard<mutex> free_guard(single_file_block_lock);
+			free_ids = free_list;
+		}
+		struct LiveExtent {
+			uint64_t offset;
+			idx_t size;
+			idx_t index;
+		};
+		vector<LiveExtent> live;
+		for (idx_t i = 0; i < extents.size(); i++) {
+			if (extents[i].offset == 0 || free_ids.count(NumericCast<block_id_t>(i))) {
+				continue;
+			}
+			live.push_back({extents[i].offset,
+			                AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, BLOCK_EXTENT_ALIGNMENT), i});
+		}
+		std::sort(live.begin(), live.end(), [](const LiveExtent &a, const LiveExtent &b) { return a.offset < b.offset; });
+		struct Hole {
+			uint64_t offset;
+			idx_t size;
+		};
+		// the holes: the free space the rebuild after this commit found (nothing durable references it)
+		vector<Hole> holes;
+		for (auto &range : free_by_offset) {
+			holes.push_back({range.first, range.second});
+		}
+		compact_moved = 0;
+		// from the last extent backwards: into the smallest hole before it that fits; a vacated extent stays as it is
+		// (the durable map references it until the header rewrite below), and a hole found at or after the extent lies
+		// after every extent still to come, so it leaves the index
+		multimap<idx_t, idx_t> by_size;
+		for (idx_t h = 0; h < holes.size(); h++) {
+			by_size.insert(make_pair(holes[h].size, h));
+		}
+		unsafe_unique_array<data_t> buffer;
+		idx_t buffer_size = 0;
+		for (idx_t l = live.size(); l > 0; l--) {
+			auto &extent = live[l - 1];
+			auto entry = by_size.lower_bound(extent.size);
+			while (entry != by_size.end() && holes[entry->second].offset >= extent.offset) {
+				entry = by_size.erase(entry);
+			}
+			if (entry == by_size.end()) {
+				continue;
+			}
+			auto hole_index = entry->second;
+			by_size.erase(entry);
+			auto &hole = holes[hole_index];
+			auto bytes = GetBlockHeaderSize() + extents[extent.index].length;
+			if (bytes > buffer_size) {
+				buffer = make_unsafe_uniq_array_uninitialized<data_t>(bytes);
+				buffer_size = bytes;
+			}
+			handle->Read(context, buffer.get(), bytes, extent.offset);
+			handle->Write(context, buffer.get(), bytes, hole.offset);
+			TakeFreeSpaceLocked(hole.offset, extent.size);
+			NotifyBlockWritten(bytes);
+			extents[extent.index].offset = hole.offset;
+			extent.offset = hole.offset;
+			hole.offset += extent.size;
+			hole.size -= extent.size;
+			if (hole.size > 0) {
+				by_size.insert(make_pair(hole.size, hole_index));
+			}
+			compact_moved++;
+		}
+		extent_compacting = false;
+		extent_cv.notify_all();
+	}
+	if (compact_moved == 0) {
+		RelocateExtentMapLow(context, free_blocks);
+		return;
+	}
+	// durable: the moved extents and a new extent map, then the active header pointing at it; only then are the vacated
+	// extents and the previous map free (the rebuild), and the tail they leave is cut
+	idx_t block_count;
+	{
+		lock_guard<mutex> guard(single_file_block_lock);
+		block_count = NumericCast<idx_t>(max_block);
+	}
+	WriteExtentMap(context, block_count, free_blocks);
+	handle->Sync();
+	WriteActiveHeaderInPlace(context);
+	RebuildFreeExtents();
+	RelocateExtentMapLow(context, free_blocks);
+}
+
+void SingleFileBlockManager::RelocateExtentMapLow(QueryContext context, const set<block_id_t> &free_blocks) {
+	idx_t block_count;
+	{
+		lock_guard<mutex> guard(single_file_block_lock);
+		block_count = NumericCast<idx_t>(max_block);
+	}
+	uint64_t target;
+	{
+		lock_guard<mutex> guard(extent_lock);
+		// room for block_count entries: WriteExtentMap writes at most that many
+		auto map_size =
+		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + block_count * EXTENT_MAP_ENTRY_SIZE, BLOCK_EXTENT_ALIGNMENT);
+		auto current_size =
+		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + extent_map_entries * EXTENT_MAP_ENTRY_SIZE, BLOCK_EXTENT_ALIGNMENT);
+		if (extent_map_offset == 0 || extent_map_offset + current_size != next_extent_offset) {
+			// the map does not end the file: nothing it pins
+			return;
+		}
+		// the lowest free range that holds the map, before the map
+		optional_idx found;
+		for (auto &range : free_by_offset) {
+			if (range.first >= extent_map_offset) {
+				break;
+			}
+			if (range.second >= map_size) {
+				found = range.first;
+				break;
+			}
+		}
+		if (!found.IsValid()) {
+			return;
+		}
+		target = found.GetIndex();
+		TakeFreeSpaceLocked(target, map_size);
+	}
+	WriteExtentMap(context, block_count, free_blocks, target);
+	handle->Sync();
+	WriteActiveHeaderInPlace(context);
+	RebuildFreeExtents();
+}
+
+void SingleFileBlockManager::RebuildFreeExtents() {
+	unique_lock<mutex> guard(extent_lock);
+	extent_compacting = true;
+	extent_cv.wait(guard, [&]() { return extent_io == 0; });
+	set<block_id_t> free_ids;
+	block_id_t block_limit;
+	{
+		lock_guard<mutex> free_guard(single_file_block_lock);
+		free_ids = free_list;
+		block_limit = max_block;
+	}
+	// held: every extent of a block id that is not free (live in the committed state, or in use), and the committed
+	// extent map; everything else is free, including what this commit released
+	vector<pair<uint64_t, idx_t>> held;
+	for (idx_t i = 0; i < extents.size(); i++) {
+		if (i >= NumericCast<idx_t>(block_limit) || free_ids.count(NumericCast<block_id_t>(i))) {
+			// a free id holds no extent: its old one is free space now, and a later write gives it a new one
+			extents[i] = BlockExtent();
+			continue;
+		}
+		if (extents[i].offset == 0) {
+			continue;
+		}
+		held.emplace_back(extents[i].offset,
+		                  AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, BLOCK_EXTENT_ALIGNMENT));
+	}
+	if (extent_map_offset != 0) {
+		held.emplace_back(extent_map_offset, AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + extent_map_entries *
+		                                                                                   EXTENT_MAP_ENTRY_SIZE,
+		                                                       BLOCK_EXTENT_ALIGNMENT));
+	}
+	std::sort(held.begin(), held.end());
+	vector<pair<uint64_t, idx_t>> ranges;
+	uint64_t position = BLOCK_START;
+	for (auto &range : held) {
+		if (range.first > position) {
+			ranges.emplace_back(position, range.first - position);
+		}
+		position = MaxValue<uint64_t>(position, range.first + range.second);
+	}
+	// a free tail is cut from the file
+	if (position < next_extent_offset) {
+		handle->Truncate(NumericCast<int64_t>(position));
+		next_extent_offset = position;
+	}
+	SetFreeSpaceLocked(ranges);
+	extent_compacting = false;
+	extent_cv.notify_all();
+}
+
+void SingleFileBlockManager::LoadExtentMap(QueryContext context, idx_t map_offset, idx_t map_entries) {
+	lock_guard<mutex> guard(extent_lock);
+	extents.clear();
+	auto file_end = AlignValue<idx_t>(MaxValue<idx_t>(handle->GetFileSize(), BLOCK_START), BLOCK_EXTENT_ALIGNMENT);
+	if (map_offset == 0) {
+		// no checkpoint has written blocks yet
+		next_extent_offset = file_end;
+		return;
+	}
+	auto map_size = EXTENT_MAP_HEADER_SIZE + map_entries * EXTENT_MAP_ENTRY_SIZE;
+	if (map_offset < BLOCK_START || map_offset + map_size > handle->GetFileSize()) {
+		throw IOException("Corrupt database file: the extent map of \"%s\" lies outside the file", path);
+	}
+	auto map = make_unsafe_uniq_array_uninitialized<data_t>(map_size);
+	handle->Read(context, map.get(), map_size, map_offset);
+	if (memcmp(map.get(), EXTENT_MAP_MAGIC, sizeof(uint64_t)) != 0 || Load<uint64_t>(map.get() + 8) != map_entries ||
+	    Load<uint64_t>(map.get() + 24) != GetBlockAllocSize() ||
+	    Load<uint64_t>(map.get() + 16) !=
+	        Checksum(map.get() + EXTENT_MAP_HEADER_SIZE, map_entries * EXTENT_MAP_ENTRY_SIZE)) {
+		throw IOException("Corrupt database file: the extent map of \"%s\" does not match its header", path);
+	}
+	extents.resize(map_entries);
+	auto ptr = map.get() + EXTENT_MAP_HEADER_SIZE;
+	for (idx_t i = 0; i < map_entries; i++) {
+		extents[i].offset = Load<uint64_t>(ptr);
+		extents[i].length = Load<uint32_t>(ptr + sizeof(uint64_t));
+		ptr += EXTENT_MAP_ENTRY_SIZE;
+	}
+	// the free space: every byte from the first block to the end of the file that neither a block of the loaded map
+	// (whose free ids hold no extent) nor the map itself holds
+	vector<pair<uint64_t, idx_t>> held;
+	for (auto &extent : extents) {
+		if (extent.offset != 0) {
+			held.emplace_back(extent.offset,
+			                  AlignValue<idx_t>(GetBlockHeaderSize() + extent.length, BLOCK_EXTENT_ALIGNMENT));
+		}
+	}
+	held.emplace_back(map_offset, AlignValue<idx_t>(map_size, BLOCK_EXTENT_ALIGNMENT));
+	std::sort(held.begin(), held.end());
+	vector<pair<uint64_t, idx_t>> ranges;
+	uint64_t position = BLOCK_START;
+	for (auto &range : held) {
+		if (range.first > position) {
+			ranges.emplace_back(position, range.first - position);
+		}
+		position = MaxValue<uint64_t>(position, range.first + range.second);
+	}
+	if (position < file_end) {
+		ranges.emplace_back(position, file_end - position);
+	}
+	SetFreeSpaceLocked(ranges);
+	extent_map_offset = map_offset;
+	extent_map_entries = map_entries;
+	next_extent_offset = file_end;
 }
 
 void SingleFileBlockManager::Truncate() {
@@ -1169,6 +1915,10 @@ void SingleFileBlockManager::Truncate() {
 	}
 	// truncate the file
 	free_list.erase(free_list.lower_bound(max_block), free_list.end());
+	if (block_compression) {
+		// block positions are extents: only the ids are trimmed (the append-only extents stay)
+		return;
+	}
 	handle->Truncate(NumericCast<int64_t>(BLOCK_START + NumericCast<idx_t>(max_block) * GetBlockAllocSize()));
 }
 
@@ -1247,6 +1997,10 @@ bool SingleFileBlockManager::AddFreeBlock(unique_lock<mutex> &lock, block_id_t b
 	return false;
 }
 void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader header) {
+	unique_lock<mutex> header_guard(header_lock, std::defer_lock);
+	if (block_compression) {
+		header_guard.lock();
+	}
 	auto free_list_blocks = GetFreeListBlocks();
 
 	// now handle the free list
@@ -1306,6 +2060,11 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 	header.block_count = NumericCast<idx_t>(max_block);
 	lock.unlock();
 
+	if (block_compression) {
+		// the extent map of every block the header can reference, written (and synced) before the header
+		WriteExtentMap(context, header.block_count, all_free_blocks);
+	}
+
 	header.serialization_compatibility = options.storage_version.GetIndex();
 
 	auto debug_checkpoint_abort = Settings::Get<DebugCheckpointAbortSetting>(db.GetDatabase());
@@ -1331,6 +2090,11 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 	// set the header inside the buffer
 	MemoryStream serializer(Allocator::Get(db));
 	header.Write(serializer);
+	if (block_compression) {
+		// two fields after serialization_compatibility (block compression): the extent map position
+		serializer.Write<idx_t>(extent_map_offset);
+		serializer.Write<idx_t>(extent_map_entries);
+	}
 	memcpy(header_buffer.buffer, serializer.GetData(), serializer.GetPosition());
 	// now write the header to the file, active_header determines whether we write to h1 or h2
 	// note that if active_header is h1 we write to h2, and vice versa
@@ -1340,11 +2104,48 @@ void SingleFileBlockManager::WriteHeader(QueryContext context, DatabaseHeader he
 	active_header = 1 - active_header;
 	//! Ensure the header write ends up on disk
 	handle->Sync();
+	if (block_compression) {
+		// committed: what this checkpoint released becomes reusable and a free tail is cut; then the extents at the end
+		// of the file move into the free space before them (durable through an in-place header rewrite) and the tail
+		// they leave is cut
+		durable_header = header;
+		RebuildFreeExtents();
+		CompactAfterCommit(context, all_free_blocks);
+	}
 	// Release the free fully freed blocks to the filesystem.
 	TrimFreeBlocks(fully_freed_blocks);
 }
 
 void SingleFileBlockManager::FileSync() {
+	if (!block_compression) {
+		handle->Sync();
+		return;
+	}
+	// the WAL is about to reference blocks written since the last commit (optimistic writes): their extents must be
+	// found at restart, so the extent map of the current blocks is written and the active header rewritten in place
+	// to point at it (same iteration, so the WAL still matches the header)
+	lock_guard<mutex> header_guard(header_lock);
+	set<block_id_t> free_ids;
+	idx_t block_count;
+	{
+		lock_guard<mutex> guard(single_file_block_lock);
+		free_ids = free_list;
+		block_count = NumericCast<idx_t>(max_block);
+	}
+	WriteExtentMap(QueryContext(), block_count, free_ids);
+	handle->Sync();
+	WriteActiveHeaderInPlace(QueryContext());
+}
+
+void SingleFileBlockManager::WriteActiveHeaderInPlace(QueryContext context) {
+	header_buffer.Clear();
+	MemoryStream serializer(Allocator::Get(db));
+	durable_header.Write(serializer);
+	serializer.Write<idx_t>(extent_map_offset);
+	serializer.Write<idx_t>(extent_map_entries);
+	memcpy(header_buffer.buffer, serializer.GetData(), serializer.GetPosition());
+	auto location = active_header == 0 ? Storage::FILE_HEADER_SIZE : Storage::FILE_HEADER_SIZE * 2;
+	ChecksumAndWrite(context, header_buffer, location);
 	handle->Sync();
 }
 
@@ -1367,7 +2168,7 @@ void SingleFileBlockManager::TrimFreeBlockRange(block_id_t start, block_id_t end
 }
 
 void SingleFileBlockManager::TrimFreeBlocks(const set<block_id_t> &blocks) {
-	if (!DBConfig::Get(db).options.trim_free_blocks) {
+	if (!DBConfig::Get(db).options.trim_free_blocks || block_compression) {
 		return;
 	}
 	lock_guard<mutex> lock(single_file_block_lock);

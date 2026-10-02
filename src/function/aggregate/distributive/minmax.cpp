@@ -5,6 +5,7 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
+#include "duckdb/function/aggregate/min_max_string_arena.hpp"
 #include "duckdb/function/aggregate/minmax_n_helpers.hpp"
 #include "duckdb/function/aggregate/sort_key_helpers.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -13,8 +14,18 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression_binder.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 
 namespace duckdb {
+
+bool MinMaxArenaEnabled() {
+	return kMinMaxStringArena;
+}
+
+ArenaAllocator *&MinMaxArenaSlot() {
+	static thread_local ArenaAllocator *slot = nullptr;
+	return slot;
+}
 
 namespace {
 
@@ -154,14 +165,21 @@ struct MaxOperation : public NumericMinMaxBase {
 	}
 };
 
-struct MinMaxStringState : MinMaxState<string_t> {
+// laid out as MinMaxState<string_t> (same size and alignment) plus the arena flag in its padding
+struct MinMaxStringState {
+	string_t value;
+	bool isset;
+	//! a non-inlined value's bytes come from the grouped hash table's arena (MinMaxArenaSlot), preceded by their
+	//! uint32_t capacity; they are never passed to delete[]
+	bool arena_owned;
+
 	void Destroy() {
-		if (isset && !value.IsInlined()) {
+		if (isset && !value.IsInlined() && !arena_owned) {
 			delete[] value.GetData();
 		}
 	}
 
-	void Assign(string_t input) {
+	void Assign(string_t input, ArenaAllocator &allocator) {
 		if (input.IsInlined()) {
 			// inlined string - we can directly store it into the string_t without having to allocate anything
 			Destroy();
@@ -170,10 +188,29 @@ struct MinMaxStringState : MinMaxState<string_t> {
 			// non-inlined string, need to allocate space for it somehow
 			auto len = input.GetSize();
 			char *ptr;
-			if (!isset || value.GetSize() < len) {
+			if (MinMaxArenaSlot() == &allocator) {
+				const bool own_arena = isset && !value.IsInlined() && arena_owned;
+				const uint32_t capacity =
+				    own_arena ? Load<uint32_t>(const_data_ptr_cast(value.GetData()) - sizeof(uint32_t)) : 0;
+				if (capacity >= len) {
+					// this fits into the current arena slot - take over the pointer
+					ptr = value.GetDataWriteable();
+				} else {
+					// a new arena slot; a replaced arena slot at least doubles, so a state's arena bytes stay below
+					// four times its longest value
+					Destroy();
+					const auto new_capacity =
+					    MaxValue<idx_t>(len, MinValue<idx_t>(2ULL * capacity, NumericLimits<uint32_t>::Maximum()));
+					auto slot = allocator.Allocate(sizeof(uint32_t) + new_capacity);
+					Store<uint32_t>(UnsafeNumericCast<uint32_t>(new_capacity), slot);
+					ptr = char_ptr_cast(slot + sizeof(uint32_t));
+					arena_owned = true;
+				}
+			} else if (!isset || value.GetSize() < len) {
 				// we cannot fit this into the current slot - destroy it and re-allocate
 				Destroy();
 				ptr = new char[len];
+				arena_owned = false;
 			} else {
 				// this fits into the current slot - take over the pointer
 				ptr = value.GetDataWriteable();
@@ -187,13 +224,19 @@ struct MinMaxStringState : MinMaxState<string_t> {
 
 struct StringMinMaxBase : public MinMaxBase {
 	template <class STATE>
+	static void Initialize(STATE &state) {
+		state.isset = false;
+		state.arena_owned = false;
+	}
+
+	template <class STATE>
 	static void Destroy(STATE &state, AggregateInputData &aggr_input_data) {
 		state.Destroy();
 	}
 
 	template <class INPUT_TYPE, class STATE>
 	static void Assign(STATE &state, INPUT_TYPE input, AggregateInputData &input_data) {
-		state.Assign(input);
+		state.Assign(input, input_data.allocator);
 	}
 
 	template <class T, class STATE>
@@ -250,6 +293,7 @@ struct VectorMinMaxBase {
 	template <class STATE>
 	static void Initialize(STATE &state) {
 		state.isset = false;
+		state.arena_owned = false;
 	}
 
 	template <class STATE>
@@ -259,7 +303,7 @@ struct VectorMinMaxBase {
 
 	template <class INPUT_TYPE, class STATE>
 	static void Assign(STATE &state, INPUT_TYPE input, AggregateInputData &input_data) {
-		state.Assign(input);
+		state.Assign(input, input_data.allocator);
 	}
 
 	template <class INPUT_TYPE, class STATE, class OP>

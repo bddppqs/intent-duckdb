@@ -94,6 +94,9 @@ public:
 	void Read(ReadStream &source);
 
 	idx_t GetMetadataBlockSize() const;
+	//! Read-ahead of the storage blocks holding the given metadata pointers that are not loaded yet (see
+	//! SingleFileBlockManager::ReadAhead); a no-op for any other block manager
+	void ReadAhead(const vector<MetaBlockPointer> &pointers);
 
 protected:
 	BlockManager &block_manager;

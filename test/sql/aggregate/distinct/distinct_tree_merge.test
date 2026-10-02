@@ -1,0 +1,77 @@
+# name: test/sql/aggregate/distinct/distinct_tree_merge.test
+# description: The grouped DISTINCT class's merge as a tree on the phase-2 tasks
+#              (FusedTreeMerge) - count(DISTINCT x) alone and the mixed shape (the mixed fold's companions), one key and two keys,
+#              few and many groups - at 1, 7, 64 and 96 threads, each answer in closed form from the generator (the same
+#              answer at every thread count, whatever the order in which the phase-2 tasks arrive and fetch their
+#              partitions)
+# group: [distinct]
+
+# t1: g = i % 1000 over x = i // 2000: each g holds 2,200 rows and 1,100 distinct x; SMALLINT s, INTEGER z
+statement ok
+CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS g, (i // 2000)::BIGINT AS x, (i % 7)::SMALLINT AS s, (i * 3)::INTEGER AS z FROM range(2200000) t(i);
+
+# t3: two SMALLINT keys and a BIGINT x (the 12-byte key region): 200 groups of 11,000 rows and 5,500 distinct x each
+statement ok
+CREATE TABLE t3 AS SELECT (i % 10)::SMALLINT AS g1, ((i // 10) % 20)::SMALLINT AS g2, (i // 400)::BIGINT AS x, (i % 1500)::SMALLINT AS w FROM range(2200000) t(i);
+
+# t5: 300,000 groups (the group tables and the companions grow): each g holds 7 or 8 distinct x
+statement ok
+CREATE TABLE t5 AS SELECT (i % 300000)::INTEGER AS g, (i // 300000)::BIGINT AS x, ((i % 3) - 1)::SMALLINT AS s FROM range(2200000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u FROM t5 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+foreach threads 1 7 64 96
+
+statement ok
+SET threads=${threads}
+
+# one key, count(DISTINCT x) alone
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g)
+----
+1000	1100000	1100	1100
+
+# one key, the mixed shape: count_star, sum(SMALLINT), avg(SMALLINT), sum(INTEGER) beside the distinct count
+query IIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, sum(round(a * c))::BIGINT, sum(sz)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a, sum(z) AS sz FROM t1 GROUP BY g)
+----
+1000	1100000	2200000	6599995	6599995	7259996700000
+
+query IIIII
+SELECT g, u, c, ss, round(a * c)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a FROM t1 GROUP BY g) ORDER BY ss DESC, g LIMIT 3
+----
+6	1100	2200	6605	6605
+13	1100	2200	6605	6605
+20	1100	2200	6605	6605
+
+# two keys at the 12-byte bound, count(DISTINCT x) alone and mixed
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g1, g2, count(DISTINCT x) AS u FROM t3 GROUP BY g1, g2)
+----
+200	1100000	5500	5500
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(sw)::BIGINT, sum(round(aw * c))::BIGINT FROM (SELECT g1, g2, count(DISTINCT x) AS u, count(*) AS c, sum(w) AS sw, avg(w) AS aw FROM t3 GROUP BY g1, g2)
+----
+200	1100000	2200000	1648650000	1648650000
+
+# many groups: count(DISTINCT x) alone and mixed (s = g % 3 - 1 on each of a group's 7 or 8 rows)
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u FROM t5 GROUP BY g)
+----
+300000	2200000	7	8
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, min(ss)::BIGINT, max(ss)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t5 GROUP BY g)
+----
+300000	2200000	2200000	-1	-8	8
+
+endloop

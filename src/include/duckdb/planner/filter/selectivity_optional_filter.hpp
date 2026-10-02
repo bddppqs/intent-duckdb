@@ -54,8 +54,12 @@ public:
 
 	float selectivity_threshold;
 	idx_t n_vectors_to_check;
+	//! Set on the wrapper of a Top-N bound applied row by row (TopN::PushdownDynamicFilters): the scan keeps the filter
+	//! in its per-vector loop while the thread-local state is active. Copy() preserves it.
+	bool top_n_rowwise;
 
-	SelectivityOptionalFilter(unique_ptr<TableFilter> filter, float selectivity_threshold, idx_t n_vectors_to_check);
+	SelectivityOptionalFilter(unique_ptr<TableFilter> filter, float selectivity_threshold, idx_t n_vectors_to_check,
+	                          bool top_n_rowwise = false);
 
 public:
 	unique_ptr<TableFilter> Copy() const override;
@@ -65,6 +69,7 @@ public:
 	void FiltersNullValues(const LogicalType &type, bool &filters_nulls, bool &filters_valid_values,
 	                       TableFilterState &filter_state) const override;
 	unique_ptr<TableFilterState> InitializeState(ClientContext &context) const override;
+	bool FiltersRows(TableFilterState &filter_state) const override;
 	idx_t FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
 	                      TableFilterState &filter_state, idx_t scan_count, idx_t &approved_tuple_count) const override;
 };

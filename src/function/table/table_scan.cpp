@@ -9,8 +9,12 @@
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/execution/index/art/art.hpp"
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/database.hpp"
@@ -18,6 +22,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -31,6 +36,9 @@
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
@@ -103,11 +111,12 @@ class DuckIndexScanState : public TableScanGlobalState {
 public:
 	DuckIndexScanState(ClientContext &context, const FunctionData *bind_data_p)
 	    : TableScanGlobalState(context, bind_data_p), next_batch_index(0), arena(Allocator::Get(context)),
-	      row_ids(nullptr), row_id_count(0), finished_first_phase(false), started_last_phase(false) {
+	      row_ids(nullptr), row_id_count(0), finished_first_phase(false), started_last_phase(false),
+	      batch_rows(STANDARD_VECTOR_SIZE) {
 	}
 
 	//! The batch index of the next Sink.
-	//! Also determines the offset of the next chunk. I.e., offset = next_batch_index * STANDARD_VECTOR_SIZE.
+	//! Also determines the offset of the next chunk. I.e., offset = next_batch_index * batch_rows.
 	atomic<idx_t> next_batch_index;
 	//! The arena allocator containing the memory of the row IDs.
 	ArenaAllocator arena;
@@ -125,6 +134,8 @@ public:
 	//! Synchronize <ART version, SegmentTree<RowGroup>> when vacuum_rebuild_indexes is enabled (since
 	//! ART indexes are rebuilt during vacuuming with this setting).
 	unique_ptr<StorageLockKey> vacuum_lock;
+	//! The row ids per batch: STANDARD_VECTOR_SIZE, or fewer for a small fetch split over tasks
+	idx_t batch_rows;
 
 public:
 	unique_ptr<LocalTableFunctionState> InitLocalState(ExecutionContext &context,
@@ -172,10 +183,10 @@ public:
 					l_state.batch_index = next_batch_index;
 					next_batch_index++;
 
-					offset = l_state.batch_index * STANDARD_VECTOR_SIZE;
+					offset = l_state.batch_index * batch_rows;
 					auto remaining = row_id_count - offset;
-					scan_count = remaining <= STANDARD_VECTOR_SIZE ? remaining : STANDARD_VECTOR_SIZE;
-					finished_first_phase = remaining <= STANDARD_VECTOR_SIZE ? true : false;
+					scan_count = remaining <= batch_rows ? remaining : batch_rows;
+					finished_first_phase = remaining <= batch_rows ? true : false;
 					phase_to_be_performed = ExecutionPhase::STORAGE;
 				} else if (!started_last_phase) {
 					// First thread to get last phase, great, set l_state's in_charge_of_final_stretch, so same thread
@@ -243,7 +254,7 @@ public:
 		if (row_id_count == 0) {
 			return 100;
 		}
-		auto scanned_rows = next_batch_index * STANDARD_VECTOR_SIZE;
+		auto scanned_rows = next_batch_index * batch_rows;
 		auto percentage = 100 * (static_cast<double>(scanned_rows) / static_cast<double>(row_id_count));
 		return percentage > 100 ? 100 : percentage;
 	}
@@ -274,6 +285,9 @@ public:
 
 public:
 	ParallelTableScanState state;
+	//! the columns this scan publishes (the planner's mark on the PhysicalTableScan), set on this thread
+	//! around every storage call that initializes a segment scan or a column build (may be null)
+	shared_ptr<dict_global::ScanPublication> global_scan_publication;
 
 private:
 	const TableScanBindData &bind_data;
@@ -301,6 +315,12 @@ public:
 
 		l_state->scan_state.Initialize(std::move(storage_ids), context.client, input.filters, input.sample_options);
 
+		if (ParallelCollectionScanState::PiecesEnabled()) {
+			auto sink = context.pipeline ? context.pipeline->GetSink() : optional_ptr<PhysicalOperator>();
+			state.scan_state.DecidePieces(context.client, sink && !sink->RequiredPartitionInfo().AnyRequired() &&
+			                                                  !context.pipeline->IsOrderDependent());
+		}
+		dict_global::ThreadPublicationScope global_publication_scope(global_scan_publication.get());
 		l_state->rows_in_current_row_group = storage.NextParallelScan(context.client, state, l_state->scan_state);
 		if (l_state->rows_in_current_row_group > 0) {
 			l_state->row_groups_scanned++;
@@ -310,12 +330,19 @@ public:
 		}
 
 		l_state->scan_state.options.force_fetch_row = ClientConfig::GetConfig(context.client).force_fetch_row;
+		if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
+			auto &scan_op = input.op->Cast<PhysicalTableScan>();
+			if (scan_op.run_aggregate) {
+				l_state->scan_state.run_aggregate = scan_op.run_aggregate->CreatePartial(context.client);
+			}
+		}
 		return std::move(l_state);
 	}
 
 	void TableScanFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) override {
 		auto &l_state = data_p.local_state->Cast<TableScanLocalState>();
 		l_state.scan_state.options.force_fetch_row = ClientConfig::GetConfig(context).force_fetch_row;
+		dict_global::ThreadPublicationScope global_publication_scope(global_scan_publication.get());
 
 		do {
 			if (bind_data.is_create_index) {
@@ -334,6 +361,8 @@ public:
 			l_state.rows_in_current_row_group = storage.NextParallelScan(context, state, l_state.scan_state);
 			if (l_state.rows_in_current_row_group > 0) {
 				l_state.row_groups_scanned++;
+			} else if (l_state.scan_state.run_aggregate) {
+				l_state.scan_state.run_aggregate->FinishScan();
 			}
 
 			if (data_p.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR) {
@@ -412,7 +441,11 @@ unique_ptr<GlobalTableFunctionState> DuckTableScanInitGlobal(ClientContext &cont
 		g_state->state.local_state.reorderer = make_uniq<RowGroupReorderer>(*bind_data.order_options, transaction);
 	}
 
-	storage.InitializeParallelScan(context, g_state->state, input.column_indexes);
+	g_state->global_scan_publication = dict_global::ScanPublicationOf(input.bind_data.get());
+	{
+		dict_global::ThreadPublicationScope global_publication_scope(g_state->global_scan_publication.get());
+		storage.InitializeParallelScan(context, g_state->state, input.column_indexes);
+	}
 	if (!input.CanRemoveFilterColumns()) {
 		return std::move(g_state);
 	}
@@ -432,6 +465,25 @@ unique_ptr<GlobalTableFunctionState> DuckTableScanInitGlobal(ClientContext &cont
 	return std::move(g_state);
 }
 
+//===--------------------------------------------------------------------===//
+// The index scan's task count and batch size
+//
+// The index scan hands out its row ids in batches (next_batch_index) and runs the transaction-local phase on the one
+// task that reaches it first, so tasks beyond the batch count find no work - but TableScanGlobalState sized max_threads
+// for a full table scan, so a late-materialised fetch of 10 rows scheduled one pipeline task per thread, each building
+// (and destroying) its PipelineExecutor: the source's local state, every operator state and every intermediate chunk
+// (every column for SELECT *), whose buffer-allocator reservations all meet on the global memory counters - while the
+// one task holding the batch fetched all 10 rows (a FetchRow per column per row) alone.
+// With kLateMaterializedRowIdFetch, max_threads is capped at the batch count (at least one), and a fetch of fewer
+// than STANDARD_VECTOR_SIZE row ids is split into batches of ceil(row_id_count / min(threads, row_id_count)) row
+// ids, one task each, so the rows are fetched in parallel (the same constant enables the RLE fetch's block skip,
+// rle.cpp, and the buffer allocator's lazy reservation text, standard_buffer_manager.cpp). Off, the table-sized
+// task count and STANDARD_VECTOR_SIZE batches are kept.
+//===--------------------------------------------------------------------===//
+static bool LateMaterializedRowIdFetchEnabled() {
+	return kLateMaterializedRowIdFetch;
+}
+
 unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &context, TableFunctionInitInput &input,
                                                              const TableScanBindData &bind_data, set<row_t> &row_ids,
                                                              unique_ptr<StorageLockKey> vacuum_lock) {
@@ -449,6 +501,16 @@ unique_ptr<GlobalTableFunctionState> DuckIndexScanInitGlobal(ClientContext &cont
 		for (const auto row_id : row_ids) {
 			g_state->row_ids[row_id_count++] = row_id;
 		}
+	}
+	const auto late_materialized_fetch = LateMaterializedRowIdFetchEnabled();
+	if (late_materialized_fetch && g_state->row_id_count > 1 && g_state->row_id_count < STANDARD_VECTOR_SIZE) {
+		auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+		auto tasks = MinValue<idx_t>(MaxValue<idx_t>(threads, 1), g_state->row_id_count);
+		g_state->batch_rows = (g_state->row_id_count + tasks - 1) / tasks;
+	}
+	if (late_materialized_fetch) {
+		auto batches = (g_state->row_id_count + g_state->batch_rows - 1) / g_state->batch_rows;
+		g_state->max_threads = MinValue<idx_t>(g_state->max_threads, MaxValue<idx_t>(batches, 1));
 	}
 
 	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
@@ -681,6 +743,57 @@ bool TryScanIndex(ART &art, IndexEntry &entry, const ColumnList &column_list, Ta
 	return true;
 }
 
+//===--------------------------------------------------------------------===//
+// The row-id fetch for a small row-id IN filter
+//
+// A late-materialised semi join pushes its build-side row ids to the probe-side scan as an IN filter under an
+// OptionalFilter, ANDed with the build's min / max bounds on the same column. Those prune row groups by zone map only,
+// so the scan reads every row group that holds one of the rows in full. When the scan's final filter set holds exactly
+// one entry, on the row-id column, and that entry reduces - through CONJUNCTION_AND and OPTIONAL_FILTER, exactly as
+// ExtractComparisonsAndInFilters walks it (a BLOOM_FILTER child is ignored, any other filter type refuses) - to one IN
+// list whose values GetUniqueValues keeps (the IN values satisfying every collected comparison) number at most
+// dynamic_or_filter_threshold, the scan is initialised as the existing index-scan state over those row ids and
+// fetches exactly those rows through DataTable::Fetch, which applies the version info per row. Transaction-local row
+// ids (>= MAX_ROW_ID) are not fetched: the index scan's local-storage phase scans the local rows under the same
+// filters. A scan that samples is refused (the index scan does not sample).
+//===--------------------------------------------------------------------===//
+static bool RowIdFetchDisabled() {
+	return !kRowIdFetchScan;
+}
+
+static bool TryRowIdFetch(ClientContext &context, const TableFunctionInitInput &input, TableFilterSet &filter_set,
+                          set<row_t> &row_ids) {
+	if (RowIdFetchDisabled() || input.sample_options || filter_set.filters.size() != 1) {
+		return false;
+	}
+	auto &entry = *filter_set.filters.begin();
+	if (entry.first >= input.column_indexes.size() || !input.column_indexes[entry.first].IsRowIdColumn()) {
+		return false;
+	}
+	vector<reference<ConstantFilter>> comparisons;
+	vector<reference<InFilter>> in_filters;
+	// exactly one IN list: GetUniqueValues takes the union of several, which is not their conjunction
+	if (!ExtractComparisonsAndInFilters(*entry.second, comparisons, in_filters) || in_filters.size() != 1) {
+		return false;
+	}
+	auto unique_values = GetUniqueValues(comparisons, in_filters);
+	if (unique_values.size() > Settings::Get<DynamicOrFilterThresholdSetting>(context)) {
+		return false;
+	}
+	set<row_t> fetch_ids;
+	for (auto &value : unique_values) {
+		if (value.IsNull() || value.type().id() != LogicalTypeId::BIGINT) {
+			return false;
+		}
+		auto row_id = value.GetValue<row_t>();
+		if (row_id >= 0 && row_id < MAX_ROW_ID) {
+			fetch_ids.insert(row_id);
+		}
+	}
+	row_ids = std::move(fetch_ids);
+	return true;
+}
+
 unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	D_ASSERT(input.bind_data);
 
@@ -693,6 +806,16 @@ unique_ptr<GlobalTableFunctionState> TableScanInitGlobal(ClientContext &context,
 		return DuckTableScanInitGlobal(context, input, storage, bind_data);
 	}
 	auto &filter_set = *input.filters;
+
+	// a small row-id IN filter fetches its rows
+	set<row_t> fetch_row_ids;
+	if (TryRowIdFetch(context, input, filter_set, fetch_row_ids)) {
+		unique_ptr<StorageLockKey> vacuum_lock;
+		if (storage.GetAttached().GetVacuumRebuildIndexThreshold() > 0) {
+			vacuum_lock = DuckTransactionManager::Get(storage.GetAttached()).SharedVacuumLock();
+		}
+		return DuckIndexScanInitGlobal(context, input, bind_data, fetch_row_ids, std::move(vacuum_lock));
+	}
 
 	// FIXME: We currently only support scanning one ART with one filter.
 	// If multiple filters exist, i.e., a = 11 AND b = 24, we need to
@@ -800,7 +923,7 @@ vector<PartitionStatistics> TableScanGetPartitionStats(ClientContext &context, G
 	auto &bind_data = input.bind_data->Cast<TableScanBindData>();
 	auto &duck_table = bind_data.table.Cast<DuckTableEntry>();
 	auto &storage = duck_table.GetStorage();
-	return storage.GetPartitionStats(context);
+	return storage.GetPartitionStats(context, input.whole_table);
 }
 
 BindInfo TableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {

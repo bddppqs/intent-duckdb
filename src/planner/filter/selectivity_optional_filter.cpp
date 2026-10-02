@@ -53,9 +53,9 @@ double SelectivityOptionalFilterState::SelectivityStats::GetSelectivity() const 
 }
 
 SelectivityOptionalFilter::SelectivityOptionalFilter(unique_ptr<TableFilter> filter, const float selectivity_threshold,
-                                                     const idx_t n_vectors_to_check)
+                                                     const idx_t n_vectors_to_check, const bool top_n_rowwise)
     : OptionalFilter(std::move(filter)), selectivity_threshold(selectivity_threshold),
-      n_vectors_to_check(n_vectors_to_check) {
+      n_vectors_to_check(n_vectors_to_check), top_n_rowwise(top_n_rowwise) {
 }
 
 FilterPropagateResult SelectivityOptionalFilter::CheckStatistics(BaseStatistics &stats) const {
@@ -66,6 +66,12 @@ FilterPropagateResult SelectivityOptionalFilter::CheckStatistics(BaseStatistics 
 
 void SelectivityOptionalFilter::Serialize(Serializer &serializer) const {
 	OptionalFilter::Serialize(serializer);
+	if (top_n_rowwise) {
+		// a Top-N bound's wrapper is part of the optimized logical plan: it is written as the plain OptionalFilter it
+		// deserializes as (OPTIONAL_FILTER reads OptionalFilter::Deserialize), so a deserialized plan keeps the
+		// zonemap-only wrapper
+		return;
+	}
 	serializer.WritePropertyWithDefault<float>(201, "selectivity_threshold", selectivity_threshold);
 	serializer.WritePropertyWithDefault<idx_t>(202, "n_vectors_to_check", n_vectors_to_check);
 }
@@ -83,6 +89,10 @@ void SelectivityOptionalFilter::FiltersNullValues(const LogicalType &type, bool 
 	return ConstantFun::FiltersNullValues(type, *this->child_filter, filters_nulls, filters_valid_values,
 	                                      *state.child_state);
 }
+bool SelectivityOptionalFilter::FiltersRows(TableFilterState &filter_state) const {
+	return top_n_rowwise && filter_state.Cast<SelectivityOptionalFilterState>().stats.IsActive();
+}
+
 unique_ptr<TableFilterState> SelectivityOptionalFilter::InitializeState(ClientContext &context) const {
 	D_ASSERT(child_filter);
 	auto child_filter_state = TableFilterState::Initialize(context, *child_filter);
@@ -107,7 +117,8 @@ idx_t SelectivityOptionalFilter::FilterSelection(SelectionVector &sel, Vector &v
 }
 
 unique_ptr<TableFilter> SelectivityOptionalFilter::Copy() const {
-	auto copy = make_uniq<SelectivityOptionalFilter>(child_filter->Copy(), selectivity_threshold, n_vectors_to_check);
+	auto copy = make_uniq<SelectivityOptionalFilter>(child_filter->Copy(), selectivity_threshold, n_vectors_to_check,
+	                                                 top_n_rowwise);
 	return duckdb::unique_ptr_cast<SelectivityOptionalFilter, TableFilter>(std::move(copy));
 }
 

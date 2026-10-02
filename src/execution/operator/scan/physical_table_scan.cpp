@@ -6,6 +6,7 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 #include "duckdb/main/settings.hpp"
 
@@ -358,6 +359,9 @@ InsertionOrderPreservingMap<string> PhysicalTableScan::ParamsToString() const {
 			AddProjectionNames(column_index, names[column_id], returned_types[column_id], projections);
 		}
 		result["Projections"] = projections;
+	}
+	if (run_aggregate) {
+		result["Run Aggregate"] = run_aggregate->column_names;
 	}
 	if (function.filter_pushdown && table_filters) {
 		result["Filters"] = GetFilterInfo(this, table_filters);

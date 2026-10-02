@@ -10,11 +10,58 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/ht_entry.hpp"
+#include "duckdb/execution/radix_partitioned_hashtable.hpp"
+#include "duckdb/function/aggregate/min_max_string_arena.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
 
 using ValidityBytes = TupleDataLayout::ValidityBytes;
+
+namespace {
+
+//! the state of one borrowed-heap merge.  "source_rows" are the partial rows of the chunk
+//! FindOrCreateGroupsInternal is currently probing with; "input" is the append input built from the
+//! subset of them that turned out to be new groups, with every heap size zero so the append
+//! allocates no heap for them and copies none of their key bytes.
+struct BorrowedGroupKeyState {
+	BorrowedGroupKeyState() {
+		input.heap_sizes.Reference(zero_heap_sizes);
+	}
+
+	//! STANDARD_VECTOR_SIZE zeroes: the heap every borrowed row does NOT bring with it
+	Vector zero_heap_sizes = Vector(LogicalType::UBIGINT, true, true);
+	TupleDataChunkState input;
+	Vector *source_rows = nullptr;
+};
+
+//! Set for the whole of one GroupedAggregateHashTable::Combine that borrows, and null otherwise.
+//! The append block in FindOrCreateGroupsInternal is the only reader.
+thread_local BorrowedGroupKeyState *borrowed_group_key_state = nullptr;
+
+struct BorrowedGroupKeyScope {
+	explicit BorrowedGroupKeyScope(BorrowedGroupKeyState &borrow_state) {
+		borrowed_group_key_state = &borrow_state;
+	}
+	~BorrowedGroupKeyScope() {
+		borrowed_group_key_state = nullptr;
+	}
+};
+
+} // namespace
+
+// A new VARCHAR group key whose bytes live in a DICT_FSST-mode storage dictionary's own string arena is appended with
+// its string_t stored verbatim and no heap copy; the collection that receives the rows holds the arena's owner until the
+// rows die.
+// Borrowed arenas trade memory for speed (they are held outside memory_limit); below dict_global::SMALL_MEMORY_LIMIT
+// they cause swap, so a sink under a smaller memory_limit appends every key with the heap copy.
+
+bool BorrowedStringKeysEnabled() {
+	return kBorrowedStringGroupKeys;
+}
 
 GroupedAggregateHashTable::GroupedAggregateHashTable(ClientContext &context, Allocator &allocator,
                                                      vector<LogicalType> group_types, vector<LogicalType> payload_types,
@@ -56,6 +103,12 @@ GroupedAggregateHashTable::GroupedAggregateHashTable(ClientContext &context_p, A
 	layout_ptr = std::move(layout);
 
 	hash_offset = layout_ptr->GetOffsets()[layout_ptr->ColumnCount() - 1];
+
+	const auto &variable_columns = layout_ptr->GetVariableColumns();
+	if (variable_columns.size() == 1 && variable_columns[0] < layout_ptr->ColumnCount() - 1 &&
+	    layout_ptr->GetTypes()[variable_columns[0]].id() == LogicalTypeId::VARCHAR) {
+		borrowable_key_column = variable_columns[0];
+	}
 
 	// Partitioned data and pointer table
 	InitializePartitionedData();
@@ -171,14 +224,32 @@ void GroupedAggregateHashTable::Destroy() {
 		if (data_collection->Count() == 0) {
 			continue;
 		}
-		TupleDataChunkIterator iterator(*data_collection, TupleDataPinProperties::DESTROY_AFTER_DONE, false);
-		auto &row_locations = iterator.GetChunkState().row_locations;
-		do {
-			RowOperations::DestroyStates(state.row_state, *layout_ptr, row_locations, iterator.GetCurrentChunkCount());
-		} while (iterator.Next());
-		data_collection->Reset();
+		GlobalDictionaryDestroyStates(*data_collection, *layout_ptr, state.row_state);
 	}
 	// LCOV_EXCL_STOP
+}
+
+idx_t GroupedAggregateHashTable::GlobalDictionaryDestroyStates(TupleDataCollection &data_collection,
+                                                               TupleDataLayout &layout, RowOperationsState &row_state) {
+	// runs inside destructors, so it never throws: a chunk that cannot be pinned (out of memory) ends this
+	// collection's walk, and its states are skipped: their own out-of-line allocations are lost, not the process
+	const auto total = data_collection.Count();
+	idx_t destroyed = 0;
+	try {
+		TupleDataChunkIterator iterator(data_collection, TupleDataPinProperties::DESTROY_AFTER_DONE, false);
+		auto &row_locations = iterator.GetChunkState().row_locations;
+		do {
+			const auto count = iterator.GetCurrentChunkCount();
+			RowOperations::DestroyStates(row_state, layout, row_locations, count);
+			destroyed += count;
+		} while (iterator.Next());
+	} catch (std::exception &) { // NOLINT: the skipped states are counted below
+	}
+	try {
+		data_collection.Reset();
+	} catch (std::exception &) { // NOLINT: the collection's own destructor frees what Reset could not
+	}
+	return total > destroyed ? total - destroyed : 0;
 }
 
 shared_ptr<TupleDataLayout> GroupedAggregateHashTable::GetLayoutPtr() {
@@ -362,6 +433,8 @@ optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups
 	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
 	// dictionary vector - check if this is a duplicate eliminated dictionary from the storage
 	auto &dict_col = groups.data[0];
+	// no per-table global-code array: a published global dictionary (its id set,
+	// its size above MAX_DICTIONARY_SIZE_THRESHOLD) takes the row path below with the borrow
 	auto opt_dict_size = DictionaryVector::DictionarySize(dict_col);
 	if (!opt_dict_size.IsValid()) {
 		// dict size not known - this is not a dictionary that comes from the storage
@@ -530,7 +603,63 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
 	return AddChunk(groups, state.hashes, payload, filter);
 }
 
+idx_t GroupedAggregateHashTable::GlobalDictionaryBeginAppend(DataChunk &groups) {
+	if (!dict_global::DictGlobalEnabled()) {
+		return DConstants::INVALID_INDEX;
+	}
+	idx_t borrow_column = DConstants::INVALID_INDEX;
+	auto &variable_columns = layout_ptr->GetVariableColumns();
+	if (variable_columns.size() == 1 && variable_columns[0] < groups.ColumnCount() &&
+	    dict_global::IsPublishedVector(groups.data[variable_columns[0]])) {
+		borrow_column = variable_columns[0];
+		auto child = groups.data[borrow_column].GetAuxiliary();
+		bool pinned = false;
+		for (auto &pin : global_dictionary_pins) {
+			pinned = pinned || pin.get() == child.get();
+		}
+		if (!pinned) {
+			global_dictionary_pins.push_back(std::move(child));
+		}
+	}
+	return borrow_column;
+}
+
+idx_t GroupedAggregateHashTable::AddRunChunk(DataChunk &groups, const uint16_t *run_counts, idx_t run_count,
+                                             const vector<aggregate_grouped_run_update_t> &run_updates) {
+	if (run_count == 0) {
+		return 0;
+	}
+#ifdef DEBUG
+	D_ASSERT(groups.ColumnCount() + 1 == layout_ptr->ColumnCount());
+	D_ASSERT(groups.size() == run_count);
+	D_ASSERT(run_updates.size() == layout_ptr->GetAggregates().size());
+	for (idx_t i = 0; i < groups.ColumnCount(); i++) {
+		D_ASSERT(groups.GetTypes()[i] == layout_ptr->GetTypes()[i]);
+	}
+#endif
+	// one probe per run; the raw group values are appended exactly as AddChunk would, without the compressed-group
+	// fast paths (a run batch is a flat vector of distinct-by-construction adjacent values)
+	sink_count += run_count;
+	groups.Hash(state.hashes);
+	const auto new_group_count = FindOrCreateGroups(groups, state.hashes, state.addresses, state.new_groups);
+	VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(layout_ptr->GetAggrOffset()), run_count);
+
+	// one grouped run update per aggregate; the addresses vector walks the payload exactly as UpdateAggregates does
+	auto &aggregates = layout_ptr->GetAggregates();
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto &aggr = aggregates[i];
+		AggregateInputData aggr_input_data(aggr.GetFunctionData(), state.row_state.allocator);
+		run_updates[i](groups.data[0], run_counts, run_count, aggr_input_data, state.addresses);
+		VectorOperations::AddInPlace(state.addresses, NumericCast<int64_t>(aggr.payload_size), run_count);
+	}
+	Verify();
+	return new_group_count;
+}
+
 void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter) {
+	// MIN/MAX string states of this table may take their bytes from its aggregate arena
+	const MinMaxArenaScope min_max_string_arena(state.row_state.allocator,
+	                                               buffer_manager.GetMaxMemory() >= dict_global::SMALL_MEMORY_LIMIT);
 	// Now every cell has an entry, update the aggregates
 	auto &aggregates = layout_ptr->GetAggregates();
 	idx_t filter_idx = 0;
@@ -672,6 +801,10 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 	// convert all vectors to unified format
 	TupleDataCollection::ToUnifiedFormat(state.partitioned_append_state.chunk_state, state.group_chunk);
 
+	// the borrowed key column and its owner, decided once per chunk from the group chunk (never from a dictionary id)
+	buffer_ptr<VectorBuffer> borrowed_owner;
+	const auto borrowed_column = BorrowedKeyColumn(borrowed_owner);
+
 	group_hashes_v.Flatten(chunk_size);
 	const auto hashes = FlatVector::GetData<hash_t>(group_hashes_v);
 
@@ -680,8 +813,21 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 
 	if (skip_lookups) {
 		// Just appending now
-		partitioned_data->AppendUnified(state.partitioned_append_state, state.group_chunk,
-		                                *FlatVector::IncrementalSelectionVector(), chunk_size);
+		auto &append_chunk_state = state.partitioned_append_state.chunk_state;
+		append_chunk_state.borrowed_key_column = borrowed_column;
+		append_chunk_state.borrowed_owner = borrowed_owner;
+		auto &thread_borrow = dict_global::ThreadBorrowColumn();
+		thread_borrow = GlobalDictionaryBeginAppend(groups);
+		try {
+			partitioned_data->AppendUnified(state.partitioned_append_state, state.group_chunk,
+			                                *FlatVector::IncrementalSelectionVector(), chunk_size);
+		} catch (...) {
+			thread_borrow = DConstants::INVALID_INDEX;
+			throw;
+		}
+		thread_borrow = DConstants::INVALID_INDEX;
+		append_chunk_state.borrowed_key_column = DConstants::INVALID_INDEX;
+		append_chunk_state.borrowed_owner.reset();
 		RowOperations::InitializeStates(*layout_ptr, state.partitioned_append_state.chunk_state.row_locations,
 		                                *FlatVector::IncrementalSelectionVector(), chunk_size);
 
@@ -749,8 +895,15 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 			// Append everything that belongs to an empty group
 			optional_ptr<PartitionedTupleData> data;
 			optional_ptr<PartitionedTupleDataAppendState> append_state;
-			if (radix_bits >= UNPARTITIONED_RADIX_BITS_THRESHOLD &&
-			    new_entry_count / RadixPartitioning::NumberOfPartitions(radix_bits) <= 4) {
+			// a borrowed merge appends the partial row the new group was created from
+			// instead of scattering the group columns into a heap of our own, so the group key is
+			// materialised once (by the sink) rather than twice
+			const auto borrow = borrowed_group_key_state;
+			if (borrow) {
+				data = partitioned_data.get();
+				append_state = &state.partitioned_append_state;
+			} else if (radix_bits >= UNPARTITIONED_RADIX_BITS_THRESHOLD &&
+			           new_entry_count / RadixPartitioning::NumberOfPartitions(radix_bits) <= 4) {
 				TupleDataCollection::ToUnifiedFormat(state.unpartitioned_append_state.chunk_state, state.group_chunk);
 				data = unpartitioned_data.get();
 				append_state = &state.unpartitioned_append_state;
@@ -758,7 +911,39 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 				data = partitioned_data.get();
 				append_state = &state.partitioned_append_state;
 			}
-			data->AppendUnified(*append_state, state.group_chunk, empty_vector, new_entry_count);
+			if (borrow) {
+				const auto source_rows = FlatVector::GetData<data_ptr_t>(*borrow->source_rows);
+				const auto borrowed_rows = FlatVector::GetData<data_ptr_t>(borrow->input.row_locations);
+				for (idx_t new_entry_idx = 0; new_entry_idx < new_entry_count; new_entry_idx++) {
+					borrowed_rows[new_entry_idx] = source_rows[empty_vector.get_index_unsafe(new_entry_idx)];
+				}
+				// every heap size in the input is zero, so this copies the fixed-width rows and no
+				// heap: the group keys keep pointing into the collection we are combining
+				data->Append(*append_state, borrow->input, new_entry_count);
+				const auto appended = FlatVector::GetData<data_ptr_t>(append_state->chunk_state.row_locations);
+				const auto heap_size_offset = layout_ptr->GetHeapSizeOffset();
+				for (idx_t new_entry_idx = 0; new_entry_idx < new_entry_count; new_entry_idx++) {
+					// the copied row owns none of the heap bytes its source row owns
+					Store<idx_t>(0, appended[new_entry_idx] + heap_size_offset);
+				}
+			} else {
+				auto &append_chunk_state = append_state->chunk_state;
+				append_chunk_state.borrowed_key_column = borrowed_column;
+				append_chunk_state.borrowed_owner = borrowed_owner;
+				// a group column over a published global dictionary is stored verbatim (a borrow: no heap,
+				// no copy) when it is the layout's only variable-size column
+				auto &thread_borrow = dict_global::ThreadBorrowColumn();
+				thread_borrow = GlobalDictionaryBeginAppend(groups);
+				try {
+					data->AppendUnified(*append_state, state.group_chunk, empty_vector, new_entry_count);
+				} catch (...) {
+					thread_borrow = DConstants::INVALID_INDEX;
+					throw;
+				}
+				thread_borrow = DConstants::INVALID_INDEX;
+				append_chunk_state.borrowed_key_column = DConstants::INVALID_INDEX;
+				append_chunk_state.borrowed_owner.reset();
+			}
 			RowOperations::InitializeStates(*layout_ptr, append_state->chunk_state.row_locations,
 			                                *FlatVector::IncrementalSelectionVector(), new_entry_count);
 
@@ -767,7 +952,8 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 			const auto &row_sel = append_state->reverse_partition_sel;
 			for (idx_t new_entry_idx = 0; new_entry_idx < new_entry_count; new_entry_idx++) {
 				const auto index = empty_vector.get_index_unsafe(new_entry_idx);
-				const auto row_idx = row_sel.get_index_unsafe(index);
+				// a borrowed append wrote the rows in new-entry order, not in chunk order
+				const auto row_idx = borrow ? new_entry_idx : row_sel.get_index_unsafe(index);
 				const auto &row_location = row_locations[row_idx];
 
 				auto &entry = entries[ht_offsets[index]];
@@ -816,6 +1002,32 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroupsInternal(DataChunk &groups, V
 	return new_group_count;
 }
 
+void GroupedAggregateHashTable::SetSinkExternal(const bool external) {
+	sink_external = external;
+}
+
+idx_t GroupedAggregateHashTable::BorrowedKeyColumn(buffer_ptr<VectorBuffer> &owner) {
+	if (borrowable_key_column == DConstants::INVALID_INDEX || sink_external || !BorrowedStringKeysEnabled() ||
+	    buffer_manager.GetMaxMemory() < dict_global::SMALL_MEMORY_LIMIT) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto &key = state.group_chunk.data[borrowable_key_column];
+	if (key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto &child = DictionaryVector::Child(key);
+	if (child.GetVectorType() != VectorType::FLAT_VECTOR) {
+		return DConstants::INVALID_INDEX;
+	}
+	auto auxiliary = child.GetAuxiliary();
+	if (!auxiliary || auxiliary->GetBufferType() != VectorBufferType::STRING_BUFFER ||
+	    !auxiliary->Cast<VectorStringBuffer>().owns_all_strings) {
+		return DConstants::INVALID_INDEX;
+	}
+	owner = std::move(auxiliary);
+	return borrowable_key_column;
+}
+
 // this is to support distinct aggregations where we need to record whether we
 // have already seen a value for a group
 idx_t GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &group_hashes, Vector &addresses_out,
@@ -835,21 +1047,33 @@ idx_t GroupedAggregateHashTable::FindOrCreateGroups(DataChunk &groups, Vector &a
 }
 
 struct FlushMoveState {
-	explicit FlushMoveState(TupleDataCollection &collection_p)
-	    : collection(collection_p), hashes(LogicalType::HASH), group_addresses(LogicalType::POINTER),
-	      new_groups_sel(STANDARD_VECTOR_SIZE) {
+	explicit FlushMoveState(TupleDataCollection &collection_p, vector<BufferHandle> *borrowed_pins_p)
+	    : collection(collection_p), borrowed_pins(borrowed_pins_p), hashes(LogicalType::HASH),
+	      group_addresses(LogicalType::POINTER), new_groups_sel(STANDARD_VECTOR_SIZE) {
 		const auto &layout = collection.GetLayout();
 		vector<column_t> column_ids;
 		column_ids.reserve(layout.ColumnCount() - 1);
 		for (idx_t col_idx = 0; col_idx < layout.ColumnCount() - 1; col_idx++) {
 			column_ids.emplace_back(col_idx);
 		}
-		collection.InitializeScan(scan_state, column_ids, TupleDataPinProperties::DESTROY_AFTER_DONE);
+		// a borrowed merge leaves the group keys in these blocks, so nothing may destroy
+		// them as they are scanned
+		collection.InitializeScan(scan_state, column_ids,
+		                          borrowed_pins ? TupleDataPinProperties::UNPIN_AFTER_DONE
+		                                        : TupleDataPinProperties::DESTROY_AFTER_DONE);
 		collection.InitializeScanChunk(scan_state, groups);
 		hash_col_idx = layout.ColumnCount() - 1;
 	}
 
 	bool Scan() {
+		if (borrowed_pins) {
+			// take over the handles of the chunk we are done with, so its blocks stay
+			// resident at the address the group keys we borrowed from it point into.  Taken before
+			// the next chunk is fetched, exactly as BlockIteratorState does it, because the rows of
+			// the chunk just processed are read until then.
+			scan_state.pin_state.row_handles.acquire_handles(*borrowed_pins);
+			scan_state.pin_state.heap_handles.acquire_handles(*borrowed_pins);
+		}
 		if (collection.Scan(scan_state, groups)) {
 			collection.Gather(scan_state.chunk_state.row_locations, *FlatVector::IncrementalSelectionVector(),
 			                  groups.size(), hash_col_idx, hashes, *FlatVector::IncrementalSelectionVector(), nullptr);
@@ -861,6 +1085,8 @@ struct FlushMoveState {
 	}
 
 	TupleDataCollection &collection;
+	//! Where the pins of the scanned blocks go, or null when this merge does not borrow
+	vector<BufferHandle> *const borrowed_pins;
 	TupleDataScanState scan_state;
 	DataChunk groups;
 
@@ -874,7 +1100,9 @@ struct FlushMoveState {
 void GroupedAggregateHashTable::Combine(GroupedAggregateHashTable &other) {
 	auto other_partitioned_data = other.AcquirePartitionedData();
 	auto other_data = other_partitioned_data->GetUnpartitioned();
+	const auto previous = ArmBorrowedGroupKeys(nullptr);
 	Combine(*other_data);
+	ArmBorrowedGroupKeys(previous);
 
 	// Inherit ownership to all stored aggregate allocators
 	stored_allocators.emplace_back(other.aggregate_allocator);
@@ -892,8 +1120,26 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
 		return;
 	}
 
-	FlushMoveState fm_state(other_data);
+	// borrow the group keys of the rows we are combining rather than materialising them a
+	// second time.  Only for the single-partition finalize merge that arms it, and only when the
+	// rows actually carry a heap and the two layouts are identical, so a row copied out of
+	// "other_data" is a valid row here.
+	const auto borrowed_pins = (radix_bits == 0 && !layout_ptr->AllConstant() &&
+	                            other_data.GetLayout().GetTypes() == layout_ptr->GetTypes() &&
+	                            other_data.GetLayout().GetRowWidth() == layout_ptr->GetRowWidth())
+	                               ? BorrowedGroupKeyPins()
+	                               : nullptr;
 
+	FlushMoveState fm_state(other_data, borrowed_pins);
+	BorrowedGroupKeyState borrow_state;
+	unique_ptr<BorrowedGroupKeyScope> borrow_scope;
+	if (borrowed_pins) {
+		borrow_scope = make_uniq<BorrowedGroupKeyScope>(borrow_state);
+	}
+
+	// MIN/MAX string states combined into this table may take their bytes from its aggregate arena
+	const MinMaxArenaScope min_max_string_arena(state.row_state.allocator,
+	                                               buffer_manager.GetMaxMemory() >= dict_global::SMALL_MEMORY_LIMIT);
 	idx_t chunk_idx = 0;
 	const auto chunk_count = other_data.ChunkCount();
 	while (fm_state.Scan()) {
@@ -902,6 +1148,7 @@ void GroupedAggregateHashTable::Combine(TupleDataCollection &other_data, optiona
 			throw InterruptException();
 		}
 		const auto input_chunk_size = fm_state.groups.size();
+		borrow_state.source_rows = &fm_state.scan_state.chunk_state.row_locations;
 		FindOrCreateGroups(fm_state.groups, fm_state.hashes, fm_state.group_addresses, fm_state.new_groups_sel);
 		RowOperations::CombineStates(state.row_state, *layout_ptr, fm_state.scan_state.chunk_state.row_locations,
 		                             fm_state.group_addresses, input_chunk_size);

@@ -1,0 +1,174 @@
+# name: test/sql/aggregate/aggregates/run_aware_ungrouped_aggregates.test
+# description: Run-aware ungrouped integer aggregates over RLE and Constant segments: SUM/AVG/COUNT/COUNT(*)
+#              aggregated from (value, run length) pairs must equal the row-by-row answers, and every other shape
+#              (filters, NULLs, DISTINCT, MIN/MAX) keeps the ordinary path.
+# group: [aggregates]
+
+statement ok
+PRAGMA enable_verification
+
+# BIGINT runs at the type boundaries with the run lengths 1, 7, 8, 2047, 2048, 2049, 65535 and 70000 (a run that
+# spans two RLE entries and a row-group boundary), then mixed magnitudes
+statement ok
+CREATE TABLE t_rle_big(v BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_rle_big SELECT CASE WHEN i < 1 THEN 9223372036854775807::BIGINT WHEN i < 8 THEN (-9223372036854775807 - 1)::BIGINT WHEN i < 16 THEN 9223372036854775807::BIGINT WHEN i < 2063 THEN (-9223372036854775807 - 1)::BIGINT WHEN i < 4111 THEN 9223372036854775807::BIGINT WHEN i < 6160 THEN (-9223372036854775807 - 1)::BIGINT WHEN i < 71695 THEN 9223372036854775807::BIGINT WHEN i < 141695 THEN (-9223372036854775807 - 1)::BIGINT WHEN i < 141698 THEN 12345::BIGINT WHEN i < 143746 THEN (-7)::BIGINT ELSE 0::BIGINT END FROM range(143751) t(i);
+
+statement ok
+CREATE TABLE t_rle_small(v SMALLINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_rle_small SELECT CASE WHEN i < 2047 THEN 32767::SMALLINT WHEN i < 4095 THEN (-32767 - 1)::SMALLINT WHEN i < 6144 THEN 32767::SMALLINT WHEN i < 6151 THEN 123::SMALLINT ELSE (-7)::SMALLINT END FROM range(8200) t(i);
+
+# single-value columns become Constant segments
+statement ok
+CREATE TABLE t_const(v BIGINT, w SMALLINT);
+
+statement ok
+INSERT INTO t_const SELECT 42::BIGINT, (-3)::SMALLINT FROM range(130000) t(i);
+
+# NULL layouts fall back to the ordinary scan: a NULL inside a run, every 64th row NULL
+statement ok
+CREATE TABLE t_null(v BIGINT USING COMPRESSION 'rle', z BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_null SELECT CASE WHEN i % 5000 = 2500 THEN NULL ELSE (i // 100)::BIGINT END, CASE WHEN i % 64 = 63 THEN NULL ELSE (i // 200)::BIGINT END FROM range(130000) t(i);
+
+statement ok
+CHECKPOINT;
+
+query IIII
+SELECT SUM(v), COUNT(v), COUNT(*), MIN(v) FROM t_rle_big;
+----
+-60053375331961445330781	143751	143751	-9223372036854775808
+
+query II
+SELECT SUM(v), COUNT(*) FROM t_rle_big WHERE v > 0;
+----
+623426162715088006383779	67595
+
+query II
+SELECT MIN(v), MAX(v) FROM t_rle_big;
+----
+-9223372036854775808	9223372036854775807
+
+query II
+SELECT SUM(v), COUNT(*) FROM t_rle_small;
+----
+67091286	8200
+
+# SUM(v + k) over a SMALLINT column is a widening cast on the run values; these runs stay below the type's maximum by
+# more than k, so the row-by-row evaluation of v + k (the unoptimized plan) does not overflow either
+statement ok
+CREATE TABLE t_rle_mid(v SMALLINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_rle_mid SELECT CASE WHEN i < 2047 THEN 32700::SMALLINT WHEN i < 4095 THEN (-32767 - 1)::SMALLINT WHEN i < 6144 THEN 32700::SMALLINT WHEN i < 6151 THEN 123::SMALLINT ELSE (-7)::SMALLINT END FROM range(8200) t(i);
+
+query III
+SELECT SUM(v), SUM(v + 1), SUM(v + 7) FROM t_rle_mid;
+----
+66816854	66825054	66874254
+
+query IIIIII
+SELECT SUM(v), AVG(v), COUNT(v), COUNT(*), SUM(w), AVG(w) FROM t_const;
+----
+5460000	42.0	130000	130000	-390000	-3.0
+
+query IIIII
+SELECT SUM(v), COUNT(v), COUNT(*), SUM(z), COUNT(z) FROM t_null;
+----
+84418100	129974	130000	41525738	127969
+
+query II
+SELECT SUM(DISTINCT v), COUNT(DISTINCT v) FROM t_rle_small;
+----
+115	4
+
+# the run path renders a "Run Aggregate" line in the physical plan of the eligible shapes only
+query II
+EXPLAIN SELECT SUM(v), COUNT(*) FROM t_rle_big;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+query II
+EXPLAIN SELECT SUM(v) FROM t_rle_big WHERE v > 0;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_rle_small GROUP BY v;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+# the planner rewrites SUM(v + k) into SUM(v) + k * COUNT(v) with a unary COUNT whose declared argument
+# type is ANY; the bound child's type decides admission, so the plan attaches
+query II
+EXPLAIN SELECT SUM(v), SUM(v + 1) FROM t_rle_small;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+# two aggregates reading one scan column through different casts keep the ordinary plan (one run sink per column)
+query III
+SELECT SUM(v), SUM(v::INTEGER), COUNT(*) FROM t_rle_small;
+----
+67091286	67091286	8200
+
+query II
+EXPLAIN SELECT SUM(v), SUM(v::INTEGER) FROM t_rle_small;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query RRI
+SELECT round(AVG(v), 9), round(AVG(v::BIGINT), 9), COUNT(*) FROM t_rle_small;
+----
+8181.864146341	8181.864146341	8200
+
+query II
+EXPLAIN SELECT AVG(v), AVG(v::BIGINT) FROM t_rle_small;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+# the unary COUNT over a NULL-free column (statistics turn it into COUNT(*)) and over a NULL-bearing column (run
+# vectors count their run lengths, NULL-bearing vectors fall back to the ordinary count)
+query II
+SELECT COUNT(v), SUM(v) FROM t_rle_small;
+----
+8200	67091286
+
+query II
+SELECT COUNT(v), COUNT(*) FROM t_null;
+----
+129974	130000
+
+query II
+EXPLAIN SELECT COUNT(v), COUNT(*) FROM t_null;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+# a BIGINT RLE column of two row groups with NULLs only in the first: the first row group falls back, the second takes
+# the run path, both partials combine into one answer
+statement ok
+CREATE TABLE t_null_rg(v BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_null_rg SELECT CASE WHEN i < 122880 AND i % 5000 = 0 THEN NULL ELSE (i // 100)::BIGINT END FROM range(245760) t(i);
+
+statement ok
+CHECKPOINT;
+
+query IRII
+SELECT SUM(v), AVG(v), COUNT(v), COUNT(*) FROM t_null_rg;
+----
+301852020	1228.36396931654	245735	245760
+
+query IIII
+SELECT SUM(v), SUM(v + 1), SUM(v + 7), COUNT(*) FROM t_null_rg;
+----
+301852020	302097755	303572165	245760
+
+query II
+EXPLAIN SELECT SUM(v), AVG(v), COUNT(v), COUNT(*) FROM t_null_rg;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*

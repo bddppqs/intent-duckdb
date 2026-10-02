@@ -1,0 +1,333 @@
+# name: test/sql/aggregate/group/sink_key_borrow.test
+# description: The owned-dictionary key borrow at the aggregate sink: grouped aggregates, grouped and
+#              ungrouped DISTINCT over DICT_FSST-mode, mode-mixed, NULL-bearing, all-inlined and two-VARCHAR-key
+#              tables at threads 1, 4 and 8, and the borrowed keys consumed downstream (a join, a second aggregate,
+#              a window); the expected rows are the generator's and do not depend on the borrow
+# group: [group]
+
+statement ok
+ATTACH '__TEST_DIR__/sink_key_borrow.db' AS d (STORAGE_VERSION 'latest');
+
+# t_fsst: 400,000 rows over 100,000 vocabulary keys of 20-40 bytes in runs of four (DICT_FSST mode)
+statement ok
+CREATE TABLE d.t_fsst AS SELECT ('key ' || array_to_string([['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 40) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1600) % 40)]], ' ') || ' ' || ((i // 4))::VARCHAR) AS k, (i % 7)::INTEGER AS x FROM range(400000) t(i);
+
+# t_mixed: row groups alternating vocabulary keys and md5 keys in runs of three - DICT_FSST- and DICTIONARY-mode segments
+#          (10 and 4 on duckdb 1.5.5), so borrowed and copied rows share one sink
+statement ok
+CREATE TABLE d.t_mixed AS SELECT CASE WHEN (i // 122880) % 2 = 0 THEN ('key ' || array_to_string([['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 3) // 1) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 3) // 40) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 3) // 1600) % 40)]], ' ') || ' ' || ((i // 3))::VARCHAR) ELSE md5(((i // 3) * 7919)::VARCHAR) END AS k, (i % 11)::INTEGER AS x FROM range(491520) t(i);
+
+# t_null: t_fsst's keys with every tenth key NULL
+statement ok
+CREATE TABLE d.t_null AS SELECT CASE WHEN (i // 4) % 10 = 0 THEN NULL ELSE ('key ' || array_to_string([['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 40) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1600) % 40)]], ' ') || ' ' || ((i // 4))::VARCHAR) END AS k, (i % 7)::INTEGER AS x FROM range(400000) t(i);
+
+# t_inline: keys of at most 12 bytes (an all-inlined dictionary: nothing to borrow)
+statement ok
+CREATE TABLE d.t_inline AS SELECT 'k' || ((i // 4) % 50000)::VARCHAR AS k, (i % 7)::INTEGER AS x FROM range(400000) t(i);
+
+# t_two: two VARCHAR keys (a second variable-size column: no borrow)
+statement ok
+CREATE TABLE d.t_two AS SELECT ('key ' || array_to_string([['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 40) % 40)], ['alpha','bravo','charlie','delta','echo','foxtrot','golf','hotel','india','juliet','kilo','lima','mike','november','oscar','papa','quebec','romeo','sierra','tango','uniform','victor','whiskey','xray','yankee','zulu','amber','basil','cedar','dune','ember','fjord','grove','haven','iris','jade','kelp','lotus','maple','nova'][1 + (((i // 4) // 1600) % 40)]], ' ') || ' ' || ((i // 4))::VARCHAR) AS k, 'second ' || ((i // 8) % 13)::VARCHAR || ' padding' AS k2, (i % 7)::INTEGER AS x FROM range(400000) t(i);
+
+statement ok
+CHECKPOINT d;
+
+statement ok
+SET threads=1;
+
+# t_fsst at threads 1
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_fsst GROUP BY k)
+----
+100000	400000	10886360	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_fsst GROUP BY k)
+----
+100000	400000	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_fsst
+----
+100000	400000
+
+# t_mixed at threads 1
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k)
+----
+163840	491520	14624982	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_mixed GROUP BY k)
+----
+163840	491520	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_mixed
+----
+163840	491520
+
+# t_null at threads 1
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_null GROUP BY k)
+----
+90001	400000	9790724	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_null GROUP BY k)
+----
+90001	360007	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_null
+----
+90000	400000
+
+# t_inline at threads 1
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_inline GROUP BY k)
+----
+50000	400000	2311120	k0	k9999
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_inline GROUP BY k)
+----
+50000	350000	k0	k9999
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_inline
+----
+50000	400000
+
+# the top keys of t_mixed at threads 1
+query TI
+SELECT k, count(*)::BIGINT AS c FROM d.t_mixed GROUP BY k ORDER BY c DESC, k LIMIT 3
+----
+000125feb6f757626dab6a1c5f19e50c	3
+00029ac38c8d26bc32204b531db367d6	3
+0002b7d60d0551fed6d38e47391de95f	3
+
+# t_two: both keys grouped at threads 1
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) + length(k2))::BIGINT, min(k), max(k2) FROM (SELECT k, k2, count(*) AS c FROM d.t_two GROUP BY k, k2)
+----
+100000	400000	4344666	key alpha alpha alpha 0	second 9 padding
+
+# the borrowed keys consumed downstream: a join on the grouped output at threads 1
+query II
+SELECT count(*)::BIGINT, sum(length(a.k))::BIGINT FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) a JOIN (SELECT k FROM d.t_fsst GROUP BY k UNION ALL SELECT k FROM d.t_mixed GROUP BY k) b USING (k)
+----
+222880	6490472
+
+# a second aggregate over the first at threads 1
+query IITT
+SELECT c, count(*)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) GROUP BY c ORDER BY c
+----
+3	163840	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+# a window over the grouped keys at threads 1
+query IT
+SELECT sum(r)::BIGINT, max(k) FROM (SELECT k, row_number() OVER (ORDER BY k) AS r FROM (SELECT k FROM d.t_fsst GROUP BY k))
+----
+5000050000	key zulu zulu zulu 41025
+
+statement ok
+SET threads=4;
+
+# t_fsst at threads 4
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_fsst GROUP BY k)
+----
+100000	400000	10886360	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_fsst GROUP BY k)
+----
+100000	400000	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_fsst
+----
+100000	400000
+
+# t_mixed at threads 4
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k)
+----
+163840	491520	14624982	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_mixed GROUP BY k)
+----
+163840	491520	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_mixed
+----
+163840	491520
+
+# t_null at threads 4
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_null GROUP BY k)
+----
+90001	400000	9790724	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_null GROUP BY k)
+----
+90001	360007	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_null
+----
+90000	400000
+
+# t_inline at threads 4
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_inline GROUP BY k)
+----
+50000	400000	2311120	k0	k9999
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_inline GROUP BY k)
+----
+50000	350000	k0	k9999
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_inline
+----
+50000	400000
+
+# the top keys of t_mixed at threads 4
+query TI
+SELECT k, count(*)::BIGINT AS c FROM d.t_mixed GROUP BY k ORDER BY c DESC, k LIMIT 3
+----
+000125feb6f757626dab6a1c5f19e50c	3
+00029ac38c8d26bc32204b531db367d6	3
+0002b7d60d0551fed6d38e47391de95f	3
+
+# t_two: both keys grouped at threads 4
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) + length(k2))::BIGINT, min(k), max(k2) FROM (SELECT k, k2, count(*) AS c FROM d.t_two GROUP BY k, k2)
+----
+100000	400000	4344666	key alpha alpha alpha 0	second 9 padding
+
+# the borrowed keys consumed downstream: a join on the grouped output at threads 4
+query II
+SELECT count(*)::BIGINT, sum(length(a.k))::BIGINT FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) a JOIN (SELECT k FROM d.t_fsst GROUP BY k UNION ALL SELECT k FROM d.t_mixed GROUP BY k) b USING (k)
+----
+222880	6490472
+
+# a second aggregate over the first at threads 4
+query IITT
+SELECT c, count(*)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) GROUP BY c ORDER BY c
+----
+3	163840	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+# a window over the grouped keys at threads 4
+query IT
+SELECT sum(r)::BIGINT, max(k) FROM (SELECT k, row_number() OVER (ORDER BY k) AS r FROM (SELECT k FROM d.t_fsst GROUP BY k))
+----
+5000050000	key zulu zulu zulu 41025
+
+statement ok
+SET threads=8;
+
+# t_fsst at threads 8
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_fsst GROUP BY k)
+----
+100000	400000	10886360	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_fsst GROUP BY k)
+----
+100000	400000	key alpha alpha alpha 0	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_fsst
+----
+100000	400000
+
+# t_mixed at threads 8
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k)
+----
+163840	491520	14624982	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_mixed GROUP BY k)
+----
+163840	491520	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_mixed
+----
+163840	491520
+
+# t_null at threads 8
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_null GROUP BY k)
+----
+90001	400000	9790724	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_null GROUP BY k)
+----
+90001	360007	key amber alpha alpha 26	key zulu zulu zulu 41025
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_null
+----
+90000	400000
+
+# t_inline at threads 8
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) * c)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_inline GROUP BY k)
+----
+50000	400000	2311120	k0	k9999
+
+query IITT
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(k), max(k) FROM (SELECT k, count(DISTINCT x) AS n FROM d.t_inline GROUP BY k)
+----
+50000	350000	k0	k9999
+
+query II
+SELECT count(DISTINCT k)::BIGINT, count(*)::BIGINT FROM d.t_inline
+----
+50000	400000
+
+# the top keys of t_mixed at threads 8
+query TI
+SELECT k, count(*)::BIGINT AS c FROM d.t_mixed GROUP BY k ORDER BY c DESC, k LIMIT 3
+----
+000125feb6f757626dab6a1c5f19e50c	3
+00029ac38c8d26bc32204b531db367d6	3
+0002b7d60d0551fed6d38e47391de95f	3
+
+# t_two: both keys grouped at threads 8
+query IIITT
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(length(k) + length(k2))::BIGINT, min(k), max(k2) FROM (SELECT k, k2, count(*) AS c FROM d.t_two GROUP BY k, k2)
+----
+100000	400000	4344666	key alpha alpha alpha 0	second 9 padding
+
+# the borrowed keys consumed downstream: a join on the grouped output at threads 8
+query II
+SELECT count(*)::BIGINT, sum(length(a.k))::BIGINT FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) a JOIN (SELECT k FROM d.t_fsst GROUP BY k UNION ALL SELECT k FROM d.t_mixed GROUP BY k) b USING (k)
+----
+222880	6490472
+
+# a second aggregate over the first at threads 8
+query IITT
+SELECT c, count(*)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c FROM d.t_mixed GROUP BY k) GROUP BY c ORDER BY c
+----
+3	163840	000125feb6f757626dab6a1c5f19e50c	key zulu zulu zulu 105025
+
+# a window over the grouped keys at threads 8
+query IT
+SELECT sum(r)::BIGINT, max(k) FROM (SELECT k, row_number() OVER (ORDER BY k) AS r FROM (SELECT k FROM d.t_fsst GROUP BY k))
+----
+5000050000	key zulu zulu zulu 41025
+
+statement ok
+DETACH d;

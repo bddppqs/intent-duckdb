@@ -1,0 +1,70 @@
+# name: test/sql/aggregate/distinct/fused_aggregate_reserve.test
+# description: The fused kernel's reservation (one fetch_add with rollback, or a
+#              compare-and-swap loop): ungrouped and grouped count(DISTINCT x) over >= 2^20 rows at threads 1 and 8,
+#              expected rows in closed form from the generator, so the answers are the same under either reservation form
+#              and under any drain budget (a budget of 1 or 8 MiB forces the drain crossing; the
+#              default budget keeps every shape on the fused path); the Fused Distinct Aggregate marker carries the
+#              reserve= token on the JSON plan, and its drained_rows counter on the JSON profile. No require line.
+# group: [distinct]
+
+# u: x = i * 7919 mod 1000003 (a prime; 7919 is invertible mod it): 2,200,000 rows cover every residue, so 1,000,003
+# distinct x; no two adjacent rows are equal (nothing folds)
+statement ok
+CREATE TABLE u AS SELECT ((i * 7919) % 1000003)::BIGINT AS x FROM range(2200000) t(i);
+
+# g1: g = i % 1000 over x = i // 2000: each g holds 2,200 rows and 1,100 distinct x (rows i and i + 1000 share one pair)
+statement ok
+CREATE TABLE g1 AS SELECT (i % 1000)::INTEGER AS g, (i // 2000)::BIGINT AS x FROM range(2200000) t(i);
+
+# g2: g = i * 31 mod 97 over the u generator: every (g, x) pair is distinct, 97 groups of 22,680 or 22,681 rows
+statement ok
+CREATE TABLE g2 AS SELECT ((i * 31) % 97)::INTEGER AS g, ((i * 7919) % 1000003)::BIGINT AS x FROM range(2200000) t(i);
+
+# the EXPLAIN text: the reserve= token on the plan (either reservation form)
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM u
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*reserve=(ldadd|cas).*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS n FROM g1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*reserve=(ldadd|cas).*
+
+# the profile: the token and the drained_rows counter
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM u
+----
+analyzed_plan	<REGEX>:.*Fused Distinct Aggregate.*reserve=(ldadd|cas).*drained_rows=[0-9]+.*
+
+foreach threads 1 8
+
+statement ok
+SET threads=${threads}
+
+# ungrouped
+query I
+SELECT count(DISTINCT x) FROM u
+----
+1000003
+
+# grouped, one key, the kept rows 2,200,000 (nothing folds)
+query IIII
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(n), max(n) FROM (SELECT g, count(DISTINCT x) AS n FROM g1 GROUP BY g)
+----
+1000	1100000	1100	1100
+
+query II
+SELECT g, count(DISTINCT x) AS n FROM g1 GROUP BY g ORDER BY g LIMIT 3
+----
+0	1100
+1	1100
+2	1100
+
+# grouped, every pair distinct
+query IIII
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(n), max(n) FROM (SELECT g, count(DISTINCT x) AS n FROM g2 GROUP BY g)
+----
+97	2200000	22680	22681
+
+endloop

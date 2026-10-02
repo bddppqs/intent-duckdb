@@ -13,6 +13,8 @@
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 
+#include <type_traits>
+
 namespace duckdb {
 
 // structs
@@ -28,6 +30,22 @@ struct FrameBounds {
 
 // A set of window subframes for windowed EXCLUDE
 using SubFrames = vector<FrameBounds>;
+
+template <class... TYPES>
+struct AggregateRunVoid {
+	typedef void type;
+};
+
+//! Whether OP declares RunOperation<INPUT_TYPE, STATE, OP>(state, value, count): the explicit opt-in of an
+//! aggregate operation to run-aware updates (a run of `count` copies of `value`)
+template <class STATE, class INPUT_TYPE, class OP, class = void>
+struct AggregateHasRunOperation : std::false_type {};
+
+template <class STATE, class INPUT_TYPE, class OP>
+struct AggregateHasRunOperation<STATE, INPUT_TYPE, OP,
+                                typename AggregateRunVoid<decltype(OP::template RunOperation<INPUT_TYPE, STATE, OP>(
+                                    std::declval<STATE &>(), std::declval<const INPUT_TYPE &>(),
+                                    std::declval<idx_t>()))>::type> : std::true_type {};
 
 class AggregateExecutor {
 private:
@@ -265,6 +283,29 @@ public:
 	template <class STATE_TYPE, class OP>
 	static void NullaryUpdate(data_ptr_t state, AggregateInputData &aggr_input_data, idx_t count) {
 		OP::template ConstantOperation<STATE_TYPE, OP>(*reinterpret_cast<STATE_TYPE *>(state), aggr_input_data, count);
+	}
+
+	//! Run-aware nullary update: every row of every run counts (the rows are known to exist)
+	template <class STATE_TYPE, class OP>
+	static void NullaryRunUpdate(const uint16_t *run_counts, idx_t run_count, AggregateInputData &aggr_input_data,
+	                             data_ptr_t state) {
+		idx_t total = 0;
+		for (idx_t i = 0; i < run_count; i++) {
+			total += run_counts[i];
+		}
+		OP::template ConstantOperation<STATE_TYPE, OP>(*reinterpret_cast<STATE_TYPE *>(state), aggr_input_data, total);
+	}
+
+	//! Run-aware unary update over a batch of (value, run length) pairs with no NULL values
+	template <class STATE_TYPE, class INPUT_TYPE, class OP>
+	static void UnaryRunUpdate(Vector &run_values, const uint16_t *run_counts, idx_t run_count,
+	                           AggregateInputData &aggr_input_data, data_ptr_t state) {
+		D_ASSERT(run_values.GetVectorType() == VectorType::FLAT_VECTOR);
+		auto values = FlatVector::GetData<INPUT_TYPE>(run_values);
+		auto &state_ref = *reinterpret_cast<STATE_TYPE *>(state);
+		for (idx_t i = 0; i < run_count; i++) {
+			OP::template RunOperation<INPUT_TYPE, STATE_TYPE, OP>(state_ref, values[i], run_counts[i]);
+		}
 	}
 
 	template <class STATE_TYPE, class INPUT_TYPE, class OP>

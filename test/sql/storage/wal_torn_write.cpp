@@ -113,6 +113,57 @@ TEST_CASE("Test torn WAL writes followed by successful commits", "[storage][.]")
 	DeleteDatabase(storage_database);
 }
 
+TEST_CASE("Test torn WAL commits of optimistically written row groups", "[storage][.]") {
+	auto config = GetTestConfig();
+	auto storage_database = TestCreatePath("wal_torn_row_group_data");
+	auto storage_wal = storage_database + ".wal";
+
+	LocalFileSystem lfs;
+	config->options.checkpoint_wal_size = idx_t(-1);
+	config->options.checkpoint_on_shutdown = false;
+	config->options.abort_on_wal_failure = false;
+	DeleteDatabase(storage_database);
+	{
+		DuckDB db(storage_database, config.get());
+		Connection con(db);
+		REQUIRE_NO_FAIL(con.Query("CREATE TABLE t (b INTEGER, i BIGINT)"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+		// full row groups are written optimistically: the WAL holds their block pointers (ROW_GROUP_DATA)
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO t SELECT 1, i FROM range(500000) r(i)"));
+	}
+	// a writer stopped while committing: the WAL ends before the commit's WAL_FLUSH entry is complete
+	TruncateWAL(lfs, storage_wal, GetWALFileSize(lfs, storage_wal) - 1);
+	{
+		// the uncommitted rows are not visible, and the next commit is torn the same way
+		DuckDB db(storage_database, config.get());
+		Connection con(db);
+		auto result = con.Query("SELECT COUNT(*) FROM t");
+		REQUIRE(CHECK_COLUMN(result, 0, {0}));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO t SELECT 2, i FROM range(500000) r(i)"));
+	}
+	TruncateWAL(lfs, storage_wal, GetWALFileSize(lfs, storage_wal) - 1);
+	{
+		// neither torn insert is visible; a committed insert and a checkpoint keep the blocks consistent
+		DuckDB db(storage_database, config.get());
+		Connection con(db);
+		auto result = con.Query("SELECT COUNT(*) FROM t");
+		REQUIRE(CHECK_COLUMN(result, 0, {0}));
+		REQUIRE_NO_FAIL(con.Query("INSERT INTO t SELECT 3, i FROM range(500000) r(i)"));
+		REQUIRE_NO_FAIL(con.Query("SET debug_verify_blocks=true"));
+		REQUIRE_NO_FAIL(con.Query("CHECKPOINT"));
+	}
+	{
+		DuckDB db(storage_database, config.get());
+		Connection con(db);
+		// the sum modulo a prime keeps the expected value short
+		auto result = con.Query("SELECT b, COUNT(*), SUM(i)::BIGINT % 1000000007 FROM t GROUP BY b ORDER BY b");
+		REQUIRE(CHECK_COLUMN(result, 0, {3}));
+		REQUIRE(CHECK_COLUMN(result, 1, {500000}));
+		REQUIRE(CHECK_COLUMN(result, 2, {Value::BIGINT(999749132)}));
+	}
+	DeleteDatabase(storage_database);
+}
+
 static void FlipWALByte(FileSystem &fs, const string &path, idx_t byte_pos) {
 	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ);
 	auto wal_size = handle->GetFileSize();

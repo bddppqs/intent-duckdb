@@ -1,0 +1,110 @@
+# name: test/sql/aggregate/distinct/stored_hash_distinct.test
+# description: The stored row hash on the fused kernel's DISTINCT class over >= 2^20 rows: grouped on one key,
+#              on two keys at the 12-byte key bound, with many groups, with folded runs crossing chunk boundaries, and
+#              ungrouped; the answers from the generator, the field hash=stored on each JSON plan (the (g, x) build reads
+#              the stored bits; the group table still hashes g)
+# group: [distinct]
+
+# t1: g = i % 1000 over x = i // 2000: each g holds 2,200 rows and 1,100 distinct x; y a million distinct values
+statement ok
+CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS g, (i // 2000)::BIGINT AS x, ((i * 7919) % 1000003)::BIGINT AS y FROM range(2200000) t(i);
+
+# t2: runs crossing chunk boundaries (the fold): g = (i // 5000) % 50, x = i // 3000
+statement ok
+CREATE TABLE t2 AS SELECT ((i // 5000) % 50)::INTEGER AS g, (i // 3000)::BIGINT AS x FROM range(2200000) t(i);
+
+# t3: two SMALLINT keys and a BIGINT x (the 12-byte key region)
+statement ok
+CREATE TABLE t3 AS SELECT (i % 10)::SMALLINT AS g1, ((i // 10) % 20)::SMALLINT AS g2, (i // 400)::BIGINT AS x FROM range(2200000) t(i);
+
+# t4: 300,000 groups of 7 or 8 distinct x
+statement ok
+CREATE TABLE t4 AS SELECT (i % 300000)::INTEGER AS g, (i // 300000)::BIGINT AS x FROM range(2200000) t(i);
+
+# grouped, one key
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g)
+----
+1000	1100000	1100	1100
+
+query II
+SELECT g::BIGINT, count(DISTINCT x)::BIGINT AS u FROM t1 GROUP BY g ORDER BY g LIMIT 3
+----
+0	1100
+1	1100
+2	1100
+
+# grouped, one key, a million distinct values
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT y) AS u FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT FROM (SELECT g, count(DISTINCT y) AS u FROM t1 GROUP BY g)
+----
+1000	2200000	2200	2200
+
+# grouped, runs crossing chunk boundaries (the fold before the stored bits)
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM t2 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u FROM t2 GROUP BY g)
+----
+50	1027	18	21
+
+# grouped, two keys at the 12-byte bound
+query II
+EXPLAIN (FORMAT JSON) SELECT g1, g2, count(DISTINCT x) AS u FROM t3 GROUP BY g1, g2
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT FROM (SELECT g1, g2, count(DISTINCT x) AS u FROM t3 GROUP BY g1, g2)
+----
+200	1100000	5500	5500
+
+# grouped, many groups
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM t4 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT, count(*) FILTER (WHERE u = 8)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u FROM t4 GROUP BY g)
+----
+300000	2200000	7	8	100000
+
+# ungrouped: folded runs, and a million distinct values
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM t1
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query I
+SELECT count(DISTINCT x)::BIGINT FROM t1
+----
+1100
+
+query I
+SELECT count(DISTINCT x)::BIGINT FROM t2
+----
+734
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT y) FROM t1
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+query I
+SELECT count(DISTINCT y)::BIGINT FROM t1
+----
+1000003

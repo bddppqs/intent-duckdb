@@ -10,12 +10,88 @@
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 #include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/optimizer/join_filter_pushdown_optimizer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+
+#include <cstdlib>
 
 namespace duckdb {
+
+// The Top-N bound applied row by row: on the restricted path below, where a row the bound rejects provably never
+// reaches the heap, the bound is wrapped in an adaptive SelectivityOptionalFilter that the scan evaluates per vector
+// instead of a plain OptionalFilter used for zonemap checks only (kTopNRowwiseBound; off,
+// the plain wrapper everywhere).
+static bool RowwiseTopNBoundEnabled() {
+	return kTopNRowwiseBound;
+}
+
+//! The LogicalGet reached from the Top-N's child through projections and filters only, when it is DuckDB's own table
+//! scan: a projection of column references and a filter only drop rows or columns, so every row a bound rejects reaches
+//! the heap with the same order value and is rejected there too. Any other operator on the path (a join, a cross
+//! product, LIMIT, ORDER BY, TOP_N, DISTINCT, UNNEST, a set operation) or any other scan function yields nothing.
+static optional_ptr<LogicalGet> RowwiseTopNScan(LogicalOperator &child) {
+	reference<LogicalOperator> current = child;
+	while (current.get().type == LogicalOperatorType::LOGICAL_PROJECTION ||
+	       current.get().type == LogicalOperatorType::LOGICAL_FILTER) {
+		if (current.get().children.size() != 1) {
+			return nullptr;
+		}
+		current = *current.get().children[0];
+	}
+	if (current.get().type != LogicalOperatorType::LOGICAL_GET) {
+		return nullptr;
+	}
+	auto &get = current.get().Cast<LogicalGet>();
+	if (get.function.name != "seq_scan" || !get.GetTable()) {
+		return nullptr;
+	}
+	return &get;
+}
+
+//! The number of Top-N operators whose input is being optimized on this thread (TopN::Optimize is recursive and one
+//! query's optimizer runs on one thread): a Top-N found below another one feeds it, and its bound keeps the plain wrapper
+static thread_local idx_t rowwise_top_n_enclosing_count = 0;
+
+struct RowwiseTopNEnclosingScope {
+	RowwiseTopNEnclosingScope() {
+		rowwise_top_n_enclosing_count++;
+	}
+	~RowwiseTopNEnclosingScope() {
+		rowwise_top_n_enclosing_count--;
+	}
+};
+
+//! The order types whose bound is applied row by row: fixed-width integers, decimals, dates, times and timestamps,
+//! compared by the scan's constant-comparison path on the column's own storage type
+static bool RowwiseTopNBoundType(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::DECIMAL:
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return true;
+	default:
+		return false;
+	}
+}
 
 TopN::TopN(ClientContext &context_p) : context(context_p) {
 }
@@ -112,6 +188,13 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 	// put the filter into the Top-N clause
 	op.dynamic_filter = filter_data;
 
+	// the scan on which the bound is applied row by row: NULLS LAST only (a NULLS FIRST bound is an OR with IS NULL),
+	// and never for a Top-N whose result feeds another Top-N
+	optional_ptr<LogicalGet> rowwise_get;
+	if (!nulls_first && rowwise_top_n_enclosing_count == 0 && RowwiseTopNBoundEnabled()) {
+		rowwise_get = RowwiseTopNScan(*op.children[0]);
+	}
+
 	for (auto &target : pushdown_targets) {
 		auto &get = target.get;
 		D_ASSERT(target.columns.size() == 1);
@@ -126,7 +209,16 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 			or_filter->child_filters.push_back(std::move(pushed_filter));
 			pushed_filter = std::move(or_filter);
 		}
-		auto optional_filter = make_uniq<OptionalFilter>(std::move(pushed_filter));
+		unique_ptr<TableFilter> optional_filter;
+		if (rowwise_get && &get == rowwise_get.get() && target.columns[0].storage_type == type &&
+		    RowwiseTopNBoundType(type)) {
+			// applied row by row while it filters enough (the join min/max policy), zonemap-only once it does not
+			optional_filter = make_uniq<SelectivityOptionalFilter>(std::move(pushed_filter),
+			                                                       SelectivityOptionalFilter::MIN_MAX_THRESHOLD,
+			                                                       SelectivityOptionalFilter::MIN_MAX_CHECK_N, true);
+		} else {
+			optional_filter = make_uniq<OptionalFilter>(std::move(pushed_filter));
+		}
 
 		// push the filter into the table scan
 		auto &column_index = get.GetColumnIds()[col_idx];
@@ -180,6 +272,12 @@ unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_TOP_N) {
 		PushdownDynamicFilters(op->Cast<LogicalTopN>());
+		// the operators below this Top-N feed it: a Top-N among them keeps the plain wrapper
+		RowwiseTopNEnclosingScope enclosing;
+		for (auto &child : op->children) {
+			child = Optimize(std::move(child));
+		}
+		return op;
 	}
 
 	for (auto &child : op->children) {

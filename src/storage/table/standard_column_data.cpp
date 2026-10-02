@@ -6,6 +6,7 @@
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -59,6 +60,24 @@ void StandardColumnData::InitializeScanWithOffset(ColumnScanState &state, idx_t 
 idx_t StandardColumnData::Scan(TransactionData transaction, idx_t vector_index, ColumnScanState &state, Vector &result,
                                idx_t target_count) {
 	D_ASSERT(state.offset_in_column == state.child_states[0].offset_in_column);
+	if (dict_global::DictGlobalEnabled() && !state.child_states.empty() &&
+	    ColumnData::GetVectorScanType(state, target_count, result) == ScanVectorType::SCAN_FLAT_VECTOR &&
+	    validity->GetVectorScanType(state.child_states[0], target_count, result) ==
+	        ScanVectorType::SCAN_ENTIRE_VECTOR &&
+	    TryScanGlobalDictionary(state, result, target_count)) {
+		// a straddling vector of a published column over the global dictionary; the validity child (one
+		// segment, the NULLs are code 0 of the dictionary) is advanced as for an entire vector
+		validity->ScanVector(transaction, vector_index, state.child_states[0], result, target_count,
+		                     ScanVectorType::SCAN_ENTIRE_VECTOR, state.update_scan_type);
+		return target_count;
+	}
+	if (dict_global::DictGlobalEnabled() && !state.child_states.empty() && target_count < STANDARD_VECTOR_SIZE &&
+	    GetVectorScanType(state, target_count, result) == ScanVectorType::SCAN_ENTIRE_VECTOR &&
+	    TryScanGlobalDictionary(state, result, target_count)) {
+		validity->ScanVector(transaction, vector_index, state.child_states[0], result, target_count,
+		                     ScanVectorType::SCAN_ENTIRE_VECTOR, state.update_scan_type);
+		return target_count;
+	}
 	auto scan_type = GetVectorScanType(state, target_count, result);
 	auto scan_count =
 	    ScanVector(transaction, vector_index, state, result, target_count, scan_type, state.update_scan_type);

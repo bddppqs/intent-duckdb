@@ -1,0 +1,220 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_segment_skip.test
+# description: The per-segment dictionary skip: a canonical contains / NOT contains filter (and LIKE '%x%', which the optimizer rewrites to contains) over persistent DICT_FSST- and DICTIONARY-mode segments, most of which hold no passing entry, with segment starts inside a vector, NULLs, an all-NULL segment, the empty needle, a NOT filter over segments whose every entry contains the needle, the non-canonical shapes (ILIKE, a prefix, an inner wildcard), an update inside a needle-free segment and a transient table; each query twice per server (the second read from the verdict slot) at threads 1 and 8; the answers are the plain engine answers
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load {TEST_DIR}/dict_fsst_segment_skip.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_skip AS SELECT i::BIGINT AS i, CASE WHEN i % 1000 = 999 THEN NULL WHEN i IN (5, 100005, 200005) THEN 'https://example.com/needle/' || i::VARCHAR ELSE 'https://example.com/page/' || md5(i::VARCHAR) END AS s, CASE WHEN i = 150000 THEN 'dneedle' ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS d FROM range(300000) tbl(i)
+
+statement ok
+CREATE TABLE t_all AS SELECT i::BIGINT AS i, CASE WHEN i % 997 = 0 THEN NULL WHEN i < 150000 THEN 'https://x.example.com/' || md5(i::VARCHAR) ELSE 'https://y.example.org/' || md5(i::VARCHAR) END AS s FROM range(300000) tbl(i)
+
+statement ok
+CREATE TABLE t_null AS SELECT i::BIGINT AS i, CASE WHEN i < 200000 THEN NULL ELSE 'https://example.com/v/' || md5(i::VARCHAR) END AS s FROM range(300000) tbl(i)
+
+statement ok
+CREATE TABLE t_upd AS SELECT * FROM t_skip
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the geometry, read from storage_info: many DICT_FSST-mode segments of s, most starting inside a vector; d in DICTIONARY mode
+
+query I
+SELECT count(*) > 20 AND bool_and(compression = 'DICT_FSST') AND count(*) FILTER (WHERE segment_info LIKE 'DICT_FSST:%') > 20 FROM pragma_storage_info('t_skip') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 10 FROM pragma_storage_info('t_skip') WHERE column_name = 's' AND segment_type = 'VARCHAR' AND start > 0 AND start % 2048 <> 0
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICTIONARY:%') FROM pragma_storage_info('t_skip') WHERE column_name = 'd' AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+loop r 0 2
+
+# contains, needle in 3 of the segments
+query I
+SELECT count(*) FROM t_skip WHERE contains(s, 'needle')
+----
+3
+
+# contains, the rows
+query I
+SELECT string_agg(i::VARCHAR, ',' ORDER BY i) FROM t_skip WHERE contains(s, 'needle')
+----
+5,100005,200005
+
+# LIKE '%x%' (rewritten to contains)
+query I
+SELECT count(*) FROM t_skip WHERE s LIKE '%needle%'
+----
+3
+
+# NOT contains
+query I
+SELECT count(*) FROM t_skip WHERE NOT contains(s, 'needle')
+----
+299697
+
+# NOT LIKE '%x%'
+query I
+SELECT count(*) FROM t_skip WHERE s NOT LIKE '%needle%'
+----
+299697
+
+# the empty needle passes every non-NULL entry
+query I
+SELECT count(*) FROM t_skip WHERE contains(s, '')
+----
+299700
+
+# ILIKE (never canonical)
+query I
+SELECT count(*) FROM t_skip WHERE s ILIKE '%NEEDLE%'
+----
+3
+
+# a prefix (never canonical)
+query I
+SELECT count(*) FROM t_skip WHERE s LIKE 'https://example.com/needle/1%'
+----
+1
+
+# an inner wildcard (never canonical)
+query I
+SELECT count(*) FROM t_skip WHERE s LIKE '%need_e%'
+----
+3
+
+# two canonical filters on two columns
+query I
+SELECT count(*) FROM t_skip WHERE contains(s, 'needle') AND contains(d, 'need')
+----
+0
+
+# contains on the DICTIONARY-mode column
+query II
+SELECT count(*), min(i) FROM t_skip WHERE contains(d, 'needle')
+----
+1	150000
+
+# NOT contains on the DICTIONARY-mode column, every entry containing the needle
+query I
+SELECT count(*) FROM t_skip WHERE NOT contains(d, 'd')
+----
+0
+
+# the same predicates evaluated above the scan (FILTER is never pushed into the scan)
+query II
+SELECT count(*) FILTER (WHERE contains(s, 'needle')), count(*) FILTER (WHERE NOT contains(s, 'needle')) FROM t_skip
+----
+3	299697
+
+# a needle no entry holds
+query II
+SELECT count(*), min(s) FROM t_skip WHERE contains(s, 'no-such-needle')
+----
+0	NULL
+
+# NOT contains skips only segments whose every non-NULL entry contains the needle
+query I
+SELECT count(*) FROM t_all WHERE NOT contains(s, 'x.example')
+----
+149850
+
+# contains on the same table
+query I
+SELECT count(*) FROM t_all WHERE contains(s, 'x.example')
+----
+149849
+
+# NOT contains, every non-NULL entry contains the needle
+query I
+SELECT count(*) FROM t_all WHERE NOT contains(s, 'example')
+----
+0
+
+# an all-NULL segment is skipped; NULL passes neither form
+query I
+SELECT count(*) FROM t_null WHERE contains(s, 'example')
+----
+100000
+
+# NOT contains over NULL and matching entries
+query I
+SELECT count(*) FROM t_null WHERE NOT contains(s, 'example')
+----
+0
+
+# the empty needle over an all-NULL segment
+query I
+SELECT count(*) FROM t_null WHERE contains(s, '')
+----
+100000
+
+# the empty needle, the all-NULL rows only
+query I
+SELECT count(*) FROM t_null WHERE i < 200000 AND contains(s, '')
+----
+0
+
+endloop
+
+endloop
+
+# a transient table: never skipped by the domain check, the same answers
+
+statement ok
+CREATE TEMPORARY TABLE t_tmp AS SELECT * FROM t_skip
+
+query II
+SELECT (SELECT count(*) FROM t_tmp WHERE contains(s, 'needle')), (SELECT count(*) FROM t_tmp WHERE NOT contains(s, 'needle'))
+----
+3	299697
+
+# an update inside a needle-free segment: no skip on a column with updates
+
+query I
+SELECT count(*) FROM t_upd WHERE contains(s, 'needle')
+----
+3
+
+statement ok
+UPDATE t_upd SET s = 'https://example.com/late-needle' WHERE i = 250000
+
+loop r 0 2
+
+query I
+SELECT string_agg(i::VARCHAR, ',' ORDER BY i) FROM t_upd WHERE contains(s, 'needle')
+----
+5,100005,200005,250000
+
+endloop
+
+statement ok
+CHECKPOINT
+
+restart
+
+query I
+SELECT string_agg(i::VARCHAR, ',' ORDER BY i) FROM t_upd WHERE contains(s, 'needle')
+----
+5,100005,200005,250000

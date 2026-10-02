@@ -125,6 +125,14 @@ public:
 	//! Updates the batch index of a pipeline (and returns the new minimum batch index)
 	idx_t UpdateBatchIndex(idx_t old_index, idx_t new_index);
 
+	//! Whether a sequential (single-task) pipeline runs its task on the scheduling thread first
+	static bool InlineSingleTaskEnabled();
+	//! True on this thread while Event::CompleteDependency schedules its event, the only path that reaches
+	//! Pipeline::Schedule and one that holds no executor lock
+	static bool &SchedulingCompletedDependency();
+	//! True on this thread while ScheduleSequentialTask hands its one task to Event::SetTasks to run inline
+	static bool &InlineTaskRequested();
+
 private:
 	//! Whether or not the pipeline has been readied
 	bool ready;

@@ -1,0 +1,422 @@
+# name: test/sql/aggregate/distinct/mixed_distinct_fold.test
+# description: The mixed DISTINCT shape (one count(DISTINCT x) with one to three non-distinct aggregates of the admitted kinds,
+#              none reading x): every admitted shape over >= 2^20 rows (grouped on one key, on two keys at the 12-byte key bound,
+#              ungrouped; runs that fold; many groups; negative inputs and sums that do not divide), expected answers in closed
+#              form (computed by the general path), an EXPLAIN per shape asserting the Fused Distinct Aggregate marker (its
+#              absence on the refused twins: the shared-input shapes sum(x) and avg(x), four non-distinct aggregates,
+#              avg(INTEGER), a FILTER, two distinct aggregates, a nullable input), and the stale-plan NULL cells (a NULL in g,
+#              in x and in a summed input after PREPARE: the drain; a NULL in a counted column, which reaches the operator as
+#              count_star(): no crossing). Every expectation of this file holds whether or not an admitted shape drains
+#              (the plain EXPLAIN markers are plan-time)
+# group: [distinct]
+
+# t1: g = i % 1000 over x = i // 2000 (each g holds 2,200 rows and 1,100 distinct x); SMALLINT s, INTEGER z, BIGINT b; negative
+# inputs whose group sums do not divide by 2,200: SMALLINT n in [-7, 5] and INTEGER m in [-9, 7]
+
+statement ok
+CREATE TABLE t1 AS SELECT (i % 1000)::INTEGER AS g, (i // 2000)::BIGINT AS x, (i % 7)::SMALLINT AS s, (i * 3)::INTEGER AS z, (i * 5)::BIGINT AS b, ((i % 13) - 7)::SMALLINT AS n, ((i % 17) - 9)::INTEGER AS m FROM range(2200000) t(i);
+
+# t2: runs crossing chunk boundaries (the fold engages): g = (i // 5000) % 50, x = i // 3000, a negative SMALLINT v in [-4, 2], a
+# SMALLINT w
+
+statement ok
+CREATE TABLE t2 AS SELECT ((i // 5000) % 50)::INTEGER AS g, (i // 3000)::BIGINT AS x, ((i % 7) - 4)::SMALLINT AS v, (i % 101)::SMALLINT AS w FROM range(2200000) t(i);
+
+# t3: two SMALLINT keys and a BIGINT x (the 12-byte key region): 200 groups; SMALLINT w and a negative SMALLINT n
+
+statement ok
+CREATE TABLE t3 AS SELECT (i % 10)::SMALLINT AS g1, ((i // 10) % 20)::SMALLINT AS g2, (i // 400)::BIGINT AS x, (i % 1500)::SMALLINT AS w, ((i % 7) - 4)::SMALLINT AS n FROM range(2200000) t(i);
+
+# t4: a SMALLINT x (the shared-input twins: sum(x), avg(x) and count(x) are admitted kinds over it) beside a SMALLINT y
+
+statement ok
+CREATE TABLE t4 AS SELECT (i % 500)::INTEGER AS g, (i % 3000)::SMALLINT AS x, (i % 17)::SMALLINT AS y FROM range(2200000) t(i);
+
+# t5: 300,000 groups (the companion grows past its first tables): each g holds 7 or 8 distinct x
+
+statement ok
+CREATE TABLE t5 AS SELECT (i % 300000)::INTEGER AS g, (i // 300000)::BIGINT AS x, ((i % 3) - 1)::SMALLINT AS s FROM range(2200000) t(i);
+
+# grouped, one key: count_star, sum(SMALLINT) and avg(SMALLINT) beside the distinct count
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, sum(round(a * c))::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a FROM t1 GROUP BY g)
+----
+1000	1100000	2200000	6599995	6599995
+
+query IIIII
+SELECT g, u, c, ss, round(a * c)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, avg(s) AS a FROM t1 GROUP BY g) ORDER BY ss DESC, g LIMIT 3
+----
+6	1100	2200	6605	6605
+13	1100	2200	6605	6605
+20	1100	2200	6605	6605
+
+# grouped, one key: sum_no_overflow(INTEGER), sum_no_overflow(BIGINT) and count(INTEGER) beside the distinct count
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(z) AS sz, sum(b) AS sb, count(z) AS cz FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(sz)::BIGINT, sum(sb)::BIGINT, sum(cz)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(z) AS sz, sum(b) AS sb, count(z) AS cz FROM t1 GROUP BY g)
+----
+1000	1100000	7259996700000	12099994500000	2200000
+
+query IIIII
+SELECT g, u, sz, sb, cz FROM (SELECT g, count(DISTINCT x) AS u, sum(z) AS sz, sum(b) AS sb, count(z) AS cz FROM t1 GROUP BY g) ORDER BY g LIMIT 3
+----
+0	1100	7256700000	12094500000	2200
+1	1100	7256706600	12094511000	2200
+2	1100	7256713200	12094522000	2200
+
+# grouped, one key: negative inputs (sums that do not divide by a group's row count)
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(n) AS sn, avg(n) AS an, sum(m) AS sm FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(sn)::BIGINT, sum(round(an * 2200))::BIGINT, sum(sm)::BIGINT, min(sn)::BIGINT, max(sn)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(n) AS sn, avg(n) AS an, sum(m) AS sm FROM t1 GROUP BY g)
+----
+1000	1100000	-2200015	-2200015	-2200026	-2215	-2185
+
+query IIIII
+SELECT g, u, sn, round(an * 2200)::BIGINT, sm FROM (SELECT g, count(DISTINCT x) AS u, sum(n) AS sn, avg(n) AS an, sum(m) AS sm FROM t1 GROUP BY g) ORDER BY sn, g LIMIT 3
+----
+2	1100	-2215	-2215	-2203
+15	1100	-2215	-2215	-2197
+28	1100	-2215	-2215	-2191
+
+# grouped, one key: one non-distinct aggregate beside the distinct count (count_star alone; sum over a negative input alone)
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, min(c), max(c) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM t1 GROUP BY g)
+----
+1000	1100000	2200000	2200	2200
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(n) AS sn FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(sn)::BIGINT, min(sn)::BIGINT, max(sn)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(n) AS sn FROM t1 GROUP BY g)
+----
+1000	1100000	-2200015	-2215	-2185
+
+# grouped, runs crossing chunk boundaries (the fold engages on the (g, x) rows while the companion counts every row)
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(v) AS sv, avg(w) AS aw FROM t2 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(sv)::BIGINT, sum(round(aw * c))::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(v) AS sv, avg(w) AS aw FROM t2 GROUP BY g)
+----
+50	1027	2200000	-2200005	109999253
+
+query IIIII
+SELECT g, u, c, sv, round(aw * c)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(v) AS sv, avg(w) AS aw FROM t2 GROUP BY g) ORDER BY g LIMIT 3
+----
+0	21	45000	-45006	2248873
+1	21	45000	-44998	2251173
+2	21	45000	-44997	2248827
+
+# grouped, two keys at the 12-byte bound: count_star, avg(SMALLINT) and a negative sum
+
+query II
+EXPLAIN SELECT g1, g2, count(DISTINCT x) AS u, count(*) AS c, avg(w) AS aw, sum(n) AS sn FROM t3 GROUP BY g1, g2
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(round(aw * c))::BIGINT, sum(sn)::BIGINT, min(sn)::BIGINT, max(sn)::BIGINT FROM (SELECT g1, g2, count(DISTINCT x) AS u, count(*) AS c, avg(w) AS aw, sum(n) AS sn FROM t3 GROUP BY g1, g2)
+----
+200	1100000	2200000	1648650000	-2200005	-11004	-10996
+
+query IIIIII
+SELECT g1, g2, u, c, round(aw * c)::BIGINT, sn FROM (SELECT g1, g2, count(DISTINCT x) AS u, count(*) AS c, avg(w) AS aw, sum(n) AS sn FROM t3 GROUP BY g1, g2) ORDER BY g1, g2 LIMIT 3
+----
+0	0	5500	11000	7698500	-11004
+0	1	5500	11000	7808500	-11002
+0	2	5500	11000	7918500	-11000
+
+# grouped, many groups (the companion grows): count_star and a negative sum
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t5 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, count(*) FILTER (WHERE u = 8)::BIGINT, min(ss)::BIGINT, max(ss)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t5 GROUP BY g)
+----
+300000	2200000	2200000	-1	100000	-8	8
+
+# ungrouped: count_star, sum(SMALLINT) and avg(SMALLINT); negative inputs
+
+query II
+EXPLAIN SELECT count(DISTINCT x), count(*), sum(s), avg(s) FROM t1
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIII
+SELECT count(DISTINCT x), count(*), sum(s), round(avg(s) * 2200000)::BIGINT FROM t1
+----
+1100	2200000	6599995	6599995
+
+query II
+EXPLAIN SELECT count(DISTINCT x), sum(n), avg(n), sum(m) FROM t1
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIII
+SELECT count(DISTINCT x), sum(n), round(avg(n) * 2200000)::BIGINT, sum(m) FROM t1
+----
+1100	-2200015	-2200015	-2200026
+
+query II
+EXPLAIN SELECT count(DISTINCT x), count(*), sum(v), count(w) FROM t2
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIII
+SELECT count(DISTINCT x), count(*), sum(v), count(w) FROM t2
+----
+734	2200000	-2200005	2200000
+
+# the shared-input twins: sum(x) and avg(x) beside count(DISTINCT x) take the general path; the admitted twin reads y.
+# count(x) over a NOT NULL x reaches the operator as count_star() (the optimizer's count rewrite), so its marker is not
+# asserted here; its answer is
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(x) AS v FROM t4 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(v)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(x) AS v FROM t4 GROUP BY g)
+----
+500	3000	3297900000
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, avg(x) AS v FROM t4 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(round(v * 4400))::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, avg(x) AS v FROM t4 GROUP BY g)
+----
+500	3000	3297900000
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(v)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(x) AS v FROM t4 GROUP BY g)
+----
+500	3000	2200000
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(y) AS sy FROM t4 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(sy)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(y) AS sy FROM t4 GROUP BY g)
+----
+500	3000	17599974
+
+query II
+EXPLAIN SELECT count(DISTINCT x), sum(x) FROM t4
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query II
+SELECT count(DISTINCT x), sum(x) FROM t4
+----
+3000	3297900000
+
+# other refused twins: four non-distinct aggregates (sum(z) keeps the fifth aggregate in the plan), avg(INTEGER), a FILTER,
+# two distinct aggregates beside a non-distinct one
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, sum(z) AS sz, sum(n) AS sn FROM t1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, sum(sz)::BIGINT, sum(sn)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, sum(z) AS sz, sum(n) AS sn FROM t1 GROUP BY g)
+----
+1000	1100000	2200000	6599995	7259996700000	-2200015
+
+# the same shape with count(z) over the NOT NULL z: the optimizer rewrites count(z) to count_star() and merges it with
+# count(*), so the operator holds three non-distinct aggregates beside the distinct count and the mixed class attaches
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, count(z) AS cz, sum(n) AS sn FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, sum(cz)::BIGINT, sum(sn)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, count(z) AS cz, sum(n) AS sn FROM t1 GROUP BY g)
+----
+1000	1100000	2200000	6599995	2200000	-2200015
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, avg(z) AS az FROM t1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(round(az * 2200))::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, avg(z) AS az FROM t1 GROUP BY g)
+----
+1000	1100000	7259996700000
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, sum(s) FILTER (WHERE s > 2) AS ss FROM t1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(ss)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, sum(s) FILTER (WHERE s > 2) AS ss FROM t1 GROUP BY g)
+----
+1000	1100000	5657137
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(DISTINCT s) AS us, count(*) AS c FROM t1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(us)::BIGINT, sum(c)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(DISTINCT s) AS us, count(*) AS c FROM t1 GROUP BY g)
+----
+1000	1100000	7000	2200000
+
+# a nullable input holding NULLs: refused, the answer the general path's
+
+statement ok
+CREATE TABLE tn AS SELECT (i % 100)::INTEGER AS g, (i // 50)::BIGINT AS x, CASE WHEN i % 97 = 0 THEN NULL ELSE (i % 7)::SMALLINT END AS s FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(s) AS cs, sum(s) AS ss FROM tn GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, sum(cs)::BIGINT, sum(ss)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(s) AS cs, sum(s) AS ss FROM tn GROUP BY g)
+----
+100	1100000	1088659	3265977
+
+# stale plans: each statement prepared while its table holds no NULL (the fused EXPLAIN text), then a NULL inserted in g, in x, in a
+# summed input and in a counted column in turn, then executed: a NULL in g, x or the summed input is a crossing that drains the
+# thread (the (g, x) rows to the distinct table, the companion re-expanded into the regular sink); count(c) over a column that
+# held no NULL reaches the operator as count_star() (the optimizer's count rewrite), so its NULL is no crossing; every answer
+# is the general path's under the same stale plan
+
+statement ok
+CREATE TABLE ts_g AS SELECT (i % 100)::INTEGER AS g, (i // 50)::BIGINT AS x, ((i % 7) - 3)::SMALLINT AS s, (i % 13)::INTEGER AS c FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_g GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+statement ok
+PREPARE p_g AS SELECT count(*)::BIGINT, count(g)::BIGINT, sum(u)::BIGINT, sum(n)::BIGINT, sum(ss)::BIGINT, sum(cc)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_g GROUP BY g);
+
+statement ok
+INSERT INTO ts_g VALUES (NULL, 7, 1, 2);
+
+query IIIIII
+EXECUTE p_g
+----
+101	101	1100001	1100001	-2	1100001
+
+statement ok
+CREATE TABLE ts_x AS SELECT (i % 100)::INTEGER AS g, (i // 50)::BIGINT AS x, ((i % 7) - 3)::SMALLINT AS s, (i % 13)::INTEGER AS c FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_x GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+statement ok
+PREPARE p_x AS SELECT count(*)::BIGINT, count(g)::BIGINT, sum(u)::BIGINT, sum(n)::BIGINT, sum(ss)::BIGINT, sum(cc)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_x GROUP BY g);
+
+statement ok
+INSERT INTO ts_x VALUES (3, NULL, 1, 2);
+
+query IIIIII
+EXECUTE p_x
+----
+100	100	1100001	1100001	-2	1100001
+
+statement ok
+CREATE TABLE ts_s AS SELECT (i % 100)::INTEGER AS g, (i // 50)::BIGINT AS x, ((i % 7) - 3)::SMALLINT AS s, (i % 13)::INTEGER AS c FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_s GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+statement ok
+PREPARE p_s AS SELECT count(*)::BIGINT, count(g)::BIGINT, sum(u)::BIGINT, sum(n)::BIGINT, sum(ss)::BIGINT, sum(cc)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_s GROUP BY g);
+
+statement ok
+INSERT INTO ts_s VALUES (3, 7, NULL, 2);
+
+query IIIIII
+EXECUTE p_s
+----
+100	100	1100001	1100001	-3	1100001
+
+statement ok
+CREATE TABLE ts_c AS SELECT (i % 100)::INTEGER AS g, (i // 50)::BIGINT AS x, ((i % 7) - 3)::SMALLINT AS s, (i % 13)::INTEGER AS c FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_c GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+statement ok
+PREPARE p_c AS SELECT count(*)::BIGINT, count(g)::BIGINT, sum(u)::BIGINT, sum(n)::BIGINT, sum(ss)::BIGINT, sum(cc)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS n, sum(s) AS ss, count(c) AS cc FROM ts_c GROUP BY g);
+
+statement ok
+INSERT INTO ts_c VALUES (3, 7, 1, NULL);
+
+query IIIIII
+EXECUTE p_c
+----
+100	100	1100001	1100001	-2	1100001
+
+# the ungrouped stale plan: a NULL summed input
+
+statement ok
+CREATE TABLE ts_u AS SELECT (i // 50)::BIGINT AS x, ((i % 7) - 3)::SMALLINT AS s, (i % 13)::INTEGER AS c FROM range(1100000) t(i);
+
+query II
+EXPLAIN SELECT count(DISTINCT x), count(*), sum(s), count(c) FROM ts_u
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+statement ok
+PREPARE p_u AS SELECT count(DISTINCT x), count(*), sum(s), count(c) FROM ts_u;
+
+statement ok
+INSERT INTO ts_u VALUES (7, NULL, 2);
+
+query IIII
+EXECUTE p_u
+----
+22000	1100001	-3	1100001

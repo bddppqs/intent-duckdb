@@ -1,0 +1,329 @@
+# name: test/sql/optimizer/first_keys_aggregate_limit.test
+# description: GROUP BY ... LIMIT k without ORDER BY is rewritten into a first-k-keys pass (FirstKeysAggregate)
+# group: [optimizer]
+
+# no PRAGMA enable_verification: its serializer round trip (Planner::VerifyPlan) replaces the optimized plan by a
+# deserialized copy, and the first-keys marker is deliberately not serialized (the copy is the standard plan, still exact)
+
+statement ok
+CREATE TABLE fk(u BIGINT NOT NULL, s VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO fk SELECT (i // 100)::BIGINT, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN '' ELSE 'p' || (i % 3)::VARCHAR END, i::INTEGER FROM range(10000) t(i);
+
+# the rewrite engages on a two-key GROUP BY ... LIMIT
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 10
+----
+physical_plan	<REGEX>:.*STREAMING_FIRST_KEYS.*
+
+# k rows, every one a member of the full relation with its exact count, all distinct
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 10)
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c
+----
+10
+
+query I
+SELECT count(DISTINCT (u, s)) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 10)
+----
+10
+
+# every admitted aggregate is exact
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c, count(v) AS cv, sum(v) AS sv, min(v) AS mn, max(v) AS mx, avg(v) AS av FROM fk GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c, count(v) AS cv, sum(v) AS sv, min(v) AS mn, max(v) AS mx, avg(v) AS av FROM fk GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c AND l.cv = r.cv AND l.sv = r.sv AND l.mn = r.mn AND l.mx = r.mx AND l.av = r.av
+----
+10
+
+# LIMIT 1 and LIMIT 1024 (all 500 groups) are admitted
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 1)
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 1024)
+----
+500
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 1024) l JOIN (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c
+----
+500
+
+# k larger than the number of groups: every group with its exact count; the NULL key group is counted once
+query II
+SELECT count(*), sum(c) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY u, s LIMIT 10)
+----
+5	100
+
+query I
+SELECT c FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY u, s LIMIT 10) WHERE s IS NULL
+----
+15
+
+query I
+SELECT c FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY u, s LIMIT 10) WHERE s = ''
+----
+17
+
+# an input WHERE on a non-key column is honoured
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE v % 3 = 0 GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c FROM fk WHERE v % 3 = 0 GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c
+----
+10
+
+# empty input
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u < 0 GROUP BY u, s LIMIT 10)
+----
+0
+
+# all-NULL keys form one group
+statement ok
+CREATE TABLE nk(u BIGINT, s VARCHAR);
+
+statement ok
+INSERT INTO nk SELECT NULL, NULL FROM range(3000);
+
+query III
+SELECT u, s, count(*) FROM nk GROUP BY u, s LIMIT 10
+----
+NULL	NULL	3000
+
+# fewer than k distinct keys in the first 2048 rows: the pass continues
+statement ok
+CREATE TABLE lk(u BIGINT NOT NULL, s VARCHAR);
+
+statement ok
+INSERT INTO lk SELECT (CASE WHEN i < 5000 THEN i % 3 ELSE 10 + i % 20 END)::BIGINT, 'k' FROM range(9000) t(i);
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM lk GROUP BY u, s LIMIT 10)
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM lk GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c FROM lk GROUP BY u, s) r ON l.u = r.u AND l.s = r.s AND l.c = r.c
+----
+10
+
+# PREPARE / EXECUTE twice
+statement ok
+PREPARE fkp AS SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c
+
+query I
+EXECUTE fkp
+----
+10
+
+query I
+EXECUTE fkp
+----
+10
+
+# disabling the optimizer restores the standard plan
+statement ok
+PRAGMA disabled_optimizers='first_keys_aggregate'
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 10) l JOIN (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s) r ON l.u = r.u AND l.s IS NOT DISTINCT FROM r.s AND l.c = r.c
+----
+10
+
+statement ok
+PRAGMA disabled_optimizers=''
+
+# non-admitted shapes keep the standard plan
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 10 OFFSET 2
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 0
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 10%
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT 1025
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s ORDER BY u, s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s HAVING count(*) > 1 LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(DISTINCT v) FROM fk GROUP BY u, s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FILTER (WHERE v > 5) FROM fk GROUP BY u, s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, first(v ORDER BY v) FROM fk GROUP BY u, s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY ROLLUP (u, s) LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u % 10, count(*) FROM fk GROUP BY u % 10 LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT fk.u, fk.s, count(*) FROM fk JOIN lk ON fk.u = lk.u GROUP BY fk.u, fk.s LIMIT 10
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+# their results are those of the standard plan
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY u, s LIMIT 10 OFFSET 2)
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 0)
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT 1025)
+----
+500
+
+query III
+SELECT u, s, count(*) FROM fk WHERE u = 0 GROUP BY u, s ORDER BY s NULLS FIRST LIMIT 2
+----
+0	NULL	15
+0	(empty)	17
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY u, s HAVING count(*) >= 15 LIMIT 10)
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY GROUPING SETS ((u, s), (u)) LIMIT 10)
+----
+6
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk WHERE u = 0 GROUP BY ROLLUP (u, s) LIMIT 10)
+----
+7
+
+query I
+SELECT count(*) FROM (SELECT u % 10 AS m, count(*) AS c FROM fk GROUP BY u % 10 LIMIT 10)
+----
+10
+
+# a non-constant LIMIT is not rewritten
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk GROUP BY u, s LIMIT (SELECT 10)
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM fk GROUP BY u, s LIMIT (SELECT 10))
+----
+10
+
+# nested (STRUCT, LIST) and INTERVAL group keys are not rewritten: the pushed row-level key filter cannot evaluate them
+statement ok
+CREATE TABLE tk(st STRUCT(a INTEGER, b VARCHAR), li INTEGER[], iv INTERVAL, v INTEGER);
+
+statement ok
+INSERT INTO tk SELECT {'a': i % 4, 'b': 'x' || ((i // 4) % 2)::VARCHAR}, [i % 3, i % 2], to_days((i % 5)::INTEGER), i::INTEGER FROM range(3000) t(i);
+
+query II
+EXPLAIN SELECT st, count(*) FROM tk GROUP BY st LIMIT 3
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT li, count(*) FROM tk GROUP BY li LIMIT 3
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT iv, count(*) FROM tk GROUP BY iv LIMIT 3
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT st, iv, count(*) FROM tk GROUP BY st, iv LIMIT 3
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+# their results are those of the standard plan (every group, exact)
+query II
+SELECT count(*), sum(c) FROM (SELECT st, count(*) AS c FROM tk GROUP BY st LIMIT 10)
+----
+8	3000
+
+query II
+SELECT count(*), sum(c) FROM (SELECT li, count(*) AS c FROM tk GROUP BY li LIMIT 10)
+----
+6	3000
+
+query II
+SELECT count(*), sum(c) FROM (SELECT iv, count(*) AS c FROM tk GROUP BY iv LIMIT 10)
+----
+5	3000
+
+# a scalar key next to a nested key is not rewritten either
+query II
+EXPLAIN SELECT v % 2, li, count(*) FROM tk GROUP BY v % 2, li LIMIT 3
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+# a random()-dependent group key and a random()-dependent input filter are not rewritten
+query II
+EXPLAIN SELECT u, (random() < 0.5) AS r, count(*) FROM fk GROUP BY u, (random() < 0.5) LIMIT 5
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk WHERE random() < 0.5 GROUP BY u, s LIMIT 5
+----
+physical_plan	<!REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query I
+SELECT count(*) <= 5 FROM (SELECT u, s, count(*) AS c FROM fk WHERE random() < 0.5 GROUP BY u, s LIMIT 5)
+----
+true
+
+# a deterministic input filter on a non-key column next to the same shape stays rewritten
+query II
+EXPLAIN SELECT u, s, count(*) FROM fk WHERE v % 2 = 0 GROUP BY u, s LIMIT 5
+----
+physical_plan	<REGEX>:.*STREAMING_FIRST_KEYS.*

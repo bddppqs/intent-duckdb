@@ -40,6 +40,7 @@
 #include "duckdb/storage/block_allocator.hpp"
 
 #include "mbedtls_wrapper.hpp"
+#include "zstd.h"
 
 namespace duckdb {
 
@@ -1723,6 +1724,17 @@ Value WriteBufferRowGroupMemoryLimitSetting::GetSetting(const ClientContext &con
 		bytes = config.options.maximum_memory / 5 / (config.options.maximum_threads + 1);
 	}
 	return Value(StringUtil::BytesToHumanReadableString(bytes));
+}
+
+//===----------------------------------------------------------------------===//
+// Zstd Block Compression Level
+//===----------------------------------------------------------------------===//
+void ZstdBlockCompressionLevelSetting::OnSet(SettingCallbackInfo &info, Value &input) {
+	auto level = input.GetValue<uint64_t>();
+	if (level > NumericCast<uint64_t>(duckdb_zstd::ZSTD_maxCLevel())) {
+		throw InvalidInputException("zstd_block_compression_level must be 0 (automatic) or between 1 and %d",
+		                            duckdb_zstd::ZSTD_maxCLevel());
+	}
 }
 
 void CurrentTransactionInvalidationPolicySetting::OnSet(SettingCallbackInfo &info, Value &input) {

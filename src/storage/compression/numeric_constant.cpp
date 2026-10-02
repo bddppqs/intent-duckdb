@@ -6,6 +6,7 @@
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 
 namespace duckdb {
@@ -75,6 +76,15 @@ void ConstantScanFunction(ColumnSegment &segment, ColumnScanState &state, idx_t 
 	auto data = FlatVector::GetData<T>(result);
 	data[0] = NumericStats::GetMin<T>(nstats);
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
+
+//===--------------------------------------------------------------------===//
+// Scan runs
+//===--------------------------------------------------------------------===//
+template <class T>
+void ConstantScanRuns(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, RunSink &sink) {
+	auto &nstats = segment.stats.statistics;
+	sink.Push<T>(NumericStats::GetMin<T>(nstats), scan_count);
 }
 
 //===--------------------------------------------------------------------===//
@@ -170,6 +180,13 @@ void ConstantFun::FiltersNullValues(const LogicalType &type, const TableFilter &
 		filters_nulls = bf.FiltersNullValues();
 		break;
 	}
+	case TableFilterType::DYNAMIC_FILTER: {
+		// a Top-N bound applied row by row (NULLS LAST only, TopN::PushdownDynamicFilters): once set, a NULL sorts after
+		// the bound and never reaches the heap; while it is not set it filters nothing
+		auto &dynamic_filter = filter.Cast<DynamicFilter>();
+		filters_nulls = dynamic_filter.filter_data && dynamic_filter.filter_data->initialized;
+		break;
+	}
 	default:
 		throw InternalException("FIXME: unsupported type for filter selection in validity select");
 	}
@@ -215,10 +232,13 @@ CompressionFunction ConstantGetFunctionValidity(PhysicalType data_type) {
 
 template <class T>
 CompressionFunction ConstantGetFunction(PhysicalType data_type) {
-	return CompressionFunction(CompressionType::COMPRESSION_CONSTANT, data_type, nullptr, nullptr, nullptr, nullptr,
-	                           nullptr, nullptr, ConstantInitScan, ConstantScanFunction<T>, ConstantScanPartial<T>,
-	                           ConstantFetchRow<T>, UncompressedFunctions::EmptySkip, nullptr, nullptr, nullptr,
-	                           nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, ConstantSelect<T>);
+	auto function =
+	    CompressionFunction(CompressionType::COMPRESSION_CONSTANT, data_type, nullptr, nullptr, nullptr, nullptr,
+	                        nullptr, nullptr, ConstantInitScan, ConstantScanFunction<T>, ConstantScanPartial<T>,
+	                        ConstantFetchRow<T>, UncompressedFunctions::EmptySkip, nullptr, nullptr, nullptr, nullptr,
+	                        nullptr, nullptr, nullptr, nullptr, nullptr, ConstantSelect<T>);
+	function.scan_runs = ConstantScanRuns<T>;
+	return function;
 }
 
 CompressionFunction ConstantFun::GetFunction(PhysicalType data_type) {

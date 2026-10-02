@@ -66,6 +66,11 @@ struct RegularAdd {
 	static void AddConstant(STATE &state, T input, idx_t count) {
 		state.value += input * int64_t(count);
 	}
+
+	template <class STATE, class T>
+	static void AddRun(STATE &state, T input, idx_t count) {
+		state.value += input * int64_t(count);
+	}
 };
 
 struct HugeintAdd {
@@ -157,6 +162,25 @@ struct AddToHugeint {
 			}
 		}
 	}
+
+	template <class STATE, class T>
+	static void AddRun(STATE &state, T input, idx_t count) {
+#if ((__GNUC__ >= 5) || defined(__clang__)) && defined(__SIZEOF_INT128__)
+		// the exact 128-bit product, folded into the state with the wrapping arithmetic of AddValue
+		__int128 product = static_cast<__int128>(input) * static_cast<__int128>(count);
+		uint64_t lower = static_cast<uint64_t>(product);
+		int64_t upper = static_cast<int64_t>(product >> 64);
+		AddValue(state.value, lower, 1);
+		state.value.upper += upper;
+#else
+		// AddConstant assumes count <= STANDARD_VECTOR_SIZE: add the run in slices that satisfy it
+		while (count > 0) {
+			idx_t slice = MinValue<idx_t>(count, STANDARD_VECTOR_SIZE);
+			AddConstant<STATE, T>(state, input, slice);
+			count -= slice;
+		}
+#endif
+	}
 };
 
 template <class STATEOP, class ADDOP>
@@ -182,6 +206,12 @@ struct BaseSumOperation {
 	static void ConstantOperation(STATE &state, const INPUT_TYPE &input, AggregateUnaryInput &, idx_t count) {
 		STATEOP::template AddValues<STATE>(state, count);
 		ADDOP::template AddConstant<STATE, INPUT_TYPE>(state, input, count);
+	}
+	//! Add a run of `count` copies of `input` (used by operations that opt in through RunOperation)
+	template <class INPUT_TYPE, class STATE, class OP>
+	static void RunOperationInternal(STATE &state, const INPUT_TYPE &input, idx_t count) {
+		STATEOP::template AddValues<STATE>(state, count);
+		ADDOP::template AddRun<STATE, INPUT_TYPE>(state, input, count);
 	}
 	static bool IgnoreNull() {
 		return true;

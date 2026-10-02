@@ -633,6 +633,8 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	// Cover reading new storage files.
 	auto index_storage_infos =
 	    deserializer.ReadPropertyWithExplicitDefault<vector<IndexStorageInfo>>(104, "index_storage_infos", {});
+	// Absent (false) in every file but the block-compressed one, see SingleFileTableDataWriter::FinalizeTable
+	auto stats_exact = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "stats_exact", false);
 
 	if (!index_storage_infos.empty()) {
 		bound_info.indexes = std::move(index_storage_infos);
@@ -657,6 +659,7 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	data_reader.ReadTableData();
 
 	bound_info.data->total_rows = total_rows;
+	bound_info.data->stats_exact = stats_exact;
 	bound_info.data->read_metadata_pointers = read_pointers;
 }
 

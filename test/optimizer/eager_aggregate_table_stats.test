@@ -1,0 +1,585 @@
+# name: test/optimizer/eager_aggregate_table_stats.test
+# description: Ungrouped COUNT(*), MIN and MAX answered from the table-level statistics, only when they are exact
+# group: [optimizer]
+
+# the tables are detached and attached again by the test itself
+require skip_reload
+
+# Alternative verify disables eager aggregate execution
+require no_alternative_verify
+
+# the debug log names the partitions an answer came from: 1 = the whole table, more = the row groups
+statement ok
+CALL enable_logging(level='debug')
+
+# the table-level exactness bit is stored only in the block-compressed file (STORAGE_VERSION 'latest')
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (STORAGE_VERSION 'latest', ROW_GROUP_SIZE 2048)
+
+# 8192 rows in four row groups
+statement ok
+CREATE TABLE db.t AS SELECT
+    i::BIGINT AS i,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE i::INTEGER END AS m,
+    NULL::INTEGER AS n,
+    DATE '2019-07-01' + (i % 31)::INTEGER AS d,
+    TIMESTAMP '2019-07-01 00:00:00' + to_seconds(i) AS ts,
+    lpad(i::VARCHAR, 6, '0') AS s,
+    'long-string-value-' || lpad(i::VARCHAR, 6, '0') AS l,
+    i::DOUBLE / 4 AS f
+FROM range(8192) r(i)
+
+statement ok
+CREATE TABLE db.e (i BIGINT, s VARCHAR, d DATE)
+
+# NaN, an infinite date and an infinite timestamp lie outside the types' [MinimumValue, MaximumValue]: the statistics'
+# bounds never move from their empty values
+statement ok
+CREATE TABLE db.edge AS SELECT 'nan'::DOUBLE AS f, 'infinity'::DATE AS d, '-infinity'::TIMESTAMP AS ts FROM range(3)
+
+# strings of unequal lengths in different row groups: exact per row group, not for the whole table
+statement ok
+CREATE TABLE db.v AS SELECT CASE WHEN i < 2048 THEN 'aaa' ELSE 'bbbbb' END AS s FROM range(8192) r(i)
+
+# fresh table in the session that created it: never answered from the whole-table statistics
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIIIII
+SELECT count(*), min(i), max(i), min(d), max(d), max(s) FROM db.t
+----
+8192	0	8191	2019-07-01	2019-07-31	008191
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'ungrouped aggregate answered from the statistics of 1 partition(s)'
+----
+0
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+# loaded with exact statistics: COUNT(*), MIN and MAX come from the table statistics, no aggregate in the plan
+query II
+EXPLAIN SELECT count(*), min(i), max(i), min(m), max(m), min(d), max(d), min(ts), max(ts), min(s), max(s) FROM db.t
+----
+physical_plan	<!REGEX>:.*AGGREGATE.*
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIIIIIIIIII
+SELECT count(*), min(i), max(i), min(m), max(m), min(d), max(d), min(ts), max(ts), min(s), max(s) FROM db.t
+----
+8192	0	8191	1	8191	2019-07-01	2019-07-31	2019-07-01 00:00:00	2019-07-01 02:16:31	000000	008191
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+# the fallback plan (no statistics propagation) gives the same answer
+statement ok
+SET disabled_optimizers='statistics_propagation'
+
+query II
+EXPLAIN SELECT count(*), min(i), max(i), min(m), max(m), min(d), max(d), min(ts), max(ts), min(s), max(s) FROM db.t
+----
+physical_plan	<REGEX>:.*AGGREGATE.*
+
+query IIIIIIIIIII
+SELECT count(*), min(i), max(i), min(m), max(m), min(d), max(d), min(ts), max(ts), min(s), max(s) FROM db.t
+----
+8192	0	8191	1	8191	2019-07-01	2019-07-31	2019-07-01 00:00:00	2019-07-01 02:16:31	000000	008191
+
+query IIIIII
+SELECT min(n), max(n), min(l), max(l), min(f), max(f) FROM db.t
+----
+NULL	NULL	long-string-value-000000	long-string-value-008191	0.0	2047.75
+
+statement ok
+RESET disabled_optimizers
+
+# an all-NULL column and truncated (long) strings: no exact statistics, the scan answers
+query II
+EXPLAIN SELECT min(n), max(n) FROM db.t
+----
+physical_plan	<REGEX>:.*AGGREGATE.*
+
+query II
+EXPLAIN SELECT min(l), max(l) FROM db.t
+----
+physical_plan	<REGEX>:.*AGGREGATE.*
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIII
+SELECT min(n), max(n), min(l), max(l) FROM db.t
+----
+NULL	NULL	long-string-value-000000	long-string-value-008191
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+0
+
+# DOUBLE is not answered from the whole table; the row groups' statistics answer as before
+statement ok
+CALL truncate_duckdb_logs()
+
+query II
+SELECT min(f), max(f) FROM db.t
+----
+0.0	2047.75
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 4 partition(s)
+
+# strings of unequal lengths: the row groups answer
+statement ok
+CALL truncate_duckdb_logs()
+
+query II
+SELECT min(s), max(s) FROM db.v
+----
+aaa	bbbbb
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 4 partition(s)
+
+# bounds at their empty-statistics values are not answers, from the whole table or a row group
+query II
+EXPLAIN SELECT min(f), max(f), min(d), max(d), min(ts), max(ts) FROM db.edge
+----
+physical_plan	<REGEX>:.*AGGREGATE.*
+
+query IIIIII
+SELECT min(f), max(f), min(d), max(d), min(ts), max(ts) FROM db.edge
+----
+nan	nan	infinity	infinity	-infinity	-infinity
+
+query I
+SELECT count(*) FROM db.edge
+----
+3
+
+# an empty table
+query IIIIII
+SELECT count(*), min(i), max(i), min(s), max(s), max(d) FROM db.e
+----
+0	NULL	NULL	NULL	NULL	NULL
+
+# a filter: the row groups' statistics, as before
+query I
+SELECT count(*) FROM db.t WHERE i >= 2048
+----
+6144
+
+# uncommitted INSERT: the inserting transaction counts its own rows, the other connection does not
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO db.t VALUES (100000, 7, NULL, DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', 'zzzzzz', 'long', 1.5)
+
+query IIIII con1
+SELECT count(*), max(i), max(d), max(ts), max(s) FROM db.t
+----
+8193	100000	2020-01-01	2020-01-01 00:00:00	zzzzzz
+
+statement ok con2
+CALL truncate_duckdb_logs()
+
+query IIIII con2
+SELECT count(*), max(i), max(d), max(ts), max(s) FROM db.t
+----
+8192	8191	2019-07-31	2019-07-01 02:16:31	008191
+
+query I con2
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+statement ok con1
+ROLLBACK
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query III
+SELECT count(*), min(i), max(i) FROM db.t
+----
+8192	0	8191
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+# committed INSERT: right after it the rows are not stored data yet, the plan aggregates
+statement ok
+INSERT INTO db.t VALUES (100000, 7, NULL, DATE '2020-01-01', TIMESTAMP '2020-01-01 00:00:00', 'zzzzzz', 'long', 1.5)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIIIII
+SELECT count(*), min(i), max(i), max(d), max(ts), max(s) FROM db.t
+----
+8193	0	100000	2020-01-01	2020-01-01 00:00:00	zzzzzz
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'ungrouped aggregate answered from the statistics of 1 partition(s)'
+----
+0
+
+# appends keep the statistics exact: stored again, the whole table answers
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIIIII
+SELECT count(*), min(i), max(i), max(d), max(ts), max(s) FROM db.t
+----
+8193	0	100000	2020-01-01	2020-01-01 00:00:00	zzzzzz
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+# a DELETE, rolled back: the statistics are no longer known exact
+statement ok con1
+BEGIN
+
+statement ok con1
+DELETE FROM db.t WHERE i = 100000
+
+query III con1
+SELECT count(*), max(i), max(d) FROM db.t
+----
+8192	8191	2019-07-31
+
+query III con2
+SELECT count(*), max(i), max(d) FROM db.t
+----
+8193	100000	2020-01-01
+
+statement ok con1
+ROLLBACK
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query II
+SELECT count(*), max(i) FROM db.t
+----
+8193	100000
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'ungrouped aggregate answered from the statistics of 1 partition(s)'
+----
+0
+
+# a committed DELETE: the stored statistics keep the deleted values, and the bit is not stored again
+statement ok
+DELETE FROM db.t WHERE i = 100000 OR i = 0
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+query II
+EXPLAIN SELECT count(*), min(i), max(i) FROM db.t
+----
+physical_plan	<REGEX>:.*AGGREGATE.*
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query IIIII
+SELECT count(*), min(i), max(i), max(d), max(s) FROM db.t
+----
+8191	1	8191	2019-07-31	008191
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'ungrouped aggregate answered from the statistics of 1 partition(s)'
+----
+0
+
+# UPDATE: a second table, stored exact
+statement ok
+CREATE TABLE db.u AS SELECT i::BIGINT AS i, DATE '2019-07-01' + (i % 31)::INTEGER AS d FROM range(8192) r(i)
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query III
+SELECT count(*), min(i), max(d) FROM db.u
+----
+8192	0	2019-07-31
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+# an UPDATE in a transaction, seen by that transaction only
+statement ok con1
+BEGIN
+
+statement ok con1
+UPDATE db.u SET i = -5, d = DATE '2030-01-01' WHERE i = 0
+
+query III con1
+SELECT count(*), min(i), max(d) FROM db.u
+----
+8192	-5	2030-01-01
+
+query III con2
+SELECT count(*), min(i), max(d) FROM db.u
+----
+8192	0	2019-07-31
+
+statement ok con1
+ROLLBACK
+
+# committed UPDATEs that widen the statistics and then restore the values: the stored bounds are not exact
+statement ok
+UPDATE db.u SET i = -5, d = DATE '2030-01-01' WHERE i = 0
+
+statement ok
+UPDATE db.u SET i = 0, d = DATE '2019-07-01' WHERE i = -5
+
+query III
+SELECT count(*), min(i), max(d) FROM db.u
+----
+8192	0	2019-07-31
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query III
+SELECT count(*), min(i), max(d) FROM db.u
+----
+8192	0	2019-07-31
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'ungrouped aggregate answered from the statistics of 1 partition(s)'
+----
+0
+
+# a reverted append: r1..r4 stored exact; one transaction inserts a key into pk that another connection commits first, then
+# appends out-of-range rows to each, so its COMMIT fails and every append already merged into a table is reverted (local
+# storage flushes in reverse insertion order here, so pk last: all four). The answers stay exact, before and after the file
+# is stored and loaded again.
+statement ok
+CREATE TABLE db.pk (k INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE db.r1 AS SELECT i::BIGINT AS i, DATE '2019-07-01' + (i % 31)::INTEGER AS d FROM range(5000) r(i)
+
+statement ok
+CREATE TABLE db.r2 AS SELECT i::BIGINT AS i, DATE '2019-07-01' + (i % 31)::INTEGER AS d FROM range(5000) r(i)
+
+statement ok
+CREATE TABLE db.r3 AS SELECT i::BIGINT AS i, DATE '2019-07-01' + (i % 31)::INTEGER AS d FROM range(5000) r(i)
+
+statement ok
+CREATE TABLE db.r4 AS SELECT i::BIGINT AS i, DATE '2019-07-01' + (i % 31)::INTEGER AS d FROM range(5000) r(i)
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO db.pk VALUES (1)
+
+statement ok con1
+INSERT INTO db.r1 SELECT 1000000 + i, DATE '2099-01-01' FROM range(10) r(i)
+
+statement ok con1
+INSERT INTO db.r2 SELECT 1000000 + i, DATE '2099-01-01' FROM range(10) r(i)
+
+statement ok con1
+INSERT INTO db.r3 SELECT 1000000 + i, DATE '2099-01-01' FROM range(10) r(i)
+
+statement ok con1
+INSERT INTO db.r4 SELECT 1000000 + i, DATE '2099-01-01' FROM range(10) r(i)
+
+statement ok con2
+INSERT INTO db.pk VALUES (1)
+
+statement error con1
+COMMIT
+----
+PRIMARY KEY or UNIQUE constraint violation
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r1
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r2
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r3
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r4
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r1
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r2
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r3
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r4
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+statement ok
+SET disabled_optimizers='statistics_propagation'
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r1
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r2
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r3
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+query IIIII
+SELECT count(*), min(i), max(i), min(d), max(d) FROM db.r4
+----
+5000	0	4999	2019-07-01	2019-07-31
+
+statement ok
+RESET disabled_optimizers
+
+# the stored bit survives an unchanged checkpoint: table t2 stored exact, then a checkpoint of other changes
+statement ok
+CREATE TABLE db.t2 AS SELECT i::BIGINT AS i FROM range(5000) r(i)
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+INSERT INTO db.e VALUES (1, 'x', DATE '2001-01-01')
+
+statement ok
+CHECKPOINT db
+
+statement ok
+DETACH db
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact.db' AS db (ROW_GROUP_SIZE 2048)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query III
+SELECT count(*), min(i), max(i) FROM db.t2
+----
+5000	0	4999
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 1 partition(s)
+
+query IIII
+SELECT count(*), min(i), max(s), max(d) FROM db.e
+----
+1	1	x	2001-01-01
+
+# a file at an older storage version stores no bit: never answered from the whole table
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact_old.db' AS old (STORAGE_VERSION 'v1.4.0', ROW_GROUP_SIZE 2048)
+
+statement ok
+CREATE TABLE old.t AS SELECT i::BIGINT AS i FROM range(8192) r(i)
+
+statement ok
+DETACH old
+
+statement ok
+ATTACH '__TEST_DIR__/table_stats_exact_old.db' AS old (ROW_GROUP_SIZE 2048)
+
+statement ok
+CALL truncate_duckdb_logs()
+
+query III
+SELECT count(*), min(i), max(i) FROM old.t
+----
+8192	0	8191
+
+query I
+SELECT message FROM duckdb_logs WHERE message LIKE 'ungrouped aggregate answered%'
+----
+ungrouped aggregate answered from the statistics of 4 partition(s)

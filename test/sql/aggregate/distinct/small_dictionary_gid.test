@@ -1,0 +1,81 @@
+# name: test/sql/aggregate/distinct/small_dictionary_gid.test
+# description: The small-dictionary code domain of the fused DISTINCT class: a VARCHAR group key whose base
+#              statistics bound its distinct count, stored as a 2-byte gid (one key, two keys, beside a SMALLINT key);
+#              answers in closed form from the generator, the emit's strings across the inline boundary in ORDER BY
+#              order, and an EXPLAIN (FORMAT JSON) per shape asserting the EXPLAIN text's gid_keys field (and its absence on
+#              the NULL-holding and the non-distinct twins). The keys are longer than 15 bytes, so compressed
+#              materialization leaves them VARCHAR at the aggregate.
+# group: [distinct]
+
+statement ok
+CREATE TABLE tg AS SELECT CASE WHEN (i // 256) % 41 = 40 THEN 'https://example.com/model/' ELSE 'https://example.com/model/' || lpad(((i // 256) % 41)::VARCHAR, 2, '0') END AS g, 'https://example.com/h/' || ((i // 4096) % 30)::VARCHAR AS h, ((i // 1024) % 7)::SMALLINT AS s, ((i // 16) % 50000)::BIGINT AS x, CASE WHEN i % 97 = 0 THEN NULL ELSE 'https://example.com/n/' || ((i // 256) % 41)::VARCHAR END AS gn, CASE (i // 1024) % 4 WHEN 0 THEN '' WHEN 1 THEN 'abcdefghijkl' WHEN 2 THEN 'abcdefghijklm' ELSE repeat('z', 40) END AS ge FROM range(2097152) t(i);
+
+# one VARCHAR key
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM tg GROUP BY g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*gid_keys=1.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u FROM tg GROUP BY g)
+----
+41	131072	3184	3200
+
+query II
+SELECT g, count(DISTINCT x) AS u FROM tg GROUP BY g ORDER BY g LIMIT 3
+----
+https://example.com/model/	3184
+https://example.com/model/00	3200
+https://example.com/model/01	3200
+
+# two VARCHAR keys (the 12-byte key region: two gids and x)
+query II
+EXPLAIN (FORMAT JSON) SELECT g, h, count(DISTINCT x) AS u FROM tg GROUP BY g, h
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*gid_keys=2.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT g, h, count(DISTINCT x) AS u FROM tg GROUP BY g, h)
+----
+1230	131072	96	128
+
+# a SMALLINT key beside a VARCHAR key
+query II
+EXPLAIN (FORMAT JSON) SELECT s, g, count(DISTINCT x) AS u FROM tg GROUP BY s, g
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*gid_keys=1.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u), max(u) FROM (SELECT s, g, count(DISTINCT x) AS u FROM tg GROUP BY s, g)
+----
+287	131072	448	480
+
+# the emit: '', 12 and 13 bytes (the string_t inline boundary), 40 bytes
+query II
+SELECT ge, count(DISTINCT x) AS u FROM tg GROUP BY ge ORDER BY ge
+----
+(empty)	32768
+abcdefghijkl	32768
+abcdefghijklm	32768
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz	32768
+
+# refused twins: a key holding NULL, a VARCHAR key under a non-distinct aggregate (the gid path is DISTINCT-only)
+query II
+EXPLAIN SELECT gn, count(DISTINCT x) AS u FROM tg GROUP BY gn
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query III
+SELECT count(*)::BIGINT, sum(u)::BIGINT, count(*) FILTER (WHERE gn IS NULL)::BIGINT FROM (SELECT gn, count(DISTINCT x) AS u FROM tg GROUP BY gn)
+----
+42	152372	1
+
+query II
+EXPLAIN SELECT g, count(*) AS c FROM tg GROUP BY g
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c) FROM (SELECT g, count(*) AS c FROM tg GROUP BY g)
+----
+41	2097152	50944	51200

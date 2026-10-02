@@ -6,6 +6,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/storage/data_pointer.hpp"
 #include "duckdb/storage/table/append_state.hpp"
@@ -15,9 +16,11 @@
 #include "duckdb/planner/filter/selectivity_optional_filter.hpp"
 
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/storage/compression/dict_fsst/filter_verdict_cache.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
 #include <cstring>
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -96,6 +99,10 @@ ColumnSegment::ColumnSegment(ColumnSegment &other)
 ColumnSegment::~ColumnSegment() {
 	if (!dictionary_cache_key.empty()) {
 		db.GetObjectCache().Delete(dictionary_cache_key);
+		dict_global::ReleaseTranslation(db, dictionary_cache_key);
+		if (dict_fsst::FilterVerdictCacheEnabled()) {
+			dict_fsst::DeleteFilterVerdictSlots(db.GetObjectCache(), dictionary_cache_key);
+		}
 	}
 }
 
@@ -103,7 +110,14 @@ void ColumnSegment::InvalidateDictionaryCache() {
 	dictionary_cache_hint.store(0, std::memory_order_relaxed);
 	if (!dictionary_cache_key.empty()) {
 		db.GetObjectCache().Delete(dictionary_cache_key);
+		dict_global::ReleaseTranslation(db, dictionary_cache_key);
+		if (dict_fsst::FilterVerdictCacheEnabled()) {
+			dict_fsst::DeleteFilterVerdictSlots(db.GetObjectCache(), dictionary_cache_key);
+		}
 		dictionary_cache_key = "dict_fsst-" + UUID::ToString(UUID::GenerateRandomUUID());
+		if (dict_fsst::SegmentCacheEnabled()) {
+			dict_fsst::ResetSegmentCache(*this);
+		}
 	}
 }
 
@@ -154,9 +168,23 @@ void ColumnSegment::Filter(ColumnScanState &state, idx_t scan_count, Vector &res
 	function.get().filter(*this, state, scan_count, result, sel, sel_count, filter, filter_state);
 }
 
+FilterPropagateResult ColumnSegment::CheckDomain(ColumnScanState &state, const TableFilter &filter) {
+	if (!function.get().check_domain) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
+	return function.get().check_domain(*this, state, filter);
+}
+
 void ColumnSegment::Skip(ColumnScanState &state) {
 	function.get().skip(*this, state, state.offset_in_column - state.internal_index);
 	state.internal_index = state.offset_in_column;
+}
+
+void ColumnSegment::ScanRuns(ColumnScanState &state, idx_t scan_count, RunSink &sink) {
+	if (!function.get().scan_runs) {
+		throw InternalException("ColumnSegment::ScanRuns not implemented for this compression method");
+	}
+	function.get().scan_runs(*this, state, scan_count, sink);
 }
 
 void ColumnSegment::Scan(ColumnScanState &state, idx_t scan_count, Vector &result) {
@@ -562,6 +590,28 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
 			throw InvalidTypeException(vector.GetType(), "Invalid type for filter pushed down to table comparison");
 		}
 		return approved_tuple_count;
+	}
+	case TableFilterType::DYNAMIC_FILTER: {
+		// a Top-N bound applied row by row (TopN::PushdownDynamicFilters): snapshot the bound under its lock; while it is
+		// not set every row passes, otherwise the snapshot is applied as the constant comparison it holds
+		auto &dynamic_filter = filter.Cast<DynamicFilter>();
+		if (!dynamic_filter.filter_data) {
+			return approved_tuple_count;
+		}
+		auto comparison_type = ExpressionType::INVALID;
+		Value constant;
+		{
+			auto &filter_data = *dynamic_filter.filter_data;
+			lock_guard<mutex> l(filter_data.lock);
+			if (!filter_data.initialized) {
+				return approved_tuple_count;
+			}
+			auto &bound = *filter_data.filter;
+			comparison_type = bound.comparison_type;
+			constant = bound.constant;
+		}
+		ConstantFilter snapshot(comparison_type, std::move(constant));
+		return FilterSelection(sel, vector, vdata, snapshot, filter_state, scan_count, approved_tuple_count);
 	}
 	case TableFilterType::IS_NULL: {
 		return TemplatedNullSelection<true>(vdata, sel, approved_tuple_count);

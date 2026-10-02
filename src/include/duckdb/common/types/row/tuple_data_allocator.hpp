@@ -86,6 +86,8 @@ public:
 	void InitializeChunkState(TupleDataSegment &segment, TupleDataPinState &pin_state, TupleDataChunkState &chunk_state,
 	                          idx_t chunk_idx, bool init_heap,
 	                          optional_ptr<SortKeyPayloadState> sort_key_payload_state = nullptr);
+	//! rows whose heap-size word reads 0 are skipped - they own no heap, so a non-inlined string in them points
+	//! into memory the collection holds by owner, never into this heap
 	static void RecomputeHeapPointers(Vector &old_heap_ptrs, const SelectionVector &old_heap_sel,
 	                                  const data_ptr_t row_locations[], Vector &new_heap_ptrs, const idx_t offset,
 	                                  const idx_t count, const TupleDataLayout &layout, const idx_t base_col_offset);
@@ -129,6 +131,11 @@ private:
 	data_ptr_t GetRowPointer(TupleDataPinState &state, const TupleDataChunkPart &part);
 	//! Gets the base pointer to the heap for the given chunk part
 	data_ptr_t GetBaseHeapPointer(TupleDataPinState &state, const TupleDataChunkPart &part);
+	//! RecomputeHeapPointers with the top-level row's heap-size offset (a nested STRUCT layout's own is 0)
+	static void RecomputeHeapPointersInternal(Vector &old_heap_ptrs, const SelectionVector &old_heap_sel,
+	                                          const data_ptr_t row_locations[], Vector &new_heap_ptrs,
+	                                          const idx_t offset, const idx_t count, const TupleDataLayout &layout,
+	                                          const idx_t base_col_offset, const idx_t heap_size_offset);
 
 private:
 	//! Shared allocator for STL allocations

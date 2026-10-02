@@ -77,6 +77,18 @@ typedef void (*aggregate_destructor_t)(Vector &state, AggregateInputData &aggr_i
 typedef void (*aggregate_simple_update_t)(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count,
                                           data_ptr_t state, idx_t count);
 
+//! The type used for run-aware updates of simple (non-grouped) aggregate functions (optional): run i adds
+//! run_counts[i] copies of run_values[i] (a flat vector of the input type) to the state
+typedef void (*aggregate_run_update_t)(Vector &run_values, const uint16_t *run_counts, idx_t run_count,
+                                       AggregateInputData &aggr_input_data, data_ptr_t state);
+
+//! The type used for run-aware updates of GROUPED aggregate functions (optional): run i adds run_counts[i] copies of
+//! run_values[i] to the state addressed by states[i]. One probe and one update per run replace the per-row pair; the
+//! caller guarantees that the group key is constant over each run, that the runs hold no NULL value, and that
+//! `states` is a POINTER vector already shifted to this aggregate's payload offset
+typedef void (*aggregate_grouped_run_update_t)(Vector &run_values, const uint16_t *run_counts, idx_t run_count,
+                                               AggregateInputData &aggr_input_data, Vector &states);
+
 //! The type used for computing complex/custom windowed aggregate functions (optional)
 typedef void (*aggregate_window_t)(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
                                    const_data_ptr_t g_state, data_ptr_t l_state, const SubFrames &subframes,
@@ -103,6 +115,19 @@ struct AggregateFunctionInfo {
 		DynamicCastCheck<TARGET>(this);
 		return reinterpret_cast<const TARGET &>(*this);
 	}
+};
+
+//! Carries the optional run-aware update of a simple aggregate. It lives in `function_info` rather than in the
+//! AggregateFunction layout so that extensions built against the pinned headers keep their ABI (loadable extensions
+//! construct AggregateFunction objects and register them through the core).
+struct RunUpdateFunctionInfo : public AggregateFunctionInfo {
+	explicit RunUpdateFunctionInfo(aggregate_run_update_t run_update_p,
+	                               aggregate_grouped_run_update_t grouped_run_update_p = nullptr)
+	    : run_update(run_update_p), grouped_run_update(grouped_run_update_p) {
+	}
+	aggregate_run_update_t run_update;
+	//! The grouped counterpart; null when the function has none
+	aggregate_grouped_run_update_t grouped_run_update;
 };
 
 enum class AggregateDestructorType {
@@ -305,10 +330,13 @@ public:
 public:
 	template <class STATE, class RESULT_TYPE, class OP>
 	static AggregateFunction NullaryAggregate(LogicalType return_type) {
-		return AggregateFunction(
+		auto function = AggregateFunction(
 		    {}, return_type, AggregateFunction::StateSize<STATE>, AggregateFunction::StateInitialize<STATE, OP>,
 		    AggregateFunction::NullaryScatterUpdate<STATE, OP>, AggregateFunction::StateCombine<STATE, OP>,
 		    AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, AggregateFunction::NullaryUpdate<STATE, OP>);
+		AggregateFunction::SetRunUpdate(function, AggregateFunction::NullaryRunUpdate<STATE, OP>);
+		AggregateFunction::SetGroupedRunUpdate(function, AggregateFunction::NullaryGroupedRunUpdate<STATE, OP>);
+		return function;
 	}
 
 	template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP,
@@ -316,12 +344,14 @@ public:
 	static AggregateFunction
 	UnaryAggregate(const LogicalType &input_type, LogicalType return_type,
 	               FunctionNullHandling null_handling = FunctionNullHandling::DEFAULT_NULL_HANDLING) {
-		return AggregateFunction({input_type}, return_type, AggregateFunction::StateSize<STATE>,
-		                         AggregateFunction::StateInitialize<STATE, OP, destructor_type>,
-		                         AggregateFunction::UnaryScatterUpdate<STATE, INPUT_TYPE, OP>,
-		                         AggregateFunction::StateCombine<STATE, OP>,
-		                         AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, null_handling,
-		                         AggregateFunction::UnaryUpdate<STATE, INPUT_TYPE, OP>);
+		auto function = AggregateFunction({input_type}, return_type, AggregateFunction::StateSize<STATE>,
+		                                  AggregateFunction::StateInitialize<STATE, OP, destructor_type>,
+		                                  AggregateFunction::UnaryScatterUpdate<STATE, INPUT_TYPE, OP>,
+		                                  AggregateFunction::StateCombine<STATE, OP>,
+		                                  AggregateFunction::StateFinalize<STATE, RESULT_TYPE, OP>, null_handling,
+		                                  AggregateFunction::UnaryUpdate<STATE, INPUT_TYPE, OP>);
+		AggregateFunction::SetRunUpdate(function, AggregateFunction::GetUnaryRunUpdate<STATE, INPUT_TYPE, OP>());
+		return function;
 	}
 
 	template <class STATE, class INPUT_TYPE, class RESULT_TYPE, class OP,
@@ -373,6 +403,91 @@ public:
 	                          idx_t count) {
 		D_ASSERT(input_count == 0);
 		AggregateExecutor::NullaryUpdate<STATE, OP>(state, aggr_input_data, count);
+	}
+
+	template <class STATE, class OP>
+	static void NullaryRunUpdate(Vector &run_values, const uint16_t *run_counts, idx_t run_count,
+	                             AggregateInputData &aggr_input_data, data_ptr_t state) {
+		AggregateExecutor::NullaryRunUpdate<STATE, OP>(run_counts, run_count, aggr_input_data, state);
+	}
+
+	//! One state update per run: run i adds run_counts[i] rows to the group addressed by states[i]. `states` is the
+	//! hash table's POINTER vector, already shifted to this aggregate's payload offset, and is always flat
+	template <class STATE, class OP>
+	static void NullaryGroupedRunUpdate(Vector &, const uint16_t *run_counts, idx_t run_count,
+	                                    AggregateInputData &aggr_input_data, Vector &states) {
+		auto state_ptrs = FlatVector::GetData<STATE *>(states);
+		for (idx_t i = 0; i < run_count; i++) {
+			OP::template ConstantOperation<STATE, OP>(*state_ptrs[i], aggr_input_data,
+			                                          static_cast<idx_t>(run_counts[i]));
+		}
+	}
+
+	template <class STATE, class INPUT_TYPE, class OP>
+	static void UnaryRunUpdate(Vector &run_values, const uint16_t *run_counts, idx_t run_count,
+	                           AggregateInputData &aggr_input_data, data_ptr_t state) {
+		AggregateExecutor::UnaryRunUpdate<STATE, INPUT_TYPE, OP>(run_values, run_counts, run_count, aggr_input_data,
+		                                                         state);
+	}
+
+	template <class STATE, class INPUT_TYPE, class OP>
+	static aggregate_run_update_t GetUnaryRunUpdateInternal(std::true_type) {
+		return AggregateFunction::UnaryRunUpdate<STATE, INPUT_TYPE, OP>;
+	}
+
+	template <class STATE, class INPUT_TYPE, class OP>
+	static aggregate_run_update_t GetUnaryRunUpdateInternal(std::false_type) {
+		return nullptr;
+	}
+
+	//! The run update of a unary aggregate: only operations declaring RunOperation opt in (nothing inherits it)
+	template <class STATE, class INPUT_TYPE, class OP>
+	static aggregate_run_update_t GetUnaryRunUpdate() {
+		return GetUnaryRunUpdateInternal<STATE, INPUT_TYPE, OP>(AggregateHasRunOperation<STATE, INPUT_TYPE, OP>());
+	}
+
+	//! Attach a run-aware update to a function (no-op for a null update: the function keeps no function_info)
+	static void SetRunUpdate(AggregateFunction &function, aggregate_run_update_t run_update) {
+		if (run_update) {
+			function.function_info = make_shared_ptr<RunUpdateFunctionInfo>(run_update);
+		}
+	}
+
+	//! The run-aware update of a function, or null when the function has none
+	static aggregate_run_update_t GetRunUpdate(const AggregateFunction &function) {
+		if (!function.function_info) {
+			return nullptr;
+		}
+		auto info = dynamic_cast<RunUpdateFunctionInfo *>(function.function_info.get());
+		return info ? info->run_update : nullptr;
+	}
+
+	//! Attach a grouped run-aware update to a function, keeping the ungrouped one it already carries. Like
+	//! SetRunUpdate it only ever writes a RunUpdateFunctionInfo, so a function carrying another AggregateFunctionInfo
+	//! subclass keeps it and simply has no grouped run update (no data member and no virtual is added to
+	//! AggregateFunction itself)
+	static void SetGroupedRunUpdate(AggregateFunction &function, aggregate_grouped_run_update_t grouped_run_update) {
+		if (!grouped_run_update) {
+			return;
+		}
+		aggregate_run_update_t run_update = nullptr;
+		if (function.function_info) {
+			auto info = dynamic_cast<RunUpdateFunctionInfo *>(function.function_info.get());
+			if (!info) {
+				return;
+			}
+			run_update = info->run_update;
+		}
+		function.function_info = make_shared_ptr<RunUpdateFunctionInfo>(run_update, grouped_run_update);
+	}
+
+	//! The grouped run-aware update of a function, or null when the function has none
+	static aggregate_grouped_run_update_t GetGroupedRunUpdate(const AggregateFunction &function) {
+		if (!function.function_info) {
+			return nullptr;
+		}
+		auto info = dynamic_cast<RunUpdateFunctionInfo *>(function.function_info.get());
+		return info ? info->grouped_run_update : nullptr;
 	}
 
 	template <class STATE, class T, class OP>

@@ -1,0 +1,155 @@
+# name: test/sql/aggregate/aggregates/min_max_string_arena_groups.test
+# description: MIN/MAX string states in the grouped hash aggregate take arena bytes; the
+#              grouped results must equal the window, ungrouped and arg_min/arg_max paths, which never take the arena
+# group: [aggregates]
+
+# boundary values in insertion order on one thread: 12/13-byte inlining edge, NULLs, empty strings, a minimum that grows
+# longer (the arena slot must be replaced, capacity doubled) and one that shrinks in place
+statement ok
+SET threads=1
+
+statement ok
+CREATE TABLE b(g INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO b VALUES
+  (1, 'aaaaaaaaaaaaa'), (1, 'aaaaaaaaaaaa'), (1, 'b'),
+  (2, NULL), (2, NULL),
+  (3, ''), (3, 'zzzzzzzzzzzzzzzzzzzz'), (3, NULL),
+  (4, 'yyyyyyyyyyyyyyyyyyyy'), (4, 'x'), (4, 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'),
+  (5, 'bbbbbbbbbbbbbbbbbbbb'), (5, 'abbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'), (5, 'aabbbbbbbbbbbbb'), (5, 'aaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'), (5, 'aaaa'),
+  (6, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'), (6, 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'), (6, 'zzzzzzzzzzzzzzzzzzzz');
+
+query III
+SELECT g, MIN(s), MAX(s) FROM b GROUP BY g ORDER BY g
+----
+1	aaaaaaaaaaaa	b
+2	NULL	NULL
+3	(empty)	zzzzzzzzzzzzzzzzzzzz
+4	x	yyyyyyyyyyyyyyyyyyyy
+5	aaaa	bbbbbbbbbbbbbbbbbbbb
+6	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa	zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+query II
+SELECT MIN(s), MAX(s) FROM b
+----
+(empty)	zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+# many groups, mixed lengths (inlined and not), NULLs and empty strings, several threads: the thread-local tables abandon
+# and the finalize combines partial states from several arenas
+statement ok
+SET threads=4
+
+statement ok
+CREATE TABLE t AS
+SELECT (i * 7) % 150001 AS g,
+       CASE WHEN i % 97 = 0 THEN NULL
+            WHEN i % 89 = 0 THEN ''
+            ELSE repeat(chr((97 + (i * 7919) % 26)::INTEGER), (1 + (i * 31) % 40)::INTEGER) || (i % 1009)::VARCHAR END AS s
+FROM range(1200000) r(i);
+
+loop pass 0 2
+
+# the grouped path against the window path (a separate MinMaxStringState context, never on the arena)
+query II
+SELECT COUNT(*), COUNT(*) FILTER (WHERE m IS DISTINCT FROM wm OR x IS DISTINCT FROM wx)
+FROM (SELECT g, MIN(s) AS m, MAX(s) AS x FROM t GROUP BY g) a
+JOIN (SELECT DISTINCT g, MIN(s) OVER (PARTITION BY g) AS wm, MAX(s) OVER (PARTITION BY g) AS wx FROM t) w USING (g)
+----
+150001	0
+
+# against arg_min/arg_max and the sorted-aggregate first() (states that are not MinMaxStringState)
+query I
+SELECT COUNT(*) FROM (
+  SELECT g, MIN(s) AS m, MAX(s) AS x, arg_min(s, s) AS am, arg_max(s, s) AS ax,
+         first(s ORDER BY s) FILTER (WHERE s IS NOT NULL) AS fo, first(s ORDER BY s DESC) FILTER (WHERE s IS NOT NULL) AS fx
+  FROM t GROUP BY g)
+WHERE m IS DISTINCT FROM am OR x IS DISTINCT FROM ax OR m IS DISTINCT FROM fo OR x IS DISTINCT FROM fx
+----
+0
+
+# a FILTER clause, a DISTINCT companion and a second grouping key through the same table
+query I
+SELECT COUNT(*) FROM (
+  SELECT g % 1000 AS h, g % 7 AS k, MIN(s) FILTER (WHERE length(s) > 12) AS m, MAX(s) AS x, COUNT(DISTINCT s) AS d,
+         arg_min(s, s) FILTER (WHERE length(s) > 12) AS am, arg_max(s, s) AS ax
+  FROM t GROUP BY ALL)
+WHERE m IS DISTINCT FROM am OR x IS DISTINCT FROM ax
+----
+0
+
+# the global minimum and maximum over the grouped results equal the ungrouped aggregate
+query I
+SELECT (SELECT MIN(m) FROM (SELECT MIN(s) AS m FROM t GROUP BY g)) = (SELECT MIN(s) FROM t)
+   AND (SELECT MAX(x) FROM (SELECT MAX(s) AS x FROM t GROUP BY g)) = (SELECT MAX(s) FROM t)
+----
+true
+
+# the sort-key MIN/MAX of nested types uses the same state
+query I
+SELECT COUNT(*) FROM (
+  SELECT g % 5003 AS h, MIN([s, s || 'x']) AS m, MAX({'a': s, 'b': length(s)}) AS x,
+         arg_min([s, s || 'x'], [s, s || 'x']) AS am, arg_max({'a': s, 'b': length(s)}, {'a': s, 'b': length(s)}) AS ax
+  FROM t GROUP BY ALL)
+WHERE m IS DISTINCT FROM am OR x IS DISTINCT FROM ax
+----
+0
+
+# BLOB goes through the same string state
+query I
+SELECT COUNT(*) FROM (
+  SELECT g % 3001 AS h, MIN(s::BLOB) AS m, MAX(s::BLOB) AS x, arg_min(s::BLOB, s::BLOB) AS am, arg_max(s::BLOB, s::BLOB) AS ax
+  FROM t GROUP BY ALL)
+WHERE m IS DISTINCT FROM am OR x IS DISTINCT FROM ax
+----
+0
+
+# the second pass forces the external (partitioned, spilling) aggregation
+statement ok
+SET debug_force_external=true
+
+endloop
+
+statement ok
+SET debug_force_external=false
+
+# a regexp-keyed MIN/MAX statement over a DICT_FSST column (the dictionary group path and the row path of the same table)
+statement ok
+ATTACH '__TEST_DIR__/min_max_arena.db' AS arenadb (STORAGE_VERSION 'latest');
+
+statement ok
+CREATE TABLE arenadb.r(source VARCHAR USING COMPRESSION dict_fsst);
+
+statement ok
+INSERT INTO arenadb.r
+SELECT CASE WHEN i % 13 = 0 THEN ''
+            WHEN i % 11 = 0 THEN 'archive.d' || (i % 37)::VARCHAR || '.store'
+            ELSE (CASE WHEN i % 3 = 0 THEN 'archive/' ELSE '' END) || 'd' || (i % 37)::VARCHAR || '.store/file' || ((i * 13) % 4099)::VARCHAR END
+FROM range(300000) r(i);
+
+statement ok
+CHECKPOINT arenadb
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT REGEXP_REPLACE(source, '^(?:archive/)?([^/]+)/.*$', '\1') AS k, AVG(STRLEN(source)) AS l, COUNT(*) AS c,
+         MIN(source) AS m, MAX(source) AS x, arg_min(source, source) AS am, arg_max(source, source) AS ax
+  FROM arenadb.r WHERE source <> '' GROUP BY k)
+WHERE m IS DISTINCT FROM am OR x IS DISTINCT FROM ax
+----
+0
+
+query IIII
+SELECT REGEXP_REPLACE(source, '^(?:archive/)?([^/]+)/.*$', '\1') AS k, COUNT(*) AS c, MIN(source), MAX(source)
+FROM arenadb.r WHERE source <> '' GROUP BY k HAVING COUNT(*) > 6000 ORDER BY k LIMIT 3
+----
+d0.store	6804	archive/d0.store/file1	d0.store/file999
+d1.store	6805	archive/d1.store/file0	d1.store/file999
+d10.store	6803	archive/d10.store/file0	d10.store/file999
+
+query IIII
+SELECT REGEXP_REPLACE(source, '^(?:archive/)?([^/]+)/.*$', '\1') AS k, COUNT(*) AS c, MIN(source), MAX(source)
+FROM arenadb.r WHERE source <> '' GROUP BY k HAVING COUNT(*) < 1000 ORDER BY k LIMIT 2
+----
+archive.d0.store	681	archive.d0.store	archive.d0.store
+archive.d1.store	680	archive.d1.store	archive.d1.store

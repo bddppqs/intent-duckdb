@@ -5,6 +5,7 @@
 #include "duckdb/common/types/row/tuple_data_collection.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/common/sorting/sort_key.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -107,7 +108,14 @@ void TupleDataCollection::ComputeHeapSizes(TupleDataChunkState &chunk_state, con
 	auto heap_sizes = FlatVector::GetData<idx_t>(chunk_state.heap_sizes);
 	std::fill_n(heap_sizes, append_count, 0);
 
+	const auto borrow_column = dict_global::ThreadBorrowColumn();
 	for (idx_t col_idx = 0; col_idx < new_chunk.ColumnCount(); col_idx++) {
+		if (col_idx == chunk_state.borrowed_key_column) {
+			continue;
+		}
+		if (col_idx == borrow_column) {
+			continue;
+		}
 		auto &source_v = new_chunk.data[col_idx];
 		auto &source_format = chunk_state.vector_data[col_idx];
 		ComputeHeapSizes(chunk_state.heap_sizes, source_v, source_format, append_sel, append_count);
@@ -681,7 +689,12 @@ void TupleDataCollection::Scatter(TupleDataChunkState &chunk_state, const DataCh
 		}
 
 		// Write the data
+		const auto borrow_column = dict_global::ThreadBorrowColumn();
 		for (const auto &col_idx : chunk_state.column_ids) {
+			if (col_idx == borrow_column) {
+				GlobalDictionaryScatterBorrowed(chunk_state, col_idx, append_sel, append_count);
+				continue;
+			}
 			Scatter(chunk_state, new_chunk.data[col_idx], col_idx, append_sel, append_count);
 		}
 	}
@@ -701,8 +714,109 @@ void TupleDataCollection::Scatter(TupleDataChunkState &chunk_state, const DataCh
 #endif
 }
 
+//! the scatter of a borrowed VARCHAR column: every string_t stored as its 16 bytes (the inlined branch of
+//! TupleDataValueStore<string_t> for every row), its non-inlined pointer left pointing into the owner's arena
+template <bool HAS_APPEND_SEL, bool HAS_SOURCE_SEL, bool ALL_VALID>
+static void BorrowedStringScatterInternal(const TupleDataVectorFormat &source_format,
+                                          const SelectionVector &append_sel, const idx_t append_count,
+                                          const TupleDataLayout &layout, const Vector &row_locations,
+                                          const idx_t col_idx) {
+	const auto &source_data = source_format.unified;
+	const auto &source_sel = *source_data.sel;
+	const auto data = UnifiedVectorFormat::GetData<string_t>(source_data);
+	const auto &validity = source_data.validity;
+	const auto target_locations = FlatVector::GetData<data_ptr_t>(row_locations);
+
+	idx_t entry_idx;
+	idx_t idx_in_entry;
+	ValidityBytes::GetEntryIndex(col_idx, entry_idx, idx_in_entry);
+	const auto column_count = layout.ColumnCount();
+	const auto offset_in_row = layout.GetOffsets()[col_idx];
+
+	const auto null_value = NullValue<string_t>();
+	for (idx_t i = 0; i < append_count; i++) {
+		const auto append_idx = HAS_APPEND_SEL ? append_sel.get_index_unsafe(i) : i;
+		const auto source_idx = HAS_SOURCE_SEL ? source_sel.get_index_unsafe(append_idx) : append_idx;
+		const auto &target_location = target_locations[i];
+		if (ALL_VALID || validity.RowIsValidUnsafe(source_idx)) {
+			Store<string_t>(data[source_idx], target_location + offset_in_row);
+		} else {
+			Store<string_t>(null_value, target_location + offset_in_row);
+			ValidityBytes(target_location, column_count).SetInvalidUnsafe(entry_idx, idx_in_entry);
+		}
+	}
+}
+
+static void BorrowedStringScatter(const TupleDataVectorFormat &source_format, const SelectionVector &append_sel,
+                                  const idx_t append_count, const TupleDataLayout &layout,
+                                  const Vector &row_locations, const idx_t col_idx) {
+	const auto has_append_sel = append_sel.IsSet();
+	const auto has_source_sel = source_format.unified.sel->IsSet();
+	const auto all_valid = source_format.unified.validity.AllValid();
+	if (has_append_sel) {
+		if (has_source_sel) {
+			if (all_valid) {
+				BorrowedStringScatterInternal<true, true, true>(source_format, append_sel, append_count, layout,
+				                                                row_locations, col_idx);
+			} else {
+				BorrowedStringScatterInternal<true, true, false>(source_format, append_sel, append_count, layout,
+				                                                 row_locations, col_idx);
+			}
+		} else if (all_valid) {
+			BorrowedStringScatterInternal<true, false, true>(source_format, append_sel, append_count, layout,
+			                                                 row_locations, col_idx);
+		} else {
+			BorrowedStringScatterInternal<true, false, false>(source_format, append_sel, append_count, layout,
+			                                                  row_locations, col_idx);
+		}
+	} else if (has_source_sel) {
+		if (all_valid) {
+			BorrowedStringScatterInternal<false, true, true>(source_format, append_sel, append_count, layout,
+			                                                 row_locations, col_idx);
+		} else {
+			BorrowedStringScatterInternal<false, true, false>(source_format, append_sel, append_count, layout,
+			                                                  row_locations, col_idx);
+		}
+	} else if (all_valid) {
+		BorrowedStringScatterInternal<false, false, true>(source_format, append_sel, append_count, layout,
+		                                                  row_locations, col_idx);
+	} else {
+		BorrowedStringScatterInternal<false, false, false>(source_format, append_sel, append_count, layout,
+		                                                   row_locations, col_idx);
+	}
+}
+
+void TupleDataCollection::GlobalDictionaryScatterBorrowed(TupleDataChunkState &chunk_state, const column_t column_id,
+                                                          const SelectionVector &append_sel, const idx_t append_count) const {
+	const auto &source_data = chunk_state.vector_data[column_id].unified;
+	const auto &source_sel = *source_data.sel;
+	const auto data = UnifiedVectorFormat::GetData<string_t>(source_data);
+	const auto &validity = source_data.validity;
+	const auto target_locations = FlatVector::GetData<data_ptr_t>(chunk_state.row_locations);
+	idx_t entry_idx;
+	idx_t idx_in_entry;
+	ValidityBytes::GetEntryIndex(column_id, entry_idx, idx_in_entry);
+	const auto column_count = layout.ColumnCount();
+	const auto offset_in_row = layout.GetOffsets()[column_id];
+	for (idx_t i = 0; i < append_count; i++) {
+		const auto append_idx = append_sel.get_index(i);
+		const auto source_idx = source_sel.get_index(append_idx);
+		if (validity.RowIsValid(source_idx)) {
+			Store<string_t>(data[source_idx], target_locations[i] + offset_in_row);
+		} else {
+			Store<string_t>(NullValue<string_t>(), target_locations[i] + offset_in_row);
+			ValidityBytes(target_locations[i], column_count).SetInvalidUnsafe(entry_idx, idx_in_entry);
+		}
+	}
+}
+
 void TupleDataCollection::Scatter(TupleDataChunkState &chunk_state, const Vector &source, const column_t column_id,
                                   const SelectionVector &append_sel, const idx_t append_count) const {
+	if (column_id == chunk_state.borrowed_key_column) {
+		BorrowedStringScatter(chunk_state.vector_data[column_id], append_sel, append_count, layout,
+		                      chunk_state.row_locations, column_id);
+		return;
+	}
 	const auto &scatter_function = scatter_functions[column_id];
 	scatter_function.function(source, chunk_state.vector_data[column_id], append_sel, append_count, layout,
 	                          chunk_state.row_locations, chunk_state.heap_locations, column_id,

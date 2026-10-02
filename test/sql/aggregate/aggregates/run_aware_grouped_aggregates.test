@@ -1,0 +1,214 @@
+# name: test/sql/aggregate/aggregates/run_aware_grouped_aggregates.test
+# description: Run-aware GROUP BY over RLE and Constant integer group columns (extending the run channel
+#              from ungrouped to grouped aggregates): a COUNT-family aggregate grouped by one run-eligible integer
+#              column performs one hash probe and one state update per (value, run length) pair and must equal the
+#              row-by-row answers, while every other shape (filters, NULLs, a second group column, a VARCHAR group,
+#              grouping sets, DISTINCT/FILTER aggregates, SUM/AVG/MIN/MAX) keeps the ordinary path.
+# group: [aggregates]
+
+statement ok
+PRAGMA enable_verification
+
+# 1,300 groups of 100 rows each; the values are spread far apart so the plan is a HASH_GROUP_BY and not a perfect hash
+statement ok
+CREATE TABLE t_rle_int(v INTEGER USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_rle_int SELECT ((i // 100) * 1000003)::INTEGER FROM range(130000) t(i);
+
+# the same values without RLE: the row-by-row reference
+statement ok
+CREATE TABLE t_ref_int(v INTEGER USING COMPRESSION 'uncompressed');
+
+statement ok
+INSERT INTO t_ref_int SELECT ((i // 100) * 1000003)::INTEGER FROM range(130000) t(i);
+
+# run lengths 1, 7, 8, 2047, 2048, 2049, 65535 (the rle_count_t cap) and 70000 (a run spanning two stored entries and
+# a row-group boundary), each its own group
+statement ok
+CREATE TABLE t_runs(v BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_runs SELECT CASE WHEN i < 1 THEN 1000000007::BIGINT WHEN i < 8 THEN 2000000014::BIGINT WHEN i < 16 THEN 3000000021::BIGINT WHEN i < 2063 THEN 4000000028::BIGINT WHEN i < 4111 THEN 5000000035::BIGINT WHEN i < 6160 THEN 6000000042::BIGINT WHEN i < 71695 THEN 7000000049::BIGINT WHEN i < 141695 THEN 8000000056::BIGINT ELSE 9000000063::BIGINT END FROM range(143751) t(i);
+
+# a single-value column becomes a Constant segment
+statement ok
+CREATE TABLE t_const(v BIGINT, w INTEGER);
+
+statement ok
+INSERT INTO t_const SELECT 4242424242424::BIGINT, 77::INTEGER FROM range(130000) t(i);
+
+# NULL layouts: a NULL inside a run, every 64th row NULL
+statement ok
+CREATE TABLE t_null(v BIGINT USING COMPRESSION 'rle', z BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_null SELECT CASE WHEN i % 5000 = 2500 THEN NULL ELSE ((i // 100) * 1000003)::BIGINT END, CASE WHEN i % 64 = 63 THEN NULL ELSE ((i // 200) * 1000003)::BIGINT END FROM range(130000) t(i);
+
+# two row groups with NULLs only in the first: the first falls back, the second takes the run path
+statement ok
+CREATE TABLE t_null_rg(v BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_null_rg SELECT CASE WHEN i < 122880 AND i % 5000 = 0 THEN NULL ELSE ((i // 100) * 1000003)::BIGINT END FROM range(245760) t(i);
+
+statement ok
+CREATE TABLE t_text(v VARCHAR, n INTEGER USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO t_text SELECT 'g' || (i // 100)::VARCHAR, ((i // 100) * 1000003)::INTEGER FROM range(130000) t(i);
+
+statement ok
+CHECKPOINT;
+
+# ---------------------------------------------------------------------------------------------------------------
+# the admitted shape: one run-eligible integer group column and COUNT(*)
+# ---------------------------------------------------------------------------------------------------------------
+query III
+SELECT COUNT(*), SUM(c), MAX(c) FROM (SELECT v, COUNT(*) AS c FROM t_rle_int GROUP BY v);
+----
+1300	130000	100
+
+query I
+SELECT COUNT(*) FROM (SELECT v, COUNT(*) AS c FROM t_rle_int GROUP BY v EXCEPT SELECT v, COUNT(*) AS c FROM t_ref_int GROUP BY v);
+----
+0
+
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_rle_int GROUP BY v;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+query II
+SELECT v, COUNT(*) AS c FROM t_rle_int GROUP BY v ORDER BY c DESC, v LIMIT 3;
+----
+0	100
+1000003	100
+2000006	100
+
+# run boundaries: every declared run length lands in its own group
+query II
+SELECT v, COUNT(*) AS c FROM t_runs GROUP BY v ORDER BY v;
+----
+1000000007	1
+2000000014	7
+3000000021	8
+4000000028	2047
+5000000035	2048
+6000000042	2049
+7000000049	65535
+8000000056	70000
+9000000063	2056
+
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_runs GROUP BY v;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+# a Constant segment is one run per vector
+query II
+SELECT v, COUNT(*) FROM t_const GROUP BY v;
+----
+4242424242424	130000
+
+# ---------------------------------------------------------------------------------------------------------------
+# NULL layouts: the group falls back and equals the row-by-row answer
+# ---------------------------------------------------------------------------------------------------------------
+query III
+SELECT COUNT(*), SUM(c), COUNT(*) FILTER (WHERE v IS NULL) FROM (SELECT v, COUNT(*) AS c FROM t_null GROUP BY v);
+----
+1301	130000	1
+
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_null GROUP BY v;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query III
+SELECT COUNT(*), SUM(c), COUNT(*) FILTER (WHERE z IS NULL) FROM (SELECT z, COUNT(*) AS c FROM t_null GROUP BY z);
+----
+651	130000	1
+
+query III
+SELECT COUNT(*), SUM(c), COUNT(*) FILTER (WHERE v IS NULL) FROM (SELECT v, COUNT(*) AS c FROM t_null_rg GROUP BY v);
+----
+2459	245760	1
+
+# ---------------------------------------------------------------------------------------------------------------
+# the fallback set: every other shape keeps the ordinary path and shows no marker
+# ---------------------------------------------------------------------------------------------------------------
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_rle_int WHERE v > 1000000 GROUP BY v;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+SELECT COUNT(*), SUM(c) FROM (SELECT v, COUNT(*) AS c FROM t_rle_int WHERE v > 1000000 GROUP BY v);
+----
+1299	129900
+
+query II
+EXPLAIN SELECT v, w, COUNT(*) FROM t_const GROUP BY v, w;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query III
+SELECT v, w, COUNT(*) FROM t_const GROUP BY v, w;
+----
+4242424242424	77	130000
+
+query II
+EXPLAIN SELECT v, COUNT(*) FROM t_text GROUP BY v;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+SELECT COUNT(*), SUM(c) FROM (SELECT v, COUNT(*) AS c FROM t_text GROUP BY v);
+----
+1300	130000
+
+query II
+EXPLAIN SELECT n, SUM(n) FROM t_text GROUP BY n;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+EXPLAIN SELECT n, COUNT(DISTINCT n) FROM t_text GROUP BY n;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+EXPLAIN SELECT n, COUNT(*) FILTER (WHERE n > 0) FROM t_text GROUP BY n;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+EXPLAIN SELECT v, COUNT(*), GROUPING(v) FROM t_rle_int GROUP BY GROUPING SETS ((v), ());
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+SELECT COUNT(*), SUM(c) FROM (SELECT v, COUNT(*) AS c FROM t_rle_int GROUP BY ROLLUP (v));
+----
+1301	260000
+
+query II
+EXPLAIN SELECT v, MIN(v), MAX(v) FROM t_rle_int GROUP BY v;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+query II
+SELECT COUNT(*), SUM(c) FROM (SELECT v, COUNT(*) AS c FROM t_rle_int GROUP BY v HAVING COUNT(*) > 99);
+----
+1300	130000
+
+# the ungrouped run path is unchanged
+query II
+EXPLAIN SELECT SUM(v), COUNT(*) FROM t_runs;
+----
+physical_plan	<REGEX>:.*Run Aggregate.*
+
+query I
+SELECT COUNT(*) FROM t_rle_int;
+----
+130000

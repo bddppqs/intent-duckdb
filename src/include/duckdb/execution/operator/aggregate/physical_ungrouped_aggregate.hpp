@@ -17,6 +17,8 @@
 #include "duckdb/common/unordered_map.hpp"
 
 namespace duckdb {
+class RunAggregateData;
+class FusedIntegerAggregate;
 
 //! PhysicalUngroupedAggregate is an aggregate operator that can only perform aggregates without any groups
 class PhysicalUngroupedAggregate : public PhysicalOperator {
@@ -27,20 +29,36 @@ public:
 	PhysicalUngroupedAggregate(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                           vector<unique_ptr<Expression>> expressions, idx_t estimated_cardinality,
 	                           TupleDataValidityType distinct_validity);
+	~PhysicalUngroupedAggregate() override;
 
 	//! The aggregates that have to be computed
 	vector<unique_ptr<Expression>> aggregates;
 	unique_ptr<DistinctAggregateData> distinct_data;
 	unique_ptr<DistinctAggregateCollectionInfo> distinct_collection_info;
+	//! Run-aware aggregation descriptor shared with the table scan (may be null)
+	shared_ptr<RunAggregateData> run_aggregate;
+	//! The fused kernel's DISTINCT class: count(DISTINCT x) over one non-NULL integer x, as the (x)-keyed partitioned
+	//! dedup of the fused integer aggregate. Null when the gate refuses the plan or kFusedDistinctAggregate is off
+	unique_ptr<FusedIntegerAggregate> fused;
 
 public:
 	// Source interface
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
+	//! Phase 2's source states while the fused path owns the source; the defaults otherwise
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
+	                                                 GlobalSourceState &gstate) const override;
+	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	InsertionOrderPreservingMap<string> ExtraSourceParams(GlobalSourceState &gstate,
+	                                                      LocalSourceState &lstate) const override;
 
 	bool IsSource() const override {
 		return true;
 	}
+	//! Parallel, and NO_ORDER (so the result collector can go parallel), while fused; the defaults otherwise
+	bool ParallelSource() const override;
+	OrderPreservationType SourceOrder() const override;
 
 public:
 	// Sink interface

@@ -550,7 +550,15 @@ void TupleDataAllocator::RecomputeHeapPointers(Vector &old_heap_ptrs, const Sele
 		}
 		return;
 	}
+	RecomputeHeapPointersInternal(old_heap_ptrs, old_heap_sel, row_locations, new_heap_ptrs, offset, count, layout,
+	                              base_col_offset, layout.GetHeapSizeOffset());
+}
 
+void TupleDataAllocator::RecomputeHeapPointersInternal(Vector &old_heap_ptrs, const SelectionVector &old_heap_sel,
+                                                       const data_ptr_t row_locations[], Vector &new_heap_ptrs,
+                                                       const idx_t offset, const idx_t count,
+                                                       const TupleDataLayout &layout, const idx_t base_col_offset,
+                                                       const idx_t heap_size_offset) {
 	const auto old_heap_locations = FlatVector::GetData<data_ptr_t>(old_heap_ptrs);
 
 	UnifiedVectorFormat new_heap_data;
@@ -574,12 +582,21 @@ void TupleDataAllocator::RecomputeHeapPointers(Vector &old_heap_ptrs, const Sele
 		case PhysicalType::VARCHAR: {
 			for (idx_t i = 0; i < count; i++) {
 				const auto idx = offset + i;
+				if (Load<idx_t>(row_locations[idx] + heap_size_offset) == 0) {
+					continue;
+				}
 				const auto &row_location = row_locations[idx] + base_col_offset;
 				const auto valid =
 				    all_valid ||
 				    ValidityBytes::RowIsValid(
 				        ValidityBytes(row_location, column_count).GetValidityEntryUnsafe(entry_idx), idx_in_entry);
 				if (!valid) {
+					continue;
+				}
+
+				if (base_col_offset == 0 && Load<idx_t>(row_locations[idx] + layout.GetHeapSizeOffset()) == 0) {
+					// a row without heap holds no pointer into it: a borrowed
+					// string points into a pinned dictionary and is left alone
 					continue;
 				}
 
@@ -602,6 +619,9 @@ void TupleDataAllocator::RecomputeHeapPointers(Vector &old_heap_ptrs, const Sele
 		case PhysicalType::ARRAY: {
 			for (idx_t i = 0; i < count; i++) {
 				const auto idx = offset + i;
+				if (Load<idx_t>(row_locations[idx] + heap_size_offset) == 0) {
+					continue;
+				}
 				const auto &row_location = row_locations[idx] + base_col_offset;
 				const auto valid =
 				    all_valid ||
@@ -625,8 +645,8 @@ void TupleDataAllocator::RecomputeHeapPointers(Vector &old_heap_ptrs, const Sele
 		case PhysicalType::STRUCT: {
 			const auto &struct_layout = layout.GetStructLayout(col_idx);
 			if (!struct_layout.AllConstant()) {
-				RecomputeHeapPointers(old_heap_ptrs, old_heap_sel, row_locations, new_heap_ptrs, offset, count,
-				                      struct_layout, base_col_offset + col_offset);
+				RecomputeHeapPointersInternal(old_heap_ptrs, old_heap_sel, row_locations, new_heap_ptrs, offset, count,
+				                              struct_layout, base_col_offset + col_offset, heap_size_offset);
 			}
 			break;
 		}

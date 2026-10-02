@@ -1,0 +1,113 @@
+# name: test/sql/aggregate/group/stored_hash_chain.test
+# description: The stored row hash and the in-place chained partition table on the fused kernel's integer
+#              class over >= 2^20 rows: two keys with duplicates (BIGINT + full-range INTEGER), a compressed key, every key unique
+#              (chains of length one), one key holding most rows (a long duplicate chain in one partition); the answers
+#              from the generator, the fields hash=stored chain=on on each JSON plan, and a shape whose compact row is the admitted
+#              maximum of 32 bytes keeping the row without the stored hash (fused, no field)
+# group: [group]
+
+# t1: two keys (BIGINT + full-range INTEGER) over 1,000,003 groups of two or three rows
+statement ok
+CREATE TABLE t1 AS SELECT ((i % 1000003) * 1000003)::BIGINT AS k1, ((i % 1000003) * 7919 % 2147483647)::INTEGER AS k2, (i % 2)::SMALLINT AS r, (i % 1500)::SMALLINT AS w FROM range(2200000) t(i);
+
+# t2: a compressed key: a SMALLINT of 50 values (compressed to UTINYINT by the planner) beside a full-range INTEGER
+statement ok
+CREATE TABLE t2 AS SELECT (i % 50)::SMALLINT AS cat, ((i % 1100000) * 7919 % 2147483647)::INTEGER AS num, (i % 2)::SMALLINT AS r, (i % 1500)::SMALLINT AS w FROM range(2200000) t(i);
+
+# t3: every key unique: 2,200,000 groups of one row
+statement ok
+CREATE TABLE t3 AS SELECT (i * 2654435761)::BIGINT AS k, (i % 7)::SMALLINT AS x FROM range(2200000) t(i);
+
+# t4: 2,000,000 rows of one key and 200,000 keys of one row each
+statement ok
+CREATE TABLE t4 AS SELECT (CASE WHEN i < 2000000 THEN 7 ELSE i * 2654435761 END)::BIGINT AS k, (i % 3)::SMALLINT AS x FROM range(2200000) t(i);
+
+# t5: a compact row of 32 bytes (an uncompressed BIGINT key, a full-range INTEGER key, two BIGINT and one INTEGER input)
+statement ok
+CREATE TABLE t5 AS SELECT (i * 1000003)::BIGINT AS k1, ((i * 7919) % 2147483647)::INTEGER AS k2, (i * 5)::BIGINT AS b1, (i * 3)::BIGINT AS b2, (i % 1000)::INTEGER AS z FROM range(2200000) t(i);
+
+# two keys with duplicates: count_star, sum(SMALLINT), avg(SMALLINT)
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t1 GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*hash=stored chain=on.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sr)::BIGINT, sum(round(aw * c))::BIGINT, count(*) FILTER (WHERE c = 3)::BIGINT FROM (SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t1 GROUP BY k1, k2)
+----
+1000003	2200000	1100000	1648650000	199994
+
+query IIIII
+SELECT k1, k2, c, sr, round(aw * c)::BIGINT FROM (SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t1 GROUP BY k1, k2) ORDER BY c DESC, k1 LIMIT 3
+----
+0	0	3	1	1509
+1000003	7919	3	2	1512
+2000006	15838	3	1	1515
+
+# the count-only form of the same shape
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, count(*) AS c FROM t1 GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*hash=stored chain=on.*
+
+query III
+SELECT count(*)::BIGINT, sum(c)::BIGINT, count(*) FILTER (WHERE c = 2)::BIGINT FROM (SELECT k1, k2, count(*) AS c FROM t1 GROUP BY k1, k2)
+----
+1000003	2200000	800009
+
+# a compressed key (a SMALLINT beside a full-range INTEGER)
+query II
+EXPLAIN (FORMAT JSON) SELECT cat, num, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t2 GROUP BY cat, num
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*hash=stored chain=on.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sr)::BIGINT, min(cat)::BIGINT, max(cat)::BIGINT, sum(round(aw * c))::BIGINT FROM (SELECT cat, num, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t2 GROUP BY cat, num)
+----
+1100000	2200000	1100000	0	49	1648650000
+
+query IIII
+SELECT cat::BIGINT, num::BIGINT, c, sr::BIGINT FROM (SELECT cat, num, count(*) AS c, sum(r) AS sr FROM t2 GROUP BY cat, num) ORDER BY sr DESC, cat, num LIMIT 3
+----
+1	7919	2	2
+1	59428	2	2
+1	157072	2	2
+
+# every key unique: every chain of length one
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c, sum(x) AS sx FROM t3 GROUP BY k
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*hash=stored chain=on.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sx)::BIGINT, max(c)::BIGINT FROM (SELECT k, count(*) AS c, sum(x) AS sx FROM t3 GROUP BY k)
+----
+2200000	2200000	6599995	1
+
+# one key holding 2,000,000 rows: a long duplicate chain in one partition
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c, sum(x) AS sx FROM t4 GROUP BY k
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*hash=stored chain=on.*
+
+query III
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sx)::BIGINT FROM (SELECT k, count(*) AS c, sum(x) AS sx FROM t4 GROUP BY k)
+----
+200001	2200000	2199999
+
+query III
+SELECT k, c, sx::BIGINT FROM (SELECT k, count(*) AS c, sum(x) AS sx FROM t4 GROUP BY k) ORDER BY c DESC, k LIMIT 2
+----
+7	2000000	1999999
+5308871522000000	1	2
+
+# a compact row of 32 bytes: fused without the stored hash, the stored bits would pass MAXIMUM_ROW_BYTES, so no field
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, sum(b1) AS s1, sum(b2) AS s2, sum(z) AS sz FROM t5 GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "keys=2 aggregates=3 partitions=4096 budget_mib=[0-9]+( kind=[a-z]+)?( reserve=[a-z]+)?",.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(s1)::BIGINT, sum(s2)::BIGINT, sum(sz)::BIGINT FROM (SELECT k1, k2, sum(b1) AS s1, sum(b2) AS s2, sum(z) AS sz FROM t5 GROUP BY k1, k2)
+----
+2200000	12099994500000	7259996700000	1098900000

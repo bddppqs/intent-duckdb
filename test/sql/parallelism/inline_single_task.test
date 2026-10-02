@@ -1,0 +1,76 @@
+# name: test/sql/parallelism/inline_single_task.test
+# description: Sequential (single-task) pipelines run inline on the scheduling thread give unchanged answers
+# group: [parallelism]
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+CREATE TABLE t AS SELECT range AS i, range % 7 AS g FROM range(300000);
+
+foreach threads 1 2 8
+
+statement ok
+SET threads=${threads}
+
+statement ok
+PRAGMA verify_parallelism
+
+query II
+SELECT SUM(i), COUNT(*) FROM t;
+----
+44999850000	300000
+
+query I
+SELECT i FROM t ORDER BY i DESC LIMIT 3;
+----
+299999
+299998
+299997
+
+query II
+SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g;
+----
+0	42858
+1	42857
+2	42857
+3	42857
+4	42857
+5	42857
+6	42857
+
+# a window without PARTITION BY and an ordered string_agg run in sequential pipelines
+query I
+SELECT SUM(rn) FROM (SELECT row_number() OVER () AS rn FROM t);
+----
+45000150000
+
+query I
+SELECT string_agg(i::VARCHAR, ',' ORDER BY i) FROM t WHERE i < 5;
+----
+0,1,2,3,4
+
+query I
+SELECT COUNT(*) FROM (SELECT i FROM t LIMIT 1000);
+----
+1000
+
+query I
+SELECT COUNT(*) FROM t a JOIN t b ON a.i = b.i WHERE a.i < 100;
+----
+100
+
+query I
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 10) SELECT SUM(n) FROM r;
+----
+55
+
+statement error
+SELECT CAST('x' AS INTEGER) FROM range(3);
+----
+Conversion Error
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+endloop

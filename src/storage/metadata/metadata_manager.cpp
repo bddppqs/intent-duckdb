@@ -6,6 +6,8 @@
 #include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 
@@ -328,6 +330,29 @@ void MetadataManager::Read(ReadStream &source) {
 void MetadataBlock::Write(WriteStream &sink) {
 	sink.Write<block_id_t>(block_id);
 	sink.Write<idx_t>(FreeBlocksToInteger());
+}
+
+void MetadataManager::ReadAhead(const vector<MetaBlockPointer> &pointers) {
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&block_manager);
+	if (!single_file || pointers.empty()) {
+		return;
+	}
+	vector<shared_ptr<BlockHandle>> handles;
+	{
+		lock_guard<mutex> guard(block_lock);
+		unordered_set<block_id_t> seen;
+		for (auto &pointer : pointers) {
+			auto block_id = pointer.GetBlockId();
+			if (!seen.insert(block_id).second) {
+				continue;
+			}
+			auto entry = blocks.find(block_id);
+			if (entry != blocks.end() && entry->second.block) {
+				handles.push_back(entry->second.block);
+			}
+		}
+	}
+	single_file->ReadAhead(handles);
 }
 
 idx_t MetadataManager::GetMetadataBlockSize() const {

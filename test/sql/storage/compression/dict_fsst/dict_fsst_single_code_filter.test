@@ -1,0 +1,274 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_single_code_filter.test
+# description: Single-code constant filters over DICT_FSST: <> and = with the constant present in and absent from each segment's dictionary, the empty string, NULL rows present and absent, a two-entry and a two-value dictionary, an all-NULL segment, conjunctions and IN lists, IS [NOT] NULL, a selective first predicate (the sparse branch) and an unselective one, a TopN on the filtered column, DICTIONARY-, DICT_FSST- and FSST_ONLY-mode columns, a table shorter than a vector; the answers are the plain engine answers at threads 1 and 8
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load {TEST_DIR}/dict_fsst_single_code_filter.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_code AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://example.com/search/' || md5((i // 3)::VARCHAR) || '/page' END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS d, CASE WHEN i % 101 = 0 THEN NULL WHEN i % 7 = 0 THEN '' ELSE 'd' || lpad((i % 20)::VARCHAR, 2, '0') END AS de, CASE WHEN i % 11 = 0 THEN '' ELSE 'n' || lpad((i % 50)::VARCHAR, 2, '0') END AS n, CASE WHEN i % 3 = 0 THEN NULL ELSE 'only' END AS o, CASE WHEN i % 5 = 0 THEN 'a' ELSE 'b' END AS ab, 'u' || i::VARCHAR || repeat('z', 30) || i::VARCHAR AS f FROM range(368640) tbl(i)
+
+statement ok
+CREATE TABLE t_allnull AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i < 250000 THEN NULL ELSE 'v' || lpad(i::VARCHAR, 6, '0') END AS s FROM range(300000) tbl(i)
+
+statement ok
+CREATE TABLE t_short AS SELECT i::BIGINT AS i, CASE WHEN i % 7 = 0 THEN '' ELSE 'v' || lpad(((i * 31) % 1000)::VARCHAR, 4, '0') END AS s FROM range(100) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+# the modes read from segment_info (never inferred): s DICT_FSST, d DICTIONARY, f FSST_ONLY somewhere
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICT_FSST:%') FROM pragma_storage_info('t_code') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST' AND segment_info LIKE 'DICTIONARY:%') FROM pragma_storage_info('t_code') WHERE column_name = 'd' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT bool_or(compression = 'DICT_FSST' AND segment_info LIKE 'FSST_ONLY:%') FROM pragma_storage_info('t_code') WHERE column_name = 'f' AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+# <> '' where '' is one entry of some segments, NULLs present (DICT_FSST mode)
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s <> ''
+----
+360739	360739	https://example.com/search/00003e3b9e5336685200ae85d21b4f5e/page	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# = ''
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s = ''
+----
+4100	4100	(empty)	(empty)
+
+# = a value present in some segments
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s = 'https://example.com/search/a87ff679a2f3e71d9181a67b7542122c/page'
+----
+3	3	https://example.com/search/a87ff679a2f3e71d9181a67b7542122c/page	https://example.com/search/a87ff679a2f3e71d9181a67b7542122c/page
+
+# <> a value present in some segments
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s <> 'https://example.com/search/a87ff679a2f3e71d9181a67b7542122c/page'
+----
+364836	364836	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+# <> and = a value absent from every dictionary
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s <> 'absent'
+----
+364839	364839	(empty)	https://example.com/search/fffffe98d0963d27015c198262d97221/page
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE s = 'absent'
+----
+0	0	NULL	NULL
+
+# <> a value present in every segment (DICTIONARY mode, NULLs present)
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d <> 'd05'
+----
+346741	346741	d00	d19
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d = 'd05'
+----
+18249	18249	d05	d05
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d <> 'zz'
+----
+364990	364990	d00	d19
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d = 'zz'
+----
+0	0	NULL	NULL
+
+# <> '' and = '' with '' in every segment
+query IIII
+SELECT count(*), count(de), min(de), max(de) FROM t_code WHERE de <> ''
+----
+312849	312849	d00	d19
+
+query IIII
+SELECT count(*), count(de), min(de), max(de) FROM t_code WHERE de = ''
+----
+52141	52141	(empty)	(empty)
+
+# no NULL row
+query IIII
+SELECT count(*), count(n), min(n), max(n) FROM t_code WHERE n <> ''
+----
+335127	335127	n00	n49
+
+query IIII
+SELECT count(*), count(n), min(n), max(n) FROM t_code WHERE n = 'n07'
+----
+6703	6703	n07	n07
+
+# a two-entry dictionary (the NULL slot and one value)
+query IIII
+SELECT count(*), count(o), min(o), max(o) FROM t_code WHERE o <> 'only'
+----
+0	0	NULL	NULL
+
+query IIII
+SELECT count(*), count(o), min(o), max(o) FROM t_code WHERE o = 'only'
+----
+245760	245760	only	only
+
+query IIII
+SELECT count(*), count(o), min(o), max(o) FROM t_code WHERE o <> 'other'
+----
+245760	245760	only	only
+
+# a two-value dictionary without NULLs
+query IIII
+SELECT count(*), count(ab), min(ab), max(ab) FROM t_code WHERE ab <> 'a'
+----
+294912	294912	b	b
+
+query IIII
+SELECT count(*), count(ab), min(ab), max(ab) FROM t_code WHERE ab = 'a'
+----
+73728	73728	a	a
+
+# a conjunction on one column: two failing entries
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d <> 'd01' AND d <> 'd02'
+----
+328492	328492	d00	d19
+
+# IN lists: two passing entries, and one present value beside an absent one
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d IN ('d01', 'd02')
+----
+36498	36498	d01	d02
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d IN ('d01', 'zz')
+----
+18249	18249	d01	d01
+
+# IS NULL / IS NOT NULL
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d IS NULL
+----
+3650	0	NULL	NULL
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE d IS NOT NULL
+----
+364990	364990	d00	d19
+
+# a selective first predicate (at most 3 rows per vector) and an unselective one
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE k < 3 AND d <> 'd05'
+----
+499	499	d00	d18
+
+query IIII
+SELECT count(*), count(d), min(d), max(d) FROM t_code WHERE k >= 3 AND d <> 'd05'
+----
+346242	346242	d00	d19
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_code WHERE k < 3 AND s <> ''
+----
+529	529	https://example.com/search/01cc1da1d5e00d6c7fb60943b4b03f68/page	https://example.com/search/ff6dec2c39768126491474050424b2ed/page
+
+# FSST_ONLY mode
+query IIII
+SELECT count(*), count(f), min(f), max(f) FROM t_code WHERE f <> 'u5zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz5'
+----
+368639	368639	u0zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz0	u9zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz9
+
+query IIII
+SELECT count(*), count(f), min(f), max(f) FROM t_code WHERE f = 'u200000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz200000'
+----
+1	1	u200000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz200000	u200000zzzzzzzzzzzzzzzzzzzzzzzzzzzzzz200000
+
+# grouped by the filtered column
+query II
+SELECT d, count(*) FROM t_code WHERE d <> 'd05' GROUP BY d ORDER BY d
+----
+d00	18249
+d01	18249
+d02	18249
+d03	18249
+d04	18249
+d06	18249
+d07	18249
+d08	18249
+d09	18249
+d10	18250
+d11	18250
+d12	18250
+d13	18250
+d14	18250
+d15	18250
+d16	18250
+d17	18250
+d18	18250
+d19	18250
+
+# a TopN on the filtered column
+query II
+SELECT d, i FROM t_code WHERE d <> 'd00' ORDER BY d, i LIMIT 5
+----
+d01	1
+d01	21
+d01	41
+d01	61
+d01	81
+
+# the rows in rowid order
+query I
+SELECT string_agg(d, ',' ORDER BY i) FROM t_code WHERE i < 60 AND d <> 'd03'
+----
+d01,d02,d04,d05,d06,d07,d08,d09,d10,d11,d12,d13,d14,d15,d16,d17,d18,d19,d00,d01,d02,d04,d05,d06,d07,d08,d09,d10,d11,d12,d13,d14,d15,d16,d17,d18,d19,d00,d01,d02,d04,d05,d06,d07,d08,d09,d10,d11,d12,d13,d14,d15,d16,d17,d18,d19
+
+query III
+SELECT min(rowid), max(rowid), count(*) FROM t_code WHERE d = 'd07'
+----
+7	368627	18249
+
+# an all-NULL segment
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_allnull WHERE s <> 'v250000'
+----
+49999	49999	v250001	v299999
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_allnull WHERE s = 'v250001'
+----
+1	1	v250001	v250001
+
+# a table shorter than a vector
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_short WHERE s <> ''
+----
+85	85	v0007	v0992
+
+query IIII
+SELECT count(*), count(s), min(s), max(s) FROM t_short WHERE s = 'v0031'
+----
+1	1	v0031	v0031
+
+endloop

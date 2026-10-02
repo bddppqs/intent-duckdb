@@ -10,6 +10,7 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/checkpoint/table_data_reader.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
@@ -204,6 +205,15 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 	serializer.WriteList(
 	    104, "index_storage_infos", index_storage_infos.ordered_infos.size(),
 	    [&](Serializer::List &list, idx_t i) { list.WriteElement(index_storage_infos.ordered_infos[i].get()); });
+	// Whether total_rows and the table statistics written above are exact for the stored rows. Written only in the
+	// block-compressed file, which no reader without this property opens (it refuses the file version): a reader of
+	// any other file, upstream's included, never meets an unknown property. The flag only goes from true to false,
+	// and every delete, update or reverted append clears it before it changes the rows
+	// (RowGroupCollection::StatsExact).
+	auto block_manager = dynamic_cast<SingleFileBlockManager *>(&checkpoint_manager.GetBlockManager());
+	if (block_manager && block_manager->BlockCompression()) {
+		serializer.WritePropertyWithDefault<bool>(105, "stats_exact", collection.StatsExact(), false);
+	}
 }
 
 } // namespace duckdb

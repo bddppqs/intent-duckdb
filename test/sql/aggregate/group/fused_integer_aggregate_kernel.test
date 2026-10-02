@@ -1,0 +1,109 @@
+# name: test/sql/aggregate/group/fused_integer_aggregate_kernel.test
+# description: The fused integer aggregate: every admitted shape over >= 2^20 rows (one key, two keys, a compressed
+#              key, each aggregate kind, a HAVING above), expected rows in closed form from the generator, and an
+#              EXPLAIN per shape asserting the Fused Aggregate marker (and its absence on refused twins)
+# group: [group]
+
+# t1: one BIGINT key over 1,100,000 groups of two rows (g and g + 1,100,000); key range > 2^32, so uncompressed
+statement ok
+CREATE TABLE t1 AS SELECT ((i % 1100000) * 1000003)::BIGINT AS k, (i % 7)::SMALLINT AS x, (i % 1000 - 500)::SMALLINT AS y, (i * 3)::INTEGER AS z, (i * 5)::BIGINT AS b FROM range(2200000) t(i);
+
+# t2: two keys (BIGINT + full-range INTEGER) over 1,000,003 groups of two or three rows
+statement ok
+CREATE TABLE t2 AS SELECT ((i % 1000003) * 1000003)::BIGINT AS k1, ((i % 1000003) * 7919 % 2147483647)::INTEGER AS k2, (i % 2)::SMALLINT AS r, (i % 1500)::SMALLINT AS w FROM range(2200000) t(i);
+
+# t3: a compressed key: a SMALLINT of 50 values (compressed to UTINYINT by the planner) beside a full-range INTEGER
+statement ok
+CREATE TABLE t3 AS SELECT (i % 50)::SMALLINT AS a, ((i % 1100000) * 7919 % 2147483647)::INTEGER AS b, (i % 2)::SMALLINT AS r, (i % 1500)::SMALLINT AS w FROM range(2200000) t(i);
+
+# one key: count_star, sum(SMALLINT), avg(SMALLINT)
+query II
+EXPLAIN SELECT k, count(*) AS c, sum(x) AS sx, avg(y) AS ay FROM t1 GROUP BY k
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sx)::BIGINT, (sum(ay) * 2)::BIGINT, min(k), max(k) FROM (SELECT k, count(*) AS c, sum(x) AS sx, avg(y) AS ay FROM t1 GROUP BY k)
+----
+1100000	2200000	6599995	-1100000	0	1100002299997
+
+query IIII
+SELECT k, count(*) AS c, sum(x) AS sx, avg(y) AS ay FROM t1 GROUP BY k ORDER BY sx DESC, k LIMIT 3
+----
+6000018	2	11	-494.0
+13000039	2	11	-487.0
+20000060	2	11	-480.0
+
+# one key: count(INTEGER), sum_no_overflow(INTEGER), sum_no_overflow(BIGINT), avg(SMALLINT)
+query II
+EXPLAIN SELECT k, count(z) AS cz, sum(z) AS sz, sum(b) AS sb, avg(x) AS ax FROM t1 GROUP BY k
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(cz)::BIGINT, sum(sz)::BIGINT, sum(sb)::BIGINT, (sum(ax) * 2)::BIGINT FROM (SELECT k, count(z) AS cz, sum(z) AS sz, sum(b) AS sb, avg(x) AS ax FROM t1 GROUP BY k)
+----
+1100000	2200000	7259996700000	12099994500000	6599995
+
+# two keys (BIGINT + full-range INTEGER)
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t2 GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*
+
+query IIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sr)::BIGINT, sum(round(aw * c))::BIGINT FROM (SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t2 GROUP BY k1, k2)
+----
+1000003	2200000	1100000	1648650000
+
+query IIIII
+SELECT k1, k2, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t2 GROUP BY k1, k2 ORDER BY c DESC, k1 LIMIT 3
+----
+0	0	3	1	503.0
+1000003	7919	3	2	504.0
+2000006	15838	3	1	505.0
+
+# a compressed key (a SMALLINT beside a full-range INTEGER): grouped on __internal_compress_integral_utinyint, decompressed above
+query II
+EXPLAIN SELECT a, b, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t3 GROUP BY a, b
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*__internal_compress_integra.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(sr)::BIGINT, min(a), max(a), (sum(aw) * 2)::BIGINT FROM (SELECT a, b, count(*) AS c, sum(r) AS sr, avg(w) AS aw FROM t3 GROUP BY a, b)
+----
+1100000	2200000	1100000	0	49	1648650000
+
+# a HAVING above the aggregate
+query II
+EXPLAIN SELECT a, b, sum(w) AS sw FROM t3 GROUP BY a, b HAVING sum(w) > 2000
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*
+
+query II
+SELECT count(*)::BIGINT, sum(sw)::BIGINT FROM (SELECT a, b, sum(w) AS sw FROM t3 GROUP BY a, b HAVING sum(w) > 2000)
+----
+182517	410663250
+
+query IIII
+SELECT a, b, count(*) AS c, sum(w) AS sw FROM t3 GROUP BY a, b ORDER BY sw DESC, a, b LIMIT 3
+----
+49	1082287	2	2498
+49	3607140	2	2498
+49	6131993	2	2498
+
+# refused twins: avg over INTEGER (its long double finalize), a DOUBLE sum, three keys
+query II
+EXPLAIN SELECT k, avg(z) AS az FROM t1 GROUP BY k
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+query II
+EXPLAIN SELECT k, sum(x::DOUBLE) AS sd FROM t1 GROUP BY k
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+query II
+EXPLAIN SELECT k1, k2, r, count(*) AS c FROM t2 GROUP BY k1, k2, r
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
