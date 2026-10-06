@@ -171,8 +171,9 @@ static constexpr bool kTopNRowwiseBound = true;
 //! The Top-N bound publishes an immutable copy of every value it is set to, so the scans read it without its lock
 static constexpr bool kTopNBoundLockFree = true;
 //! An ordered parallel scan that carries a Top-N bound hands out a short prefix of its first row group, then admits a
-//! bounded number of hand-outs while the bound is set (the wave gate, row_group_collection.cpp)
-static constexpr bool kTopNWaveGate = true;
+//! bounded number of hand-outs while the bound is set (the wave gate, row_group_collection.cpp). Off by default: the
+//! gate stays in the code and is enabled by setting this to true
+static constexpr bool kTopNWaveGate = false;
 //! A pipeline with one task runs it inline on the scheduling thread
 static constexpr bool kInlineSingleTaskPipelines = true;
 
