@@ -2,6 +2,11 @@
 # description: The single-code filter path under a domain verdict: persistent DICT_FSST- and DICTIONARY-mode segments whose dictionary has one failing (<> '') or one passing (=) entry, with the domain verdict on (constant filters, a same-column AND, a TopN whose dynamic bound tightens the domain away from the shape) and off (LIKE / NOT LIKE with an inner wildcard, a canonical LIKE, an OR with IS NULL), NULL rows, a two-entry dictionary and segments starting inside a vector (per-vector survivors); each query twice at threads 1 and 8; the answers are the plain engine answers
 # group: [dict_fsst]
 
+# The straddling segments this test writes need the unaligned DICT_FSST writer, so it runs only in a build with
+# kVectorAlignedDictionarySegments off (the default writer ends every segment on a vector boundary). In the default
+# build, dict_fsst_straddled_segments_read.test reaches the same scan paths on a checked-in straddled file.
+require unaligned_dictionary_segments
+
 require vector_size 2048
 
 load {TEST_DIR}/single_code_domain.db readwrite v1.5.0

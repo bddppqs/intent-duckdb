@@ -2,6 +2,11 @@
 # description: The per-segment dictionary skip: a canonical contains / NOT contains filter (and LIKE '%x%', which the optimizer rewrites to contains) over persistent DICT_FSST- and DICTIONARY-mode segments, most of which hold no passing entry, with segment starts inside a vector, NULLs, an all-NULL segment, the empty needle, a NOT filter over segments whose every entry contains the needle, the non-canonical shapes (ILIKE, a prefix, an inner wildcard), an update inside a needle-free segment and a transient table; each query twice per server (the second read from the verdict slot) at threads 1 and 8; the answers are the plain engine answers
 # group: [dict_fsst]
 
+# The straddling segments this test writes need the unaligned DICT_FSST writer, so it runs only in a build with
+# kVectorAlignedDictionarySegments off (the default writer ends every segment on a vector boundary). In the default
+# build, dict_fsst_straddled_segments_read.test reaches the same scan paths on a checked-in straddled file.
+require unaligned_dictionary_segments
+
 require vector_size 2048
 
 load {TEST_DIR}/dict_fsst_segment_skip.db readwrite v1.5.0

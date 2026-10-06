@@ -6,17 +6,20 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/operator/multiply.hpp"
 #include "duckdb/common/operator/subtract.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/compression/bitpacking.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
 #include <functional>
+#include <type_traits>
 
 namespace duckdb {
 
@@ -43,6 +46,85 @@ static bitpacking_metadata_t DecodeMeta(bitpacking_metadata_encoded_t *metadata_
 	return metadata;
 }
 
+//===--------------------------------------------------------------------===//
+// FOR_SCALED (kScaledFrameOfReference)
+//===--------------------------------------------------------------------===//
+//! A FOR group whose valid values' offsets from the minimum share a greatest common divisor d > 1 stores offset / d,
+//! and a scan computes offset * d + minimum. Integer types up to 64 bits; the arithmetic is unsigned 64-bit, wrapping
+//! to T.
+static bool ScaledFrameOfReferenceAllowed(BlockManager &block_manager) {
+	if (!kScaledFrameOfReference) {
+		return false;
+	}
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&block_manager);
+	return single_file && single_file->ScaledFrameOfReferenceFile();
+}
+
+template <class T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+static uint64_t ScaledOffset(T value, T minimum) {
+	using T_U = typename MakeUnsigned<T>::type;
+	return static_cast<T_U>(static_cast<T_U>(value) - static_cast<T_U>(minimum));
+}
+
+template <class T, typename std::enable_if<!std::is_integral<T>::value, int>::type = 0>
+static uint64_t ScaledOffset(T value, T minimum) {
+	return 0;
+}
+
+//! The greatest common divisor of the valid values' offsets from the minimum (0 when every offset is 0)
+template <class T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+static uint64_t ScaledFrameOfReferenceDivisor(const T *values, const bool *validity, idx_t count, T minimum) {
+	uint64_t divisor = 0;
+	for (idx_t i = 0; i < count && divisor != 1; i++) {
+		if (!validity[i]) {
+			continue;
+		}
+		uint64_t offset = ScaledOffset<T>(values[i], minimum);
+		if (divisor != 0 && offset % divisor == 0) {
+			continue;
+		}
+		while (offset != 0) {
+			uint64_t remainder = divisor % offset;
+			divisor = offset;
+			offset = remainder;
+		}
+	}
+	return divisor;
+}
+
+template <class T, typename std::enable_if<!std::is_integral<T>::value, int>::type = 0>
+static uint64_t ScaledFrameOfReferenceDivisor(const T *values, const bool *validity, idx_t count, T minimum) {
+	return 1;
+}
+
+//! Replaces each value with its offset from the minimum divided by the divisor (0 for a NULL)
+template <class T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+static void DivideFrameOfReference(T *values, const bool *validity, idx_t count, T minimum, uint64_t divisor) {
+	for (idx_t i = 0; i < count; i++) {
+		values[i] = validity[i] ? static_cast<T>(ScaledOffset<T>(values[i], minimum) / divisor) : T(0);
+	}
+}
+
+template <class T, typename std::enable_if<!std::is_integral<T>::value, int>::type = 0>
+static void DivideFrameOfReference(T *values, const bool *validity, idx_t count, T minimum, uint64_t divisor) {
+	throw InternalException("FOR_SCALED is not written for this type");
+}
+
+template <class T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
+static void ApplyScaledFrameOfReference(T *dst, T frame_of_reference, T divisor, idx_t size) {
+	using T_U = typename MakeUnsigned<T>::type;
+	const uint64_t scale = static_cast<T_U>(divisor);
+	const uint64_t base = static_cast<T_U>(frame_of_reference);
+	for (idx_t i = 0; i < size; i++) {
+		dst[i] = static_cast<T>(static_cast<uint64_t>(static_cast<T_U>(dst[i])) * scale + base);
+	}
+}
+
+template <class T, typename std::enable_if<!std::is_integral<T>::value, int>::type = 0>
+static void ApplyScaledFrameOfReference(T *dst, T frame_of_reference, T divisor, idx_t size) {
+	throw InternalException("Invalid bitpacking mode");
+}
+
 struct EmptyBitpackingWriter {
 	template <class T>
 	static void WriteConstant(T constant, idx_t count, void *data_ptr, bool all_invalid) {
@@ -58,6 +140,10 @@ struct EmptyBitpackingWriter {
 	template <class T>
 	static void WriteFor(T *values, bool *validity, bitpacking_width_t width, T frame_of_reference, idx_t count,
 	                     void *data_ptr) {
+	}
+	template <class T>
+	static void WriteForScaled(T *values, bool *validity, bitpacking_width_t width, T frame_of_reference, T divisor,
+	                           idx_t count, void *data_ptr) {
 	}
 };
 
@@ -100,6 +186,8 @@ public:
 
 	// Used to force a specific mode, useful in testing
 	BitpackingMode mode = BitpackingMode::AUTO;
+	// FOR may be written as FOR_SCALED (ScaledFrameOfReferenceAllowed)
+	bool allow_scaled = false;
 
 public:
 	void Reset() {
@@ -214,6 +302,25 @@ public:
 		CalculateFORStats();
 		CalculateDeltaStats();
 
+		// FOR_SCALED replaces FOR when its packed values and the divisor take fewer bytes
+		uint64_t for_divisor = 1;
+		bitpacking_width_t scaled_width = 0;
+		if (allow_scaled && mode == BitpackingMode::AUTO && can_do_for) {
+			for_divisor = ScaledFrameOfReferenceDivisor<T>(compression_buffer, compression_buffer_validity,
+			                                               compression_buffer_idx, minimum);
+			if (for_divisor > 1) {
+				scaled_width = BitpackingPrimitives::MinimumBitWidth<T, false>(
+				    static_cast<T>(ScaledOffset<T>(maximum, minimum) / for_divisor));
+				auto for_width = BitpackingPrimitives::MinimumBitWidth<T, false>(min_max_diff);
+				if (BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, scaled_width) + sizeof(T) >=
+				    BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, for_width)) {
+					for_divisor = 1;
+				}
+			} else {
+				for_divisor = 1;
+			}
+		}
+
 		if (can_do_delta) {
 			if (maximum_delta == minimum_delta && mode != BitpackingMode::FOR && mode != BitpackingMode::DELTA_FOR) {
 				// FOR needs to be T (considering hugeint is bigger than idx_t)
@@ -232,6 +339,9 @@ public:
 
 			//! `min_max_diff` is uninitialized if `can_do_for` isn't true
 			bool prefer_for = can_do_for && delta_required_bitwidth >= regular_required_bitwidth;
+			if (for_divisor > 1) {
+				prefer_for = delta_required_bitwidth >= scaled_width;
+			}
 
 			if (!prefer_for && mode != BitpackingMode::FOR) {
 				SubtractFrameOfReference(delta_buffer, minimum_delta);
@@ -251,6 +361,20 @@ public:
 
 				return true;
 			}
+		}
+
+		if (can_do_for && for_divisor > 1) {
+			DivideFrameOfReference(compression_buffer, compression_buffer_validity, compression_buffer_idx, minimum,
+			                       for_divisor);
+			OP::WriteForScaled(compression_buffer, compression_buffer_validity, scaled_width, minimum,
+			                   static_cast<T>(for_divisor), compression_buffer_idx, data_ptr);
+
+			total_size += BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, scaled_width);
+			total_size += sizeof(T); // FOR value
+			total_size += AlignValue(sizeof(bitpacking_width_t));
+			total_size += sizeof(T); // divisor
+
+			return true;
 		}
 
 		if (can_do_for) {
@@ -308,6 +432,7 @@ unique_ptr<AnalyzeState> BitpackingInitAnalyze(ColumnData &col_data, PhysicalTyp
 	CompressionInfo info(col_data.GetBlockManager());
 	auto state = make_uniq<BitpackingAnalyzeState<T>>(info);
 	state->state.mode = Settings::Get<ForceBitpackingModeSetting>(col_data.GetDatabase());
+	state->state.allow_scaled = ScaledFrameOfReferenceAllowed(col_data.GetBlockManager());
 
 	return std::move(state);
 }
@@ -359,6 +484,7 @@ public:
 
 		state.data_ptr = reinterpret_cast<void *>(this);
 		state.mode = Settings::Get<ForceBitpackingModeSetting>(checkpoint_data.GetDatabase());
+		state.allow_scaled = ScaledFrameOfReferenceAllowed(info.GetBlockManager());
 	}
 
 	ColumnDataCheckpointData &checkpoint_data;
@@ -424,6 +550,24 @@ public:
 			WriteMetaData(state, BitpackingMode::FOR);
 			WriteData(state->data_ptr, frame_of_reference);
 			WriteData(state->data_ptr, (T)width);
+
+			BitpackingPrimitives::PackBuffer<T, false>(state->data_ptr, values, count, width);
+			state->data_ptr += bp_size;
+
+			UpdateStats(state, count);
+		}
+
+		static void WriteForScaled(T *values, bool *validity, bitpacking_width_t width, T frame_of_reference, T divisor,
+		                           idx_t count, void *data_ptr) {
+			auto state = reinterpret_cast<BitpackingCompressionState<T, WRITE_STATISTICS> *>(data_ptr);
+
+			auto bp_size = BitpackingPrimitives::GetRequiredSize(count, width);
+			ReserveSpace(state, bp_size + 3 * sizeof(T));
+
+			WriteMetaData(state, BitpackingMode::FOR_SCALED);
+			WriteData(state->data_ptr, frame_of_reference);
+			WriteData(state->data_ptr, (T)width);
+			WriteData(state->data_ptr, divisor);
 
 			BitpackingPrimitives::PackBuffer<T, false>(state->data_ptr, values, count, width);
 			state->data_ptr += bp_size;
@@ -635,6 +779,7 @@ public:
 	T current_frame_of_reference;
 	T current_constant;
 	T current_delta_offset;
+	T current_divisor;
 
 	idx_t current_group_offset = 0;
 	data_ptr_t current_group_ptr;
@@ -660,6 +805,7 @@ public:
 			current_group_ptr += sizeof(T);
 			break;
 		case BitpackingMode::FOR:
+		case BitpackingMode::FOR_SCALED:
 		case BitpackingMode::CONSTANT_DELTA:
 		case BitpackingMode::DELTA_FOR:
 			current_frame_of_reference = *reinterpret_cast<T *>(current_group_ptr);
@@ -676,6 +822,7 @@ public:
 			current_group_ptr += sizeof(T);
 			break;
 		case BitpackingMode::FOR:
+		case BitpackingMode::FOR_SCALED:
 		case BitpackingMode::DELTA_FOR:
 			current_width = (bitpacking_width_t)(*reinterpret_cast<T *>(current_group_ptr));
 			current_group_ptr += MaxValue(sizeof(T), sizeof(bitpacking_width_t));
@@ -689,6 +836,9 @@ public:
 		// Read third value
 		if (current_group.mode == BitpackingMode::DELTA_FOR) {
 			current_delta_offset = *reinterpret_cast<T *>(current_group_ptr);
+			current_group_ptr += sizeof(T);
+		} else if (current_group.mode == BitpackingMode::FOR_SCALED) {
+			current_divisor = *reinterpret_cast<T *>(current_group_ptr);
 			current_group_ptr += sizeof(T);
 		}
 	}
@@ -716,7 +866,7 @@ public:
 		D_ASSERT(current_group_offset + remaining_to_skip < BITPACKING_METADATA_GROUP_SIZE);
 
 		if (current_group.mode == BitpackingMode::CONSTANT || current_group.mode == BitpackingMode::CONSTANT_DELTA ||
-		    current_group.mode == BitpackingMode::FOR) {
+		    current_group.mode == BitpackingMode::FOR || current_group.mode == BitpackingMode::FOR_SCALED) {
 			// Skipping within a constant or constant delta is done by increasing the current_group_offset
 			skipped += remaining_to_skip;
 			current_group_offset += remaining_to_skip;
@@ -821,6 +971,7 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 			continue;
 		}
 		D_ASSERT(scan_state.current_group.mode == BitpackingMode::FOR ||
+		         scan_state.current_group.mode == BitpackingMode::FOR_SCALED ||
 		         scan_state.current_group.mode == BitpackingMode::DELTA_FOR);
 
 		idx_t to_scan = MinValue<idx_t>(scan_count - scanned, BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE -
@@ -853,6 +1004,9 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 			DeltaDecode<T_S>(reinterpret_cast<T_S *>(current_result_ptr),
 			                 static_cast<T_S>(scan_state.current_delta_offset), to_scan);
 			scan_state.current_delta_offset = current_result_ptr[to_scan - 1];
+		} else if (scan_state.current_group.mode == BitpackingMode::FOR_SCALED) {
+			ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
+			                               scan_state.current_divisor, to_scan);
 		} else {
 			ApplyFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference, to_scan);
 		}
@@ -914,12 +1068,18 @@ void BitpackingFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t r
 	}
 
 	D_ASSERT(scan_state.current_group.mode == BitpackingMode::FOR ||
+	         scan_state.current_group.mode == BitpackingMode::FOR_SCALED ||
 	         scan_state.current_group.mode == BitpackingMode::DELTA_FOR);
 
 	BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
 	                                     decompression_group_start_pointer, scan_state.current_width, skip_sign_extend);
 
 	*current_result_ptr = scan_state.decompression_buffer[offset_in_compression_group];
+	if (scan_state.current_group.mode == BitpackingMode::FOR_SCALED) {
+		ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
+		                               scan_state.current_divisor, 1);
+		return;
+	}
 	*current_result_ptr += scan_state.current_frame_of_reference;
 
 	if (scan_state.current_group.mode == BitpackingMode::DELTA_FOR) {

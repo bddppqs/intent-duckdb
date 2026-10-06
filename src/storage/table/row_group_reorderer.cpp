@@ -1,5 +1,10 @@
 #include "duckdb/storage/table/row_group_reorderer.hpp"
 
+#include "duckdb/common/tuning_defaults.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
+
 namespace duckdb {
 
 namespace {
@@ -207,6 +212,29 @@ RowGroupReorderer::RowGroupReorderer(const RowGroupOrderOptions &options_p, Tran
     : options(options_p), transaction(transaction_p), offset(0), initialized(false) {
 }
 
+void RowGroupReorderer::SetScanExcludesEmptyString(const TableFilterSet *filters,
+                                                   const vector<StorageIndex> &column_ids) {
+	if (!kNonEmptyMinRowGroupOrder || !filters || initialized) {
+		return;
+	}
+	// only an ascending order that orders and prunes nothing: the key decides the scan order alone
+	if (options.column_type != OrderByColumnType::STRING || options.order_by != OrderByStatistics::MIN ||
+	    options.row_limit.IsValid() || options.row_group_offset != 0 || options.leading_null_group_offset != 0 ||
+	    options.column_idx.HasChildren()) {
+		return;
+	}
+	for (auto &entry : filters->filters) {
+		if (entry.first >= column_ids.size() || column_ids[entry.first].HasChildren() ||
+		    column_ids[entry.first].GetPrimaryIndex() != options.column_idx.GetPrimaryIndex()) {
+			continue;
+		}
+		if (ConjunctionAndFilter::ExcludesEmptyString(*entry.second)) {
+			nonempty_min_key = true;
+			return;
+		}
+	}
+}
+
 optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetNextRowGroup(SegmentNode<RowGroup> &row_group) {
 	D_ASSERT(RefersToSameObject(ordered_row_groups[offset].get(), row_group));
 	if (offset >= ordered_row_groups.size() - 1) {
@@ -342,6 +370,15 @@ optional_ptr<SegmentNode<RowGroup>> RowGroupReorderer::GetRootSegment(RowGroupSe
 		if (IsNullOnly(*stats)) {
 			null_only_groups.push_back(row_group);
 			continue;
+		}
+		if (nonempty_min_key) {
+			// key the row group on its minimum non-empty value (its min becomes that value); one without a non-empty
+			// value passes no row of the scan and goes last
+			bool no_nonempty = false;
+			if (StringStats::NarrowToNonEmpty(*stats, no_nonempty) && no_nonempty) {
+				ambiguous_groups.push_back(row_group);
+				continue;
+			}
 		}
 		Value comparison_value = RetrieveStat(*stats, options.order_by, options.column_type);
 		if (comparison_value.IsNull() || (options.null_order == OrderByNullType::NULLS_FIRST && stats->CanHaveNull())) {

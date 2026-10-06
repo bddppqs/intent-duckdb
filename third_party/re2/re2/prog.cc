@@ -125,6 +125,7 @@ Prog::Prog()
 }
 
 Prog::~Prog() {
+  DeleteTDFAs();
   DeleteDFA(dfa_longest_);
   DeleteDFA(dfa_first_);
   if (prefix_foldcase_)

@@ -10,6 +10,7 @@
 // expression symbolically.
 
 #include <stdint.h>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -50,6 +51,7 @@ enum EmptyOp {
 };
 
 class DFA;
+class TDFA;
 class Regexp;
 
 // Compiled form of regexp program.
@@ -215,6 +217,17 @@ class Prog {
     return charclass_run_tables_.data() + 256*charclass_run_index_[head];
   }
   size_t bit_state_text_max_size() { return bit_state_text_max_size_; }
+
+  // Anchored submatch search with a tagged DFA (tdfa.cc), for the programs
+  // EnableTDFA admits; its automata take their memory from the DFA budget.
+  // Returns 1 if it matched, 0 if not, and -1 if it gives no answer (not
+  // admitted, past its budget, or in use by another thread): the caller then
+  // runs another engine.
+  static const int kMaxTDFACapture = 10;
+  void EnableTDFA();
+  bool tdfa_admitted() const { return tdfa_admitted_; }
+  int SearchTDFA(const StringPiece& text, const StringPiece& context,
+                 MatchKind kind, StringPiece* match, int nmatch);
   int64_t dfa_mem() { return dfa_mem_; }
   void set_dfa_mem(int64_t dfa_mem);
   bool anchor_start() { return anchor_start_; }
@@ -414,6 +427,7 @@ class Prog {
 
   DFA* GetDFA(MatchKind kind);
   void DeleteDFA(DFA* dfa);
+  void DeleteTDFAs();
   bool BuildCharClassRunTable(int head, uint16_t* table);
   void BuildCharClassRuns();
 
@@ -445,6 +459,11 @@ class Prog {
   size_t bit_state_text_max_size_;  // upper bound (inclusive) on text.size()
   PODArray<uint16_t> charclass_run_index_;
   PODArray<uint16_t> charclass_run_tables_;
+
+  bool tdfa_admitted_ = false;
+  int64_t tdfa_budget_ = 0;           // bytes the tagged DFAs may still use
+  std::atomic<bool> tdfa_busy_{false};
+  TDFA* tdfa_[2][kMaxTDFACapture+1] = {};  // [match ends at the end][nmatch]
 
   PODArray<Inst> inst_;              // pointer to instruction array
   PODArray<uint8_t> onepass_nodes_;  // data for OnePass nodes

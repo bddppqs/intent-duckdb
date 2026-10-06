@@ -28,6 +28,7 @@
 #include "duckdb/storage/table/row_id_column_data.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -108,6 +109,14 @@ bool RowGroup::ColumnIsLoaded(storage_t c) const {
 	return is_loaded[c];
 }
 
+bool RowGroup::IsColumnLoadedLocked(storage_t c) const {
+	if (!is_loaded) {
+		return true;
+	}
+	lock_guard<mutex> l(row_group_lock);
+	return is_loaded[c];
+}
+
 vector<shared_ptr<ColumnData>> &RowGroup::GetColumns() {
 	// ensure all columns are loaded
 	for (idx_t c = 0; c < GetColumnCount(); c++) {
@@ -185,6 +194,11 @@ void RowGroup::LoadColumn(storage_t c) const {
 	auto &block_pointer = column_pointers[c];
 	MetadataReader column_data_reader(metadata_manager, block_pointer);
 	this->columns[c] = ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), c, column_data_reader, types[c]);
+	if (types[c].id() == LogicalTypeId::VARCHAR && dict_global::LazyLinkActive()) {
+		// stored translations linked lazily (dict_global::PublishPersisted): the segments linked before the column is
+		// marked loaded, so no scan sees one unlinked
+		dict_global::LinkLoadedColumn(GetTableInfo(), c, *this->columns[c]);
+	}
 	is_loaded[c] = true;
 	if (this->columns[c]->count != this->count) {
 		throw InternalException("Corrupted database - loaded column with index %llu, count %llu did "
@@ -878,6 +892,9 @@ void RowGroup::Scan(ScanOptions options, CollectionScanState &state, DataChunk &
 					auto &col_data = GetColumn(col_idx);
 					col_data.Skip(state.column_scans[i]);
 				}
+				// with the shared order, the adaptive filter also times the vectors its filters emptied (by default,
+				// only survivors are timed)
+				filter_info.EndFilterEmptied(filter_state);
 				state.vector_index++;
 				continue;
 			}

@@ -1,5 +1,6 @@
 
 #include "sqllogic_test_runner.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 
 #include "catch.hpp"
 #include "duckdb/common/file_open_flags.hpp"
@@ -552,6 +553,16 @@ RequireResult SQLLogicTestRunner::CheckRequire(SQLLogicParser &parser, const vec
 			return RequireResult::MISSING;
 		}
 		return RequireResult::PRESENT;
+	}
+
+	if (param == "vector_aligned_dictionary_segments") {
+		// the DICT_FSST checkpoint writer ends every segment on a vector boundary (the default build)
+		return kVectorAlignedDictionarySegments ? RequireResult::PRESENT : RequireResult::MISSING;
+	}
+	if (param == "unaligned_dictionary_segments") {
+		// the DICT_FSST checkpoint writer ends a segment at the row that did not fit (a build with
+		// kVectorAlignedDictionarySegments off), so segments start inside vectors
+		return kVectorAlignedDictionarySegments ? RequireResult::MISSING : RequireResult::PRESENT;
 	}
 
 	if (param == "skip_reload") {

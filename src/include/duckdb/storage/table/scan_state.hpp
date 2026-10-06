@@ -196,6 +196,8 @@ public:
 	optional_ptr<AdaptiveFilter> GetAdaptiveFilter();
 	AdaptiveFilterState BeginFilter() const;
 	void EndFilter(AdaptiveFilterState state);
+	//! EndFilter for a vector the filters emptied (a no-op without the shared filter order)
+	void EndFilterEmptied(AdaptiveFilterState state);
 
 	//! Whether or not there is any filter we need to execute
 	bool HasFilters() const;

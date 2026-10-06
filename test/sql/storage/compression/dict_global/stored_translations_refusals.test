@@ -1,0 +1,289 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_refusals.test
+# description: a plan that reads a column through its stored translations, executed in a state they do not cover, answers
+# on the generic path with no error: the fused count(DISTINCT) bitmap refused at its execution for memory, local storage, rows
+# outside the translations, an update or stale translations reads strings; a prepared grouping on the column's codes
+# re-binds; a new plan in such a state reads strings
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_refusals.db readwrite latest
+
+statement ok
+SET threads=8
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# MEMORY: a plan made at 8 threads executed at 512 under a memory limit whose quarter is below 512 bitmaps (first, while
+# the buffer pool holds nothing else)
+statement ok
+CREATE TABLE g AS SELECT 'catalog entry ' || (hash(i) % 4000000)::VARCHAR AS p FROM range(8000000) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PREPARE gd AS SELECT count(DISTINCT p) FROM g
+
+query I
+EXECUTE gd
+----
+3458539
+
+statement ok
+SET threads=512
+
+statement ok
+SET memory_limit='768MB'
+
+query I
+EXECUTE gd
+----
+3458539
+
+query II
+EXPLAIN ANALYZE EXECUTE gd
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+statement ok
+SET memory_limit='16GB'
+
+statement ok
+SET threads=8
+
+query I
+EXECUTE gd
+----
+3458539
+
+statement ok
+CREATE TABLE f AS SELECT i, 'fv-' || ((i // 3) % 200003) || '-0123456789' AS b FROM range(2097152) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PREPARE fd AS SELECT count(DISTINCT b) FROM f
+
+statement ok
+PREPARE fk AS SELECT b, count(*) AS n FROM f GROUP BY b ORDER BY n DESC, b LIMIT 3
+
+query II
+EXPLAIN SELECT count(DISTINCT b) FROM f
+----
+physical_plan	<REGEX>:.*bitmap=1.*
+
+query II
+EXPLAIN SELECT b, count(*) AS n FROM f GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<REGEX>:.*Code Keys: b \(stored\).*
+
+query I
+EXECUTE fd
+----
+200003
+
+query II
+EXECUTE fk
+----
+fv-0-0123456789	12
+fv-1-0123456789	12
+fv-10-0123456789	12
+
+query II
+EXPLAIN ANALYZE EXECUTE fd
+----
+analyzed_plan	<REGEX>:.*engaged=1.*
+
+# LOCAL_STORAGE: rows in this transaction's local storage hold strings
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO f SELECT i, CASE WHEN i % 2 = 0 THEN 'fv-7-0123456789' ELSE 'fv-local-' || i END FROM range(2097152, 2097152 + 100) r(i)
+
+query I
+EXECUTE fd
+----
+200053
+
+query II
+EXPLAIN ANALYZE EXECUTE fd
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+query II
+EXECUTE fk
+----
+fv-7-0123456789	62
+fv-0-0123456789	12
+fv-1-0123456789	12
+
+query I
+SELECT count(DISTINCT b) FROM f
+----
+200053
+
+query II
+SELECT b, count(*) AS n FROM f GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+fv-7-0123456789	62
+fv-0-0123456789	12
+fv-1-0123456789	12
+
+statement ok
+ROLLBACK
+
+query I
+EXECUTE fd
+----
+200003
+
+# COVERAGE: committed rows outside the stored translations (an append not checkpointed)
+statement ok
+INSERT INTO f SELECT i, CASE WHEN i % 2 = 0 THEN 'fv-7-0123456789' ELSE 'fv-local-' || i END FROM range(2097152, 2097152 + 100) r(i)
+
+query I
+EXECUTE fd
+----
+200053
+
+query II
+EXECUTE fk
+----
+fv-7-0123456789	62
+fv-0-0123456789	12
+fv-1-0123456789	12
+
+query I
+SELECT count(DISTINCT b) FROM f
+----
+200053
+
+query II
+SELECT b, count(*) AS n FROM f GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+fv-7-0123456789	62
+fv-0-0123456789	12
+fv-1-0123456789	12
+
+# stale: a checkpoint that rebuilt the translations over the appended rows (the prepared plans re-bind)
+statement ok
+CHECKPOINT
+
+query I
+EXECUTE fd
+----
+200053
+
+query II
+EXECUTE fk
+----
+fv-7-0123456789	62
+fv-0-0123456789	12
+fv-1-0123456789	12
+
+query II
+EXPLAIN ANALYZE EXECUTE fd
+----
+analyzed_plan	<REGEX>:.*engaged=1.*
+
+# UPDATES: an update of the column, after the plans above were made
+statement ok
+UPDATE f SET b = 'fv-upd-' || i WHERE i < 30
+
+query I
+EXECUTE fd
+----
+200083
+
+query II
+EXECUTE fk
+----
+fv-7-0123456789	59
+fv-10-0123456789	12
+fv-100-0123456789	12
+
+query I
+SELECT count(DISTINCT b) FROM f
+----
+200083
+
+query II
+SELECT b, count(*) AS n FROM f GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+fv-7-0123456789	59
+fv-10-0123456789	12
+fv-100-0123456789	12
+
+statement ok
+CHECKPOINT
+
+query I
+EXECUTE fd
+----
+200083
+
+query II
+EXECUTE fk
+----
+fv-7-0123456789	59
+fv-10-0123456789	12
+fv-100-0123456789	12
+
+# a dictionary built over the column while its translations are unused (it carries an update), then reads of its codes over
+# vectors that straddle segments once a checkpoint stored the translations again: those vectors take the stored translation
+statement ok
+CREATE TABLE w AS SELECT i, concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) AS e FROM range(1048576) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('w') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND start % 2048 <> 0
+----
+true
+
+statement ok
+UPDATE w SET e = 'upd-' || i WHERE i < 10
+
+query I
+SELECT count(DISTINCT e) FROM w
+----
+100013
+
+query II
+SELECT count(*), sum(n) FROM (SELECT e, count(*) AS n FROM w GROUP BY e) s
+----
+100013	1048576
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT e, count(*) AS n FROM w GROUP BY e ORDER BY n DESC, e LIMIT 2
+----
+physical_plan	<REGEX>:.*Code Keys: e \(stored\).*
+
+query I
+SELECT count(DISTINCT e) FROM w
+----
+100013
+
+query II
+SELECT count(*), sum(n) FROM (SELECT e, count(*) AS n FROM w GROUP BY e) s
+----
+100013	1048576
+
+query II
+SELECT left(e, 16), n FROM (SELECT e, count(*) AS n FROM w GROUP BY e ORDER BY n DESC, e LIMIT 2) s
+----
+0004289ee1c7b8b0	12
+0004d0b59e19461f	12
+
+restart
+
+query I
+SELECT count(DISTINCT b) + count(*) FROM f
+----
+2297335

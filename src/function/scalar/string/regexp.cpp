@@ -1,6 +1,7 @@
 #include "duckdb/function/scalar/regexp.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/vector_operations/binary_executor.hpp"
 #include "duckdb/common/vector_operations/ternary_executor.hpp"
 #include "duckdb/common/vector_operations/unary_executor.hpp"
@@ -162,6 +163,63 @@ static unique_ptr<FunctionData> RegexReplaceBind(ClientContext &context, ScalarF
 	return std::move(data);
 }
 
+//! RE2::Replace on one string (kRegexpReplaceInPlace): the first match replaced by the rewrite, the input unchanged
+//! when nothing matches or the rewrite is invalid - matched on the input itself and written once into the result
+static string_t ReplaceFirst(const RE2 &pattern, const string_t &input, const string_t &replace, Vector &result) {
+	static constexpr int MAX_GROUPS = 17;
+	const auto text = CreateStringPiece(input);
+	const auto rewrite = CreateStringPiece(replace);
+	const int group_count = 1 + RE2::MaxSubmatch(rewrite);
+	duckdb_re2::StringPiece groups[MAX_GROUPS];
+	if (group_count > 1 + pattern.NumberOfCapturingGroups() || group_count > MAX_GROUPS ||
+	    !pattern.Match(text, 0, text.size(), RE2::UNANCHORED, groups, group_count)) {
+		return StringVector::AddString(result, input);
+	}
+	// the rewrite's length, with RE2::Rewrite's validity rule: a backslash takes a digit or a backslash
+	idx_t rewrite_length = 0;
+	for (const char *s = rewrite.data(), *end = s + rewrite.size(); s < end; s++) {
+		if (*s != '\\') {
+			rewrite_length++;
+			continue;
+		}
+		s++;
+		const int c = s < end ? *s : -1;
+		if (c >= '0' && c <= '9') {
+			rewrite_length += groups[c - '0'].size();
+		} else if (c == '\\') {
+			rewrite_length++;
+		} else {
+			return StringVector::AddString(result, input);
+		}
+	}
+	const idx_t prefix = idx_t(groups[0].data() - text.data());
+	const idx_t suffix_begin = prefix + groups[0].size();
+	const idx_t suffix = text.size() - suffix_begin;
+	auto target = StringVector::EmptyString(result, prefix + rewrite_length + suffix);
+	auto out = target.GetDataWriteable();
+	memcpy(out, text.data(), prefix);
+	out += prefix;
+	for (const char *s = rewrite.data(), *end = s + rewrite.size(); s < end; s++) {
+		if (*s != '\\') {
+			*out++ = *s;
+			continue;
+		}
+		s++;
+		if (*s == '\\') {
+			*out++ = '\\';
+			continue;
+		}
+		auto &group = groups[*s - '0'];
+		if (!group.empty()) {
+			memcpy(out, group.data(), group.size());
+			out += group.size();
+		}
+	}
+	memcpy(out, text.data() + suffix_begin, suffix);
+	target.Finalize();
+	return target;
+}
+
 static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &info = func_expr.bind_info->Cast<RegexpReplaceBindData>();
@@ -172,6 +230,13 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 
 	if (info.constant_pattern) {
 		auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<RegexLocalState>();
+		if (kRegexpReplaceInPlace && !info.global_replace) {
+			BinaryExecutor::Execute<string_t, string_t, string_t>(
+			    strings, replaces, result, args.size(), [&](string_t input, string_t replace) {
+				    return ReplaceFirst(lstate.constant_pattern, input, replace, result);
+			    });
+			return;
+		}
 		BinaryExecutor::Execute<string_t, string_t, string_t>(
 		    strings, replaces, result, args.size(), [&](string_t input, string_t replace) {
 			    std::string sstring = input.GetString();
@@ -188,6 +253,9 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 			    RE2 re(CreateStringPiece(pattern), info.options);
 			    if (!re.ok()) {
 				    throw InvalidInputException(re.error());
+			    }
+			    if (kRegexpReplaceInPlace && !info.global_replace) {
+				    return ReplaceFirst(re, input, replace, result);
 			    }
 			    std::string sstring = input.GetString();
 			    if (info.global_replace) {

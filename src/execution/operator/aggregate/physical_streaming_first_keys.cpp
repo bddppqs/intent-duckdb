@@ -92,6 +92,10 @@ void PhysicalStreamingFirstKeys::PushKeyFilters(FirstKeysGlobalState &gstate, Fi
 	}
 	vector<pair<idx_t, unique_ptr<TableFilter>>> filters;
 	for (idx_t col = 0; col < probe_column_indexes.size(); col++) {
+		if (probe_column_indexes[col] == DConstants::INVALID_INDEX) {
+			// a code group (FirstKeysAggregate): its keys are codes, never pushed to the scan as a value filter
+			continue;
+		}
 		auto &storage_type = probe_storage_types[col];
 		value_set_t seen;
 		vector<Value> distinct_values;
@@ -201,7 +205,9 @@ InsertionOrderPreservingMap<string> PhysicalStreamingFirstKeys::ParamsToString()
 		if (i > 0) {
 			columns += ", ";
 		}
-		columns += StringUtil::Format("%llu", probe_column_indexes[i]);
+		columns += probe_column_indexes[i] == DConstants::INVALID_INDEX
+		               ? string("-")
+		               : StringUtil::Format("%llu", probe_column_indexes[i]);
 	}
 	result["Probe Columns"] = columns;
 	result["Key Filters"] = probe_filters ? "pushed" : "none";

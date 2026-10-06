@@ -1,6 +1,9 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 
 namespace duckdb {
 
@@ -67,6 +70,35 @@ unique_ptr<Expression> ConjunctionOrFilter::ToExpression(const Expression &colum
 ConjunctionAndFilter::ConjunctionAndFilter() : ConjunctionFilter(TableFilterType::CONJUNCTION_AND) {
 }
 
+//! `col <> ''` or `col > ''` on VARCHAR: the conjunct passes exactly the non-NULL, non-empty values
+static bool IsNonEmptyConjunct(const TableFilter &filter) {
+	if (filter.filter_type != TableFilterType::CONSTANT_COMPARISON) {
+		return false;
+	}
+	auto &constant_filter = filter.Cast<ConstantFilter>();
+	if (constant_filter.comparison_type != ExpressionType::COMPARE_NOTEQUAL &&
+	    constant_filter.comparison_type != ExpressionType::COMPARE_GREATERTHAN) {
+		return false;
+	}
+	auto &constant = constant_filter.constant;
+	return constant.type().id() == LogicalTypeId::VARCHAR && !constant.IsNull() && StringValue::Get(constant).empty();
+}
+
+bool ConjunctionAndFilter::ExcludesEmptyString(const TableFilter &filter) {
+	if (IsNonEmptyConjunct(filter)) {
+		return true;
+	}
+	if (filter.filter_type != TableFilterType::CONJUNCTION_AND) {
+		return false;
+	}
+	for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+		if (IsNonEmptyConjunct(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 FilterPropagateResult ConjunctionAndFilter::CheckStatistics(BaseStatistics &stats) const {
 	// the AND filter is true if ALL of the children is true
 	D_ASSERT(!child_filters.empty());
@@ -77,6 +109,36 @@ FilterPropagateResult ConjunctionAndFilter::CheckStatistics(BaseStatistics &stat
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		} else if (prune_result != result) {
 			result = FilterPropagateResult::NO_PRUNING_POSSIBLE;
+		}
+	}
+	if (result != FilterPropagateResult::NO_PRUNING_POSSIBLE) {
+		return result;
+	}
+	// a row passing the AND passes its `<> ''` conjunct, so it is a non-empty value: check the other conjuncts against
+	// the statistics of the non-empty values (min = the non-empty min); one of them always false makes the AND always
+	// false
+	optional_idx nonempty_idx;
+	for (idx_t i = 0; i < child_filters.size(); i++) {
+		if (IsNonEmptyConjunct(*child_filters[i])) {
+			nonempty_idx = i;
+			break;
+		}
+	}
+	if (!nonempty_idx.IsValid()) {
+		return result;
+	}
+	auto narrowed = stats.Copy();
+	bool no_nonempty = false;
+	if (!StringStats::NarrowToNonEmpty(narrowed, no_nonempty)) {
+		return result;
+	}
+	if (no_nonempty) {
+		return FilterPropagateResult::FILTER_ALWAYS_FALSE;
+	}
+	for (idx_t i = 0; i < child_filters.size(); i++) {
+		if (i != nonempty_idx.GetIndex() &&
+		    child_filters[i]->CheckStatistics(narrowed) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
+			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 		}
 	}
 	return result;

@@ -32,6 +32,18 @@
 #include "duckdb/storage/table/row_group_collection.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/common/tuning_defaults.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
+#include "duckdb/transaction/local_storage.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -63,10 +75,16 @@ bool FusedDistinctEnabled() {
 	return kGlobalDictionaryFusedDistinct;
 }
 
-//! PlanCodeKeys refuses the code keys of an aggregate whose packed group width with them typed passes
-//! FusedIntegerAggregate::MAXIMUM_KEY_BYTES; off, every width is typed
+//! PlanCodeKeys refuses the code keys of an aggregate whose packed group width with them typed passes the fused kernel's
+//! key bytes (WideGuardKeyBytes); off, every width is typed
 static bool WideGuardEnabled() {
 	return kGlobalDictionaryWideKeyGuard;
+}
+
+//! The wide guard's limit follows the fused kernel's grouped class: 16 key bytes when it takes three keys
+//! (kFusedSixteenByteKeys), 12 otherwise
+static idx_t WideGuardKeyBytes() {
+	return kFusedSixteenByteKeys ? FusedIntegerAggregate::MAXIMUM_KEY_BYTES : 12;
 }
 
 bool BorrowChildEnabled() {
@@ -360,6 +378,212 @@ idx_t PublicationVersion() {
 }
 
 //===--------------------------------------------------------------------===//
+// Columns read through stored translations
+static constexpr const char *CODES_ONLY_ID_PREFIX = "dict_global_codes-";
+
+namespace {
+struct CodesOnlyRegistry {
+	mutex lock;
+	unordered_map<string, weak_ptr<PersistedTranslations>> ids;
+};
+CodesOnlyRegistry &CodesOnlyIds() {
+	static auto registry = new CodesOnlyRegistry();
+	return *registry;
+}
+} // namespace
+
+shared_ptr<PersistedTranslations> CodesOnlyTranslationsOf(const string &child_id) {
+	if (child_id.compare(0, strlen(CODES_ONLY_ID_PREFIX), CODES_ONLY_ID_PREFIX) != 0) {
+		return nullptr;
+	}
+	auto &registry = CodesOnlyIds();
+	lock_guard<mutex> guard(registry.lock);
+	auto found = registry.ids.find(child_id);
+	return found == registry.ids.end() ? nullptr : found->second.lock();
+}
+
+//! Link every segment of the column to its stored translation entry: true when every segment of every row group is a
+//! DICT_FSST segment the translations hold, the column has no updates, and its rows are the table's (a vector that
+//! straddles two segments is emitted over the translations by TryScanGlobalDictionary)
+static bool LinkPersisted(DataTable &table, idx_t storage_index, const shared_ptr<PersistedTranslations> &translations,
+                          idx_t &rows) {
+	auto &collection = *table.GetRowGroupCollection();
+	auto tree = collection.GetRowGroups();
+	auto &entries = translations->Entries();
+	rows = 0;
+	idx_t linked = 0;
+	for (auto node = tree->GetRootSegment(); node; node = tree->GetNextSegment(*node)) {
+		auto &column = node->GetNode().GetRawColumnData(storage_index);
+		if (column.HasUpdates()) {
+			return false;
+		}
+		auto &segments = column.GetSegmentTree();
+		for (auto segment_node = segments.GetRootSegment(); segment_node;
+		     segment_node = segments.GetNextSegment(*segment_node)) {
+			auto &segment = segment_node->GetNode();
+			if (segment.GetCompressionFunction().type != CompressionType::COMPRESSION_DICT_FSST ||
+			    segment.segment_type != ColumnSegmentType::PERSISTENT || segment.GetBlockId() == INVALID_BLOCK) {
+				return false;
+			}
+			auto split = dict_fsst::SegmentSplit(segment);
+			const auto entry =
+			    translations->FindEntry(segment.GetBlockId(), NumericCast<uint32_t>(segment.GetBlockOffset()));
+			if (entry == DConstants::INVALID_INDEX || (split && entries[entry].dict_count != split->dict_count) ||
+			    entries[entry].rows != segment.count.load()) {
+				return false;
+			}
+			dict_fsst::LinkSegmentTranslation(segment, translations, entry);
+			rows += segment.count.load();
+			linked++;
+		}
+	}
+	return linked == entries.size();
+}
+
+//! Whether a publication in this process links lazily (set once, never cleared)
+static atomic<bool> lazy_link_active {false};
+
+bool LazyLinkActive() {
+	return lazy_link_active.load();
+}
+
+//! Link the segments of one row group's column to their entries in `translations`; a segment they do not hold (a
+//! mismatch the table unchanged since its load excludes) is linked to no entry, which a codes-only read of it refuses
+static void LinkColumnSegments(ColumnData &column, const shared_ptr<PersistedTranslations> &translations) {
+	auto &entries = translations->Entries();
+	auto &segments = column.GetSegmentTree();
+	for (auto segment_node = segments.GetRootSegment(); segment_node;
+	     segment_node = segments.GetNextSegment(*segment_node)) {
+		auto &segment = segment_node->GetNode();
+		idx_t entry = DConstants::INVALID_INDEX;
+		if (segment.GetCompressionFunction().type == CompressionType::COMPRESSION_DICT_FSST &&
+		    segment.segment_type == ColumnSegmentType::PERSISTENT && segment.GetBlockId() != INVALID_BLOCK) {
+			auto split = dict_fsst::SegmentSplit(segment);
+			entry = translations->FindEntry(segment.GetBlockId(), NumericCast<uint32_t>(segment.GetBlockOffset()));
+			if (entry != DConstants::INVALID_INDEX &&
+			    ((split && entries[entry].dict_count != split->dict_count) ||
+			     entries[entry].rows != segment.count.load())) {
+				entry = DConstants::INVALID_INDEX;
+			}
+		}
+		dict_fsst::LinkSegmentTranslation(segment, translations, entry);
+	}
+}
+
+void LinkLoadedColumn(const DataTableInfo &info, idx_t storage_index, ColumnData &column) {
+	auto translations = FindPersistedTranslations(info, storage_index);
+	if (translations && translations->lazy_link.load()) {
+		LinkColumnSegments(column, translations);
+	}
+}
+
+shared_ptr<ColumnDictionary> PublishPersisted(DataTable &table, idx_t storage_index) {
+	if (!PersistedTranslationsEnabled() || !DictGlobalEnabled()) {
+		return nullptr;
+	}
+	optional_ptr<const ColumnDefinition> definition;
+	for (auto &column : table.Columns()) {
+		if (column.StorageOid() == storage_index) {
+			definition = &column;
+			break;
+		}
+	}
+	if (!definition || definition->Type().id() != LogicalTypeId::VARCHAR ||
+	    !StringType::GetCollation(definition->Type()).empty()) {
+		return nullptr;
+	}
+	auto translations = FindPersistedTranslations(*table.GetDataTableInfo(), storage_index);
+	if (!translations) {
+		return nullptr;
+	}
+	auto &collection = *table.GetRowGroupCollection();
+	// the translations cover the table's rows only while no row lies outside them (an append not checkpointed) and
+	// the column carries no update: otherwise the column is read as without stored translations
+	if (translations->column.rows != table.GetTotalRows()) {
+		return nullptr;
+	}
+	auto row_groups = collection.GetRowGroups();
+	for (auto node = row_groups->GetRootSegment(); node; node = row_groups->GetNextSegment(*node)) {
+		auto &row_group = node->GetNode();
+		if (row_group.IsColumnLoaded(storage_index) && row_group.GetRawColumnData(storage_index).HasUpdates()) {
+			return nullptr;
+		}
+	}
+	auto registry_entry = TableEntry(table.GetDataTableInfo(), true);
+	idx_t epoch;
+	{
+		lock_guard<mutex> guard(registry_entry->lock);
+		epoch = registry_entry->epoch.load();
+		auto existing = registry_entry->persisted_columns.find(storage_index);
+		if (existing != registry_entry->persisted_columns.end()) {
+			auto &dict = existing->second;
+			if (dict->epoch == epoch && dict->collection == &collection && dict->persisted == translations) {
+				return dict;
+			}
+		}
+	}
+	idx_t rows;
+	if (collection.TryGetExactLoadedCount(rows) && rows == translations->column.rows && rows == table.GetTotalRows()) {
+		// the table unchanged since its load (no append, delete or update): its segments are the ones the translations
+		// were built over at the checkpoint that wrote both, so the column is not walked here. Each segment is linked
+		// where its row group's column is loaded: now for the loads already done (no read), at the load for the
+		// others (RowGroup::LoadColumn, under the row group's lock: a load either sees the flag or is seen below)
+		translations->Entries();
+		translations->lazy_link = true;
+		lazy_link_active = true;
+		for (auto node = row_groups->GetRootSegment(); node; node = row_groups->GetNextSegment(*node)) {
+			auto &row_group = node->GetNode();
+			if (row_group.IsColumnLoadedLocked(storage_index)) {
+				LinkColumnSegments(row_group.GetRawColumnData(storage_index), translations);
+			}
+		}
+	} else {
+		// a write since the load: the whole column walked and linked, its metadata of every row group requested at
+		// once first (each load then finds its blocks read or in flight)
+		collection.ReadAheadColumnMetadata({storage_index});
+		if (!LinkPersisted(table, storage_index, translations, rows) || rows != table.GetTotalRows() ||
+		    rows != translations->column.rows) {
+			return nullptr;
+		}
+	}
+	auto entry = make_shared_ptr<ColumnDictionary>(table.db.GetDatabase(), collection, storage_index, epoch,
+	                                               definition->Name());
+	entry->persisted = translations;
+	// the codes-only tag: a child of one invalid slot whose recorded size is the code space; no string is ever read
+	// through it (a codes-only plan proves its consumers read codes only)
+	entry->child = make_buffer<VectorChildBuffer>(Vector(LogicalType::VARCHAR, 1));
+	FlatVector::Validity(entry->child->data).SetInvalid(0);
+	entry->child->id = string(CODES_ONLY_ID_PREFIX) + UUID::ToString(UUID::GenerateRandomUUID());
+	entry->child->size = translations->Count();
+	entry->id = entry->child->id;
+	entry->count = translations->Count();
+	entry->rows_covered = rows;
+	entry->state.store(static_cast<uint8_t>(ColumnState::PUBLISHED), std::memory_order_release);
+	{
+		auto &registry = CodesOnlyIds();
+		lock_guard<mutex> guard(registry.lock);
+		registry.ids[entry->id] = translations;
+	}
+	bool replaced;
+	{
+		lock_guard<mutex> guard(registry_entry->lock);
+		auto &slot = registry_entry->persisted_columns[storage_index];
+		if (slot && slot->epoch == epoch && slot->collection == &collection && slot->persisted == translations) {
+			return slot;
+		}
+		replaced = slot != nullptr;
+		slot = entry;
+	}
+	// a first publication changes no plan made before it (Published() is unchanged, and a plan that could type these
+	// translations publishes them while it plans), so the version moves only when an entry is replaced: no plan typed on
+	// the old entry is then reused (a client's plan cache)
+	if (replaced) {
+		publication_version.fetch_add(1, std::memory_order_release);
+	}
+	return entry;
+}
+
+//===--------------------------------------------------------------------===//
 // The build
 //===--------------------------------------------------------------------===//
 namespace {
@@ -501,6 +725,8 @@ struct Builder {
 	idx_t bytes = 0;
 	idx_t translation_bytes = 0;
 	vector<PendingTranslation> translations;
+	//! the rows of the segments translated (ColumnDictionary::rows_covered)
+	idx_t rows_covered = 0;
 	//! the string heaps of a parallel build (its partitions' arenas); the published child references each
 	vector<buffer_ptr<VectorBuffer>> heaps;
 };
@@ -571,6 +797,7 @@ static BuildOutcome BuildColumn(ClientContext &context, RowGroupCollection &row_
 			builder.translation_bytes += dict_count * sizeof(uint32_t);
 			builder.translations.push_back(
 			    PendingTranslation {segment.GetDictionaryCacheKey(), std::move(codes), dict_count});
+			builder.rows_covered += segment.count;
 			builder.reservation.Grow(builder.Footprint());
 		}
 	}
@@ -607,6 +834,7 @@ static void Publish(ColumnDictionary &entry, Builder &builder, const shared_ptr<
 	entry.bytes = builder.bytes;
 	entry.index = std::move(builder.index);
 	entry.index_mask = builder.index_mask;
+	entry.rows_covered = builder.rows_covered;
 	// the slots and hashes now live in the child: the builder's copies are released, the reservation kept
 	vector<string_t>().swap(builder.slots);
 	vector<hash_t>().swap(builder.hashes);
@@ -985,6 +1213,7 @@ static BuildOutcome BuildColumnParallel(ClientContext &context, RowGroupCollecti
 	idx_t kept = 0;
 	for (idx_t k = 0; k < segment_count; k++) {
 		if (builder.translations[k].codes) {
+			builder.rows_covered += state.segments[k].get().count;
 			if (kept != k) {
 				builder.translations[kept] = std::move(builder.translations[k]);
 			}
@@ -1053,6 +1282,9 @@ void EnsureBuilt(ClientContext &context, DataTable &table, const vector<idx_t> &
 			continue;
 		}
 		if (marked->gated) {
+			continue;
+		}
+		if (marked->codes_only) {
 			continue;
 		}
 		shared_ptr<ColumnDictionary> entry;
@@ -1202,7 +1434,8 @@ void CodeKeys::ConvertOutput(DataChunk &internal, DataChunk &output) const {
 				key_idx = k;
 			}
 		}
-		if (!typed) {
+		if (!typed || typed->emit_codes) {
+			// an untyped column, or a key whose codes a projection above the Top-N decodes
 			output.data[col].Reference(internal.data[col]);
 			continue;
 		}
@@ -1217,16 +1450,17 @@ void CodeKeys::ConvertOutput(DataChunk &internal, DataChunk &output) const {
 			overflowed = overflowed || code >= dict.count;
 			sel.set_index(i, code);
 		}
-		if (!overflowed) {
+		if (!overflowed && !dict.persisted) {
 			output.data[col].Dictionary(dict.child, sel);
 			continue;
 		}
-		// an overflow code: a flat string vector
+		// an overflow code, or a column whose strings are read from the segments where they first occur: a flat
+		// string vector
 		auto &target = output.data[col];
 		target.SetVectorType(VectorType::FLAT_VECTOR);
 		auto strings = FlatVector::GetData<string_t>(target);
 		auto &validity = FlatVector::Validity(target);
-		auto child_strings = FlatVector::GetData<string_t>(dict.child->data);
+		auto child_strings = dict.persisted ? nullptr : FlatVector::GetData<string_t>(dict.child->data);
 		auto &overflow_entry = *overflow[key_idx];
 		lock_guard<mutex> guard(overflow_entry.lock);
 		for (idx_t i = 0; i < count; i++) {
@@ -1236,7 +1470,8 @@ void CodeKeys::ConvertOutput(DataChunk &internal, DataChunk &output) const {
 				continue;
 			}
 			if (code < dict.count) {
-				strings[i] = StringVector::AddStringOrBlob(target, child_strings[code]);
+				strings[i] = dict.persisted ? dict.persisted->Fetch(target, UnsafeNumericCast<uint32_t>(code))
+				                            : StringVector::AddStringOrBlob(target, child_strings[code]);
 			} else {
 				strings[i] = StringVector::AddStringOrBlob(target, overflow_entry.strings[code - dict.count]);
 			}
@@ -1299,6 +1534,418 @@ static Resolved ResolveColumn(const vector<reference<PhysicalOperator>> &chain, 
 	return result;
 }
 } // namespace
+
+//===--------------------------------------------------------------------===//
+// Codes-only scans
+//! Whether `expr` references any of `indexes` through a BOUND_REF
+static bool ReferencesAny(const Expression &expr, const unordered_set<idx_t> &indexes) {
+	bool found = false;
+	ExpressionIterator::VisitExpression<BoundReferenceExpression>(
+	    expr, [&](const BoundReferenceExpression &ref) { found = found || indexes.count(ref.index) > 0; });
+	return found;
+}
+
+//! The scan output position input column `index` of the chain's top resolves to (PROJECTION* / FILTER* BOUND_REFs)
+static optional_idx ScanPosition(const vector<reference<PhysicalOperator>> &chain, idx_t index) {
+	for (auto &operator_ref : chain) {
+		auto &op = operator_ref.get();
+		if (op.type == PhysicalOperatorType::FILTER) {
+			continue;
+		}
+		auto &projection = op.Cast<PhysicalProjection>();
+		if (index >= projection.select_list.size() ||
+		    projection.select_list[index]->GetExpressionType() != ExpressionType::BOUND_REF) {
+			return optional_idx();
+		}
+		index = projection.select_list[index]->Cast<BoundReferenceExpression>().index;
+	}
+	return index;
+}
+
+//! Whether a codes-only scan of the column at input `chunk_index` of the chain's top is sound: no FILTER stands between
+//! the scan and the consumer, the column is read by nothing there but BOUND_REFs that carry it to exactly that one input
+//! column, its pushed filter (if any) is decided on codes, and the scan emits it once; the consumer reads only its codes
+static bool CodesOnlyChain(const vector<reference<PhysicalOperator>> &chain, PhysicalTableScan &scan,
+                           idx_t chunk_index) {
+	auto position = ScanPosition(chain, chunk_index);
+	if (!position.IsValid()) {
+		return false;
+	}
+	const idx_t output_position = position.GetIndex();
+	auto column_of = [&](idx_t output) -> optional_idx {
+		const idx_t scan_index = scan.projection_ids.empty() ? output : scan.projection_ids[output];
+		if (scan_index >= scan.column_ids.size()) {
+			return optional_idx();
+		}
+		return scan_index;
+	};
+	auto scan_index = column_of(output_position);
+	if (!scan_index.IsValid()) {
+		return false;
+	}
+	const idx_t outputs = scan.projection_ids.empty() ? scan.column_ids.size() : scan.projection_ids.size();
+	for (idx_t output = 0; output < outputs; output++) {
+		auto other = column_of(output);
+		if (output != output_position && other.IsValid() &&
+		    scan.column_ids[other.GetIndex()] == scan.column_ids[scan_index.GetIndex()]) {
+			return false;
+		}
+	}
+	if (scan.table_filters) {
+		auto found = scan.table_filters->filters.find(scan_index.GetIndex());
+		if (found != scan.table_filters->filters.end() && !CodeTranslatable(*found->second)) {
+			return false;
+		}
+	}
+	unordered_set<idx_t> carrying {output_position};
+	for (idx_t i = chain.size(); i > 0; i--) {
+		auto &op = chain[i - 1].get();
+		if (op.type == PhysicalOperatorType::FILTER) {
+			// a FILTER caches its small output chunks (a CachingPhysicalOperator), and caching appends a chunk: the
+			// append copies the column's strings through its codes, and a codes-only vector holds no strings (its
+			// dictionary is a single invalid slot)
+			return false;
+		}
+		auto &projection = op.Cast<PhysicalProjection>();
+		unordered_set<idx_t> next;
+		for (idx_t out = 0; out < projection.select_list.size(); out++) {
+			auto &expr = *projection.select_list[out];
+			if (expr.GetExpressionType() == ExpressionType::BOUND_REF) {
+				if (carrying.count(expr.Cast<BoundReferenceExpression>().index)) {
+					next.insert(out);
+				}
+			} else if (ReferencesAny(expr, carrying)) {
+				return false;
+			}
+		}
+		carrying = std::move(next);
+	}
+	return carrying.size() == 1 && carrying.count(chunk_index) == 1;
+}
+
+//! The chain PROJECTION* / FILTER* over one seq_scan of a DuckDB table, or false
+static bool ScanChain(PhysicalOperator &child, vector<reference<PhysicalOperator>> &chain,
+                      optional_ptr<PhysicalTableScan> &scan) {
+	reference<PhysicalOperator> current(child);
+	while (current.get().type == PhysicalOperatorType::PROJECTION ||
+	       current.get().type == PhysicalOperatorType::FILTER) {
+		if (current.get().children.size() != 1) {
+			return false;
+		}
+		chain.push_back(current);
+		current = current.get().children[0];
+	}
+	if (current.get().type != PhysicalOperatorType::TABLE_SCAN) {
+		return false;
+	}
+	scan = &current.get().Cast<PhysicalTableScan>();
+	return scan->function.name == "seq_scan" && scan->bind_data;
+}
+
+//! The scan reads the column codes only, through the dictionary's stored translations (the column must be marked)
+static void SetCodesOnly(PhysicalTableScan &scan, const shared_ptr<ColumnDictionary> &dict,
+                         shared_ptr<atomic<bool>> admitted = nullptr) {
+	auto publication = ScanPublicationOf(scan.bind_data.get());
+	if (!publication || !dict->persisted) {
+		return;
+	}
+	for (auto &column : publication->columns) {
+		if (column.storage_index == dict->storage_index) {
+			column.codes_only = dict->persisted;
+			column.codes_only_dict = dict;
+			column.codes_only_admitted = admitted;
+		}
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Plans over stale stored translations
+static bool ScanTranslationsCurrent(ClientContext &context, const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto &scan = op.Cast<PhysicalTableScan>();
+		auto publication = scan.bind_data ? ScanPublicationOf(scan.bind_data.get()) : nullptr;
+		if (publication) {
+			for (auto &column : publication->columns) {
+				if (!column.codes_only_dict) {
+					continue;
+				}
+				auto &table = scan.bind_data->Cast<TableScanBindData>().table;
+				if (!table.IsDuckTable()) {
+					return false;
+				}
+				auto &storage = table.Cast<DuckTableEntry>().GetStorage();
+				if (column.codes_only_admitted) {
+					// the consumer decides at its execution whether the translations cover the state it reads (refused,
+					// the scan reads strings); the plan re-binds only once a checkpoint replaced the translations
+					if (FindPersistedTranslations(*storage.GetDataTableInfo(), column.storage_index) != column.codes_only) {
+						return false;
+					}
+					continue;
+				}
+				auto current = PublishPersisted(storage, column.storage_index);
+				if (current != column.codes_only_dict) {
+					return false;
+				}
+				// a column read codes-only at every execution: the rows of this transaction's local storage hold strings
+				// (an append outside the translations or an update makes PublishPersisted's entry null above)
+				if (LocalStorage::Get(context, storage.db).Find(storage)) {
+					return false;
+				}
+			}
+		}
+	}
+	for (auto &child : op.GetChildren()) {
+		if (!ScanTranslationsCurrent(context, child.get())) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool PlanTranslationsCurrent(ClientContext &context, const PhysicalOperator &root) {
+	return ScanTranslationsCurrent(context, root);
+}
+
+void ThrowStaleTranslations(const string &column_name) {
+	throw InvalidInputException("The stored translations of column \"%s\" changed after this statement was planned (a "
+	                            "checkpoint since); prepare or run the statement again",
+	                            column_name);
+}
+
+namespace {
+//! Re-binds a prepared statement whose plan reads stale stored translations (prepared before a checkpoint)
+class StoredTranslationPlans : public ClientContextState {
+public:
+	static bool Stale(ClientContext &context, PreparedStatementData &prepared) {
+		return prepared.physical_plan && !PlanTranslationsCurrent(context, prepared.physical_plan->Root());
+	}
+	RebindQueryInfo OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
+	                                  RebindQueryInfo current_rebind) override {
+		if (current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND) {
+			return current_rebind;
+		}
+		return Stale(context, info.prepared_statement) ? RebindQueryInfo::ATTEMPT_TO_REBIND : RebindQueryInfo::DO_NOT_REBIND;
+	}
+	RebindQueryInfo OnRebindPreparedStatement(ClientContext &context, BindPreparedStatementCallbackInfo &info,
+	                                          RebindQueryInfo current_rebind) override {
+		if (current_rebind == RebindQueryInfo::ATTEMPT_TO_REBIND) {
+			return current_rebind;
+		}
+		return Stale(context, info.prepared_statement) ? RebindQueryInfo::ATTEMPT_TO_REBIND : RebindQueryInfo::DO_NOT_REBIND;
+	}
+};
+} // namespace
+
+void NoteStoredTranslationPlan(ClientContext &context) {
+	context.registered_state->GetOrCreate<StoredTranslationPlans>("dict_global_stored_translation_plans");
+}
+
+void MarkCodesOnly(PhysicalOperator &child, idx_t chunk_index, const shared_ptr<ColumnDictionary> &dict,
+                   shared_ptr<atomic<bool>> admitted) {
+	vector<reference<PhysicalOperator>> chain;
+	optional_ptr<PhysicalTableScan> scan;
+	if (!dict || !dict->persisted || !ScanChain(child, chain, scan) || !CodesOnlyChain(chain, *scan, chunk_index)) {
+		return;
+	}
+	SetCodesOnly(*scan, dict, std::move(admitted));
+}
+
+//===--------------------------------------------------------------------===//
+// Late decode above a Top-N
+namespace {
+struct LateDecodeData : public FunctionData {
+	LateDecodeData(shared_ptr<CodeKeys> keys_p, idx_t key_index_p) : keys(std::move(keys_p)), key_index(key_index_p) {
+	}
+	shared_ptr<CodeKeys> keys;
+	idx_t key_index;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<LateDecodeData>(keys, key_index);
+	}
+	bool Equals(const FunctionData &other) const override {
+		auto &cast = other.Cast<LateDecodeData>();
+		return keys == cast.keys && key_index == cast.key_index;
+	}
+};
+
+void LateDecodeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &data = expr.bind_info->Cast<LateDecodeData>();
+	auto &key = data.keys->keys[data.key_index];
+	auto &dict = *key.dict;
+	const idx_t count = args.size();
+	UnifiedVectorFormat format;
+	args.data[0].ToUnifiedFormat(count, format);
+	auto codes = UnifiedVectorFormat::GetData<int32_t>(format);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto strings = FlatVector::GetData<string_t>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < count; i++) {
+		const auto idx = format.sel->get_index(i);
+		if (!format.validity.RowIsValid(idx) || codes[idx] == 0) {
+			validity.SetInvalid(i);
+			continue;
+		}
+		const auto code = UnsafeNumericCast<idx_t>(codes[idx]);
+		if (code < dict.count) {
+			strings[i] = dict.persisted->Fetch(result, UnsafeNumericCast<uint32_t>(code));
+		} else {
+			auto &overflow_entry = *data.keys->overflow[data.key_index];
+			lock_guard<mutex> guard(overflow_entry.lock);
+			strings[i] = StringVector::AddStringOrBlob(result, overflow_entry.strings[code - dict.count]);
+		}
+	}
+}
+} // namespace
+
+vector<LateDecode> PlanLateDecode(PhysicalOperator &child, const vector<BoundOrderByNode> &orders) {
+	vector<LateDecode> result;
+	if (!PersistedTranslationsEnabled()) {
+		return result;
+	}
+	// the chain: PROJECTION* over a grouped hash aggregate with code keys
+	vector<reference<PhysicalOperator>> projections;
+	reference<PhysicalOperator> current(child);
+	while (current.get().type == PhysicalOperatorType::PROJECTION) {
+		if (current.get().children.size() != 1) {
+			return result;
+		}
+		projections.push_back(current);
+		current = current.get().children[0];
+	}
+	if (current.get().type != PhysicalOperatorType::HASH_GROUP_BY) {
+		return result;
+	}
+	auto &aggregate = current.get();
+	auto keys = FindCodeKeys(&aggregate);
+	if (!keys) {
+		return result;
+	}
+	struct Carried {
+		idx_t key_index;
+		//! the positions carrying the key at each level, from the aggregate's output up to the Top-N's input
+		vector<vector<idx_t>> positions;
+	};
+	vector<Carried> carried;
+	for (idx_t k = 0; k < keys->keys.size(); k++) {
+		auto &key = keys->keys[k];
+		if (!key.dict || !key.dict->persisted || key.emit_codes) {
+			continue;
+		}
+		Carried entry;
+		entry.key_index = k;
+		unordered_set<idx_t> set {key.group_index};
+		entry.positions.push_back({key.group_index});
+		bool sound = true;
+		for (idx_t i = projections.size(); i > 0 && sound; i--) {
+			auto &projection = projections[i - 1].get().Cast<PhysicalProjection>();
+			unordered_set<idx_t> next;
+			vector<idx_t> next_positions;
+			for (idx_t out = 0; out < projection.select_list.size(); out++) {
+				auto &expr = *projection.select_list[out];
+				if (expr.GetExpressionType() == ExpressionType::BOUND_REF) {
+					if (set.count(expr.Cast<BoundReferenceExpression>().index)) {
+						next.insert(out);
+						next_positions.push_back(out);
+					}
+				} else if (ReferencesAny(expr, set)) {
+					sound = false;
+				}
+			}
+			set = std::move(next);
+			entry.positions.push_back(std::move(next_positions));
+		}
+		for (auto &order : orders) {
+			sound = sound && !ReferencesAny(*order.expression, set);
+		}
+		if (sound && !set.empty()) {
+			carried.push_back(std::move(entry));
+		}
+	}
+	for (auto &entry : carried) {
+		auto &key = keys->keys[entry.key_index];
+		key.emit_codes = true;
+		aggregate.types[key.group_index] = LogicalType::INTEGER;
+		for (idx_t level = 1; level < entry.positions.size(); level++) {
+			auto &projection = projections[projections.size() - level].get().Cast<PhysicalProjection>();
+			for (auto out : entry.positions[level]) {
+				projection.select_list[out]->return_type = LogicalType::INTEGER;
+				projection.types[out] = LogicalType::INTEGER;
+			}
+		}
+		for (auto position : entry.positions.back()) {
+			result.push_back(LateDecode {position, keys, entry.key_index});
+		}
+	}
+	return result;
+}
+
+unique_ptr<Expression> LateDecodeExpression(const LateDecode &decode, idx_t index, const LogicalType &type) {
+	ScalarFunction function("__dict_global_decode", {LogicalType::INTEGER}, type, LateDecodeFunction);
+	vector<unique_ptr<Expression>> children;
+	children.push_back(make_uniq<BoundReferenceExpression>(LogicalType::INTEGER, index));
+	return make_uniq<BoundFunctionExpression>(type, std::move(function), std::move(children),
+	                                          make_uniq<LateDecodeData>(decode.keys, decode.key_index));
+}
+
+unique_ptr<Expression> CodeDecodeExpression(const shared_ptr<ColumnDictionary> &dict, unique_ptr<Expression> child,
+                                            const LogicalType &type) {
+	// one emitted key over the dictionary's stored translations; its overflow is never taken (every code a stored one)
+	auto keys = make_shared_ptr<CodeKeys>();
+	CodeKey key;
+	key.group_index = 0;
+	key.chunk_index = 0;
+	key.dict = dict;
+	key.emit_codes = true;
+	keys->keys.push_back(std::move(key));
+	keys->overflow.push_back(make_uniq<CodeKeys::Overflow>());
+	keys->column_names = dict->column_name;
+	ScalarFunction function("__dict_global_decode", {LogicalType::INTEGER}, type, LateDecodeFunction);
+	function.SetFallible();
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(child));
+	return make_uniq<BoundFunctionExpression>(type, std::move(function), std::move(children),
+	                                          make_uniq<LateDecodeData>(std::move(keys), 0));
+}
+
+namespace {
+//! __dict_global_codes: a codes-only vector's codes (its dictionary selection) as INTEGER, NULL for code 0. Fail
+//! closed: any other vector (strings, or a dictionary vector that is not over stored translations) throws, never a
+//! lookup
+void CodesFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &input = args.data[0];
+	const idx_t count = args.size();
+	if (input.GetVectorType() == VectorType::CONSTANT_VECTOR && ConstantVector::IsNull(input)) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+		ConstantVector::SetNull(result, true);
+		return;
+	}
+	if (input.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
+	    !CodesOnlyTranslationsOf(DictionaryVector::DictionaryId(input))) {
+		throw InternalException("a codes-only vector was expected");
+	}
+	auto &codes = DictionaryVector::SelVector(input);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetData<int32_t>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < count; i++) {
+		const auto code = codes.get_index(i);
+		out[i] = UnsafeNumericCast<int32_t>(code);
+		if (code == 0) {
+			validity.SetInvalid(i);
+		}
+	}
+}
+} // namespace
+
+unique_ptr<Expression> CodesExpression(unique_ptr<Expression> child) {
+	ScalarFunction function("__dict_global_codes", {LogicalType::VARCHAR}, LogicalType::INTEGER, CodesFunction);
+	// it throws on a vector that is not codes-only: never evaluated over a dictionary's entries instead of its rows
+	function.SetFallible();
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(child));
+	return make_uniq<BoundFunctionExpression>(LogicalType::INTEGER, std::move(function), std::move(children), nullptr);
+}
 
 unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &child,
                                   vector<unique_ptr<Expression>> &groups, const vector<LogicalType> &output_types,
@@ -1365,6 +2012,15 @@ unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &chil
 			// the scan publishes the column for this plan (marked, and not refused by the memory gate)
 			dict = Published(duck_table.GetStorage(), resolved.storage_index);
 		}
+		if (!dict && StringType::GetCollation(resolved.type).empty() &&
+		    StringType::GetCollation(group.return_type).empty() && grouping_set_count <= 1 &&
+		    std::find(read_indexes.begin(), read_indexes.end(), chunk_index) == read_indexes.end() &&
+		    ScanPublicationOf(scan.bind_data.get()) && ScanPublicationOf(scan.bind_data.get())->Find(resolved.storage_index) &&
+		    !LocalStorage::Get(context, duck_table.GetStorage().db).Find(duck_table.GetStorage()) &&
+		    scan.estimated_cardinality >= idx_t(kStoredCodeKeysMinScanRows) &&
+		    CodesOnlyChain(chain, scan, chunk_index)) {
+			dict = PublishPersisted(duck_table.GetStorage(), resolved.storage_index);
+		}
 		if (!dict) {
 			continue;
 		}
@@ -1376,14 +2032,17 @@ unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &chil
 			result->column_names += "\n";
 		}
 		result->column_names += resolved.name;
+		if (key.dict->persisted) {
+			result->column_names += " (stored)";
+		}
 		result->keys.push_back(std::move(key));
 	}
 	if (result->keys.empty()) {
 		return nullptr;
 	}
-	// the wide guard: with a packed group width (plan_aggregate's key_bytes) above the fused kernel's 12 bytes once these
-	// keys are typed, the code key would land on the general hash table, where it is slower than the string key;
-	// such keys stay strings (the 12-byte bound is a tuning threshold; see CLICKBENCH-FORK.md)
+	// the wide guard: with a packed group width (plan_aggregate's key_bytes) above the fused kernel's key bytes
+	// (WideGuardKeyBytes) once these keys are typed, the code key would land on the general hash table, where it is
+	// slower than the string key; such keys stay strings (the bound is the fused kernel's key width)
 	if (WideGuardEnabled()) {
 		idx_t key_bytes = 0;
 		for (idx_t group_idx = 0; group_idx < groups.size(); group_idx++) {
@@ -1394,7 +2053,7 @@ unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &chil
 			key_bytes += typed ? GetTypeIdSize(PhysicalType::INT32)
 			                   : GetTypeIdSize(groups[group_idx]->return_type.InternalType());
 		}
-		if (key_bytes > FusedIntegerAggregate::MAXIMUM_KEY_BYTES) {
+		if (key_bytes > WideGuardKeyBytes()) {
 			return nullptr;
 		}
 	}
@@ -1406,8 +2065,63 @@ unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &chil
 		result->input_types[key.chunk_index] = LogicalType::INTEGER;
 		result->internal_output_types[key.group_index] = LogicalType::INTEGER;
 		result->overflow.push_back(make_uniq<CodeKeys::Overflow>());
+		if (key.dict->persisted) {
+			// the scan emits this key's codes only; a prepared plan re-binds once these translations go stale
+			SetCodesOnly(scan, key.dict);
+			NoteStoredTranslationPlan(context);
+		}
 	}
 	return result;
+}
+
+shared_ptr<ColumnDictionary> PlanPublishedColumn(PhysicalOperator &child, idx_t chunk_index, const LogicalType &type,
+                                                 optional_ptr<DataTable> &table) {
+	if (type.InternalType() != PhysicalType::VARCHAR || !StringType::GetCollation(type).empty()) {
+		return nullptr;
+	}
+	// the chain: PROJECTION* / FILTER* over one seq_scan of a DuckDB table (PlanCodeKeys's chain)
+	vector<reference<PhysicalOperator>> chain;
+	reference<PhysicalOperator> current(child);
+	while (current.get().type == PhysicalOperatorType::PROJECTION ||
+	       current.get().type == PhysicalOperatorType::FILTER) {
+		if (current.get().children.size() != 1) {
+			return nullptr;
+		}
+		chain.push_back(current);
+		current = current.get().children[0];
+	}
+	if (current.get().type != PhysicalOperatorType::TABLE_SCAN) {
+		return nullptr;
+	}
+	auto &scan = current.get().Cast<PhysicalTableScan>();
+	if (scan.function.name != "seq_scan" || !scan.bind_data) {
+		return nullptr;
+	}
+	auto &table_entry = scan.bind_data->Cast<TableScanBindData>().table;
+	if (!table_entry.IsDuckTable()) {
+		return nullptr;
+	}
+	auto &duck_table = table_entry.Cast<DuckTableEntry>();
+	auto resolved = ResolveColumn(chain, scan, duck_table, chunk_index);
+	if (!resolved.found || resolved.type.InternalType() != PhysicalType::VARCHAR ||
+	    !StringType::GetCollation(resolved.type).empty()) {
+		return nullptr;
+	}
+	auto publication = ScanPublicationOf(scan.bind_data.get());
+	if (!publication || !publication->Find(resolved.storage_index)) {
+		return nullptr;
+	}
+	shared_ptr<ColumnDictionary> dict;
+	if (publication->Publishes(resolved.storage_index)) {
+		dict = Published(duck_table.GetStorage(), resolved.storage_index);
+	}
+	if (!dict && CodesOnlyChain(chain, scan, chunk_index)) {
+		dict = PublishPersisted(duck_table.GetStorage(), resolved.storage_index);
+	}
+	if (dict) {
+		table = duck_table.GetStorage();
+	}
+	return dict;
 }
 
 //! The string-predicate build guard; off, such a scan is marked as any other
@@ -1497,7 +2211,8 @@ void MarkKeyConsumers(ClientContext &context, PhysicalOperator &child, const vec
 		return;
 	}
 	auto &duck_table = table_entry.Cast<DuckTableEntry>();
-	if (S1GuardEnabled() && ScanHasStringExpressionFilter(scan, duck_table)) {
+	const bool string_predicate = S1GuardEnabled() && ScanHasStringExpressionFilter(scan, duck_table);
+	if (string_predicate && !kStringPredicateStoredCodeKeys) {
 		// the string-predicate build guard: the scan stays unmarked - no build, no emission over a global dictionary,
 		// no code key, and no translation lookup in the ObjectCache at each DICT_FSST segment it initialises (the
 		// filter columns' included)
@@ -1531,6 +2246,15 @@ void MarkKeyConsumers(ClientContext &context, PhysicalOperator &child, const vec
 		if (!resolved.found || resolved.type.InternalType() != PhysicalType::VARCHAR) {
 			continue;
 		}
+		// under the string-predicate build guard only a column its consumer can read codes only through stored
+		// translations is marked (PlanCodeKeys's persisted conditions), and gated below: never built or emitted over a
+		// published dictionary; every other column stays unmarked as under the guard
+		if (string_predicate &&
+		    (scan.estimated_cardinality < idx_t(kStoredCodeKeysMinScanRows) ||
+		     LocalStorage::Get(context, duck_table.GetStorage().db).Find(duck_table.GetStorage()) ||
+		     !CodesOnlyChain(chain, scan, index) || !PublishPersisted(duck_table.GetStorage(), resolved.storage_index))) {
+			continue;
+		}
 		auto publishing = dynamic_cast<PublishingTableScanBindData *>(scan.bind_data.get());
 		if (!publishing) {
 			// the first mark: the scan's bind data becomes the publishing subclass (the base fields copied)
@@ -1556,9 +2280,143 @@ void MarkKeyConsumers(ClientContext &context, PhysicalOperator &child, const vec
 		// the admission share: a scan estimated below GATE_SHARE of the table's rows is refused the column for its
 		// executions, whatever the column's size - the build reads the whole column, not the rows the scan reads
 		// (GATE_SHARE is a tuning threshold; see CLICKBENCH-FORK.md)
-		column.gated = static_cast<double>(column.estimated_rows) < GATE_SHARE * static_cast<double>(column.table_rows);
+		column.gated = string_predicate ||
+		               static_cast<double>(column.estimated_rows) < GATE_SHARE * static_cast<double>(column.table_rows);
 		publication.columns.push_back(std::move(column));
 	}
+}
+
+void MarkFilterOnlyCodes(ClientContext &context, PhysicalTableScan &scan) {
+	if (!kFilterOnlyCodesOnly || !PersistedTranslationsEnabled() || !DictGlobalEnabled() || !scan.table_filters ||
+	    scan.projection_ids.empty() || scan.function.name != "seq_scan" || !scan.bind_data ||
+	    scan.estimated_cardinality < idx_t(kStoredCodeKeysMinScanRows)) {
+		return;
+	}
+	auto &table_entry = scan.bind_data->Cast<TableScanBindData>().table;
+	if (!table_entry.IsDuckTable()) {
+		return;
+	}
+	auto &duck_table = table_entry.Cast<DuckTableEntry>();
+	auto &storage = duck_table.GetStorage();
+	// this transaction's local rows hold strings (PlanCodeKeys's refusal; a prepared plan re-binds once they appear)
+	if (LocalStorage::Get(context, storage.db).Find(storage)) {
+		return;
+	}
+	for (auto &entry : scan.table_filters->filters) {
+		const idx_t scan_index = entry.first;
+		if (scan_index >= scan.column_ids.size() || !CodeTranslatable(*entry.second) ||
+		    std::find(scan.projection_ids.begin(), scan.projection_ids.end(), scan_index) != scan.projection_ids.end()) {
+			continue;
+		}
+		auto &column_index = scan.column_ids[scan_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren() ||
+		    !column_index.HasPrimaryIndex()) {
+			continue;
+		}
+		bool once = true;
+		for (idx_t i = 0; i < scan.column_ids.size(); i++) {
+			once = once && (i == scan_index || !(scan.column_ids[i] == column_index));
+		}
+		auto &column = duck_table.GetColumns().GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		if (!once || column.Generated() || column.Type().id() != LogicalTypeId::VARCHAR ||
+		    !StringType::GetCollation(column.Type()).empty()) {
+			continue;
+		}
+		auto dict = PublishPersisted(storage, column.StorageOid());
+		if (!dict) {
+			continue;
+		}
+		auto publishing = dynamic_cast<PublishingTableScanBindData *>(scan.bind_data.get());
+		if (!publishing) {
+			auto replacement = make_uniq<PublishingTableScanBindData>(scan.bind_data->Cast<TableScanBindData>());
+			publishing = replacement.get();
+			scan.bind_data = std::move(replacement);
+		}
+		if (!publishing->publication) {
+			publishing->publication = make_shared_ptr<ScanPublication>();
+		}
+		if (publishing->publication->Find(column.StorageOid())) {
+			continue;
+		}
+		// marked but gated: the column is never built or emitted over a published dictionary, only read codes only
+		ScanPublication::Column marked;
+		marked.storage_index = column.StorageOid();
+		marked.name = column.Name();
+		marked.gated = true;
+		marked.filter_only = true;
+		publishing->publication->columns.push_back(std::move(marked));
+		SetCodesOnly(scan, dict);
+		NoteStoredTranslationPlan(context);
+	}
+}
+
+bool MarkCodeGroupKey(ClientContext &context, LogicalGet &get, idx_t column_index,
+                      const shared_ptr<ColumnDictionary> &dict) {
+	// a get already carrying dynamic filters is refused: a runtime filter on a codes-only column must be decided on
+	// codes
+	if (get.dynamic_filters || !dict || !dict->persisted || get.function.name != "seq_scan" || !get.bind_data) {
+		return false;
+	}
+	auto table = get.GetTable();
+	auto &column_ids = get.GetColumnIds();
+	if (!table || !table->IsDuckTable() || column_index >= column_ids.size()) {
+		return false;
+	}
+	auto &column_id = column_ids[column_index];
+	if (column_id.IsRowIdColumn() || column_id.IsVirtualColumn() || column_id.HasChildren() ||
+	    !column_id.HasPrimaryIndex()) {
+		return false;
+	}
+	// the publication marks a storage column for the whole scan: the scan must read the column once
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		if (i != column_index && column_ids[i] == column_id) {
+			return false;
+		}
+	}
+	auto &column = table->GetColumns().GetColumn(LogicalIndex(column_id.GetPrimaryIndex()));
+	if (column.StorageOid() != dict->storage_index) {
+		return false;
+	}
+	auto publishing = dynamic_cast<PublishingTableScanBindData *>(get.bind_data.get());
+	if (!publishing) {
+		auto replacement = make_uniq<PublishingTableScanBindData>(get.bind_data->Cast<TableScanBindData>());
+		publishing = replacement.get();
+		get.bind_data = std::move(replacement);
+	}
+	if (!publishing->publication) {
+		publishing->publication = make_shared_ptr<ScanPublication>();
+	}
+	auto existing = publishing->publication->Find(dict->storage_index);
+	if (existing) {
+		// a second code group over the same column reads the same codes
+		return existing->group_key_codes && existing->codes_only_dict == dict;
+	}
+	// marked but gated: never built or emitted over a published dictionary, only read codes only
+	ScanPublication::Column marked;
+	marked.storage_index = dict->storage_index;
+	marked.name = column.Name();
+	marked.gated = true;
+	marked.group_key_codes = true;
+	marked.codes_only = dict->persisted;
+	marked.codes_only_dict = dict;
+	publishing->publication->columns.push_back(std::move(marked));
+	NoteStoredTranslationPlan(context);
+	return true;
+}
+
+string CodesOnlyColumnNames(const FunctionData *bind_data) {
+	string result;
+	auto publication = ScanPublicationOf(bind_data);
+	if (!publication) {
+		return result;
+	}
+	for (auto &column : publication->columns) {
+		if (column.codes_only) {
+			result += (result.empty() ? "" : "\n") + column.name +
+			          (column.filter_only ? " (filter only)" : column.group_key_codes ? " (group key)" : "");
+		}
+	}
+	return result;
 }
 
 namespace {

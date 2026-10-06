@@ -1,0 +1,415 @@
+# name: test/sql/topn/topn_varchar_nonempty_min.test
+# description: VARCHAR statistics that keep the minimum non-empty value: a Top-N bound or a range filter beside a `<> ''` (or `> ''`) filter on the same column prunes by it; answers after checkpoint, restart, appends, updates and deletes, a row group of only '' and NULL, values sharing their 8-byte prefix, unicode, NOCASE and DESC each equal the same rows taken by an ordered list aggregate, by a filter the scan cannot narrow (`length(s) > 0`) or, for NOCASE (whose ordered list aggregate orders by bytes), by a Top-N on lower(n)
+# group: [topn]
+
+require skip_reload
+
+# a file at the latest storage version: block-compressed, its VARCHAR statistics persisting the non-empty min
+load __TEST_DIR__/topn_varchar_nonempty_min.db readwrite latest
+
+statement ok
+SET threads = 8
+
+# four row groups: '' every fourth row, NULL every eleventh, otherwise a string whose prefix grows with the row number
+statement ok
+CREATE TABLE t AS SELECT i, CASE WHEN i % 4 = 0 THEN '' WHEN i % 11 = 0 THEN NULL ELSE 'k' || lpad((i // 2048)::VARCHAR, 5, '0') || ':' || (i % 97)::VARCHAR END AS s FROM range(491520) r(i)
+
+statement ok
+CHECKPOINT
+
+# the main header (after the 8-byte block checksum): the magic "DUCK" and the little-endian file version 0x40000002
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/topn_varchar_nonempty_min.db')
+----
+4455434B	0200004000000000
+
+# pass a: as checkpointed
+
+query I nosort asc_a
+SELECT unnest((list(s ORDER BY s))[1:7]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_a
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7
+----
+
+query I nosort asc_gt_a
+SELECT s FROM t WHERE s > '' ORDER BY s LIMIT 9
+----
+
+query I nosort asc_gt_a
+SELECT unnest((list(s ORDER BY s))[1:9]) FROM t WHERE length(s) > 0
+----
+
+query I nosort asc_off_a
+SELECT unnest((list(s ORDER BY s))[6:12]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_off_a
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7 OFFSET 5
+----
+
+query I nosort desc_a
+SELECT unnest((list(s ORDER BY s DESC))[1:8]) FROM t WHERE s <> ''
+----
+
+query I nosort desc_a
+SELECT s FROM t WHERE s <> '' ORDER BY s DESC LIMIT 8
+----
+
+query I nosort lt_a
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k00010'
+----
+
+query I nosort lt_a
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k00010'
+----
+
+query I nosort ge_a
+SELECT count(*) FROM t WHERE length(s) > 0 AND s >= 'k00230'
+----
+
+query I nosort ge_a
+SELECT count(*) FROM t WHERE s <> '' AND s >= 'k00230'
+----
+
+query I nosort eq_a
+SELECT count(*) FROM t WHERE length(s) > 0 AND (s = 'k00100:5' OR s = '!upd' OR s = ' late')
+----
+
+query I nosort eq_a
+SELECT count(*) FROM t WHERE s <> '' AND s IN ('k00100:5', '!upd', ' late')
+----
+
+query I nosort below_a
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k'
+----
+
+query I nosort below_a
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k'
+----
+
+# pass b: after a restart
+restart
+
+statement ok
+SET threads = 8
+
+
+query I nosort asc_b
+SELECT unnest((list(s ORDER BY s))[1:7]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_b
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7
+----
+
+query I nosort asc_gt_b
+SELECT s FROM t WHERE s > '' ORDER BY s LIMIT 9
+----
+
+query I nosort asc_gt_b
+SELECT unnest((list(s ORDER BY s))[1:9]) FROM t WHERE length(s) > 0
+----
+
+query I nosort asc_off_b
+SELECT unnest((list(s ORDER BY s))[6:12]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_off_b
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7 OFFSET 5
+----
+
+query I nosort desc_b
+SELECT unnest((list(s ORDER BY s DESC))[1:8]) FROM t WHERE s <> ''
+----
+
+query I nosort desc_b
+SELECT s FROM t WHERE s <> '' ORDER BY s DESC LIMIT 8
+----
+
+query I nosort lt_b
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k00010'
+----
+
+query I nosort lt_b
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k00010'
+----
+
+query I nosort ge_b
+SELECT count(*) FROM t WHERE length(s) > 0 AND s >= 'k00230'
+----
+
+query I nosort ge_b
+SELECT count(*) FROM t WHERE s <> '' AND s >= 'k00230'
+----
+
+query I nosort eq_b
+SELECT count(*) FROM t WHERE length(s) > 0 AND (s = 'k00100:5' OR s = '!upd' OR s = ' late')
+----
+
+query I nosort eq_b
+SELECT count(*) FROM t WHERE s <> '' AND s IN ('k00100:5', '!upd', ' late')
+----
+
+query I nosort below_b
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k'
+----
+
+query I nosort below_b
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k'
+----
+
+# appended and updated rows not yet checkpointed: a smaller non-empty value in the last row group and in the appended
+# rows, one of the smallest values updated away to ''
+statement ok
+INSERT INTO t VALUES (491520, ' late'), (491521, ''), (491522, NULL), (491523, 'k00000:0')
+
+statement ok
+UPDATE t SET s = '!upd' WHERE i = 400001
+
+statement ok
+UPDATE t SET s = '' WHERE i = 1
+
+
+query I nosort asc_c
+SELECT unnest((list(s ORDER BY s))[1:7]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_c
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7
+----
+
+query I nosort asc_gt_c
+SELECT s FROM t WHERE s > '' ORDER BY s LIMIT 9
+----
+
+query I nosort asc_gt_c
+SELECT unnest((list(s ORDER BY s))[1:9]) FROM t WHERE length(s) > 0
+----
+
+query I nosort asc_off_c
+SELECT unnest((list(s ORDER BY s))[6:12]) FROM t WHERE s <> ''
+----
+
+query I nosort asc_off_c
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7 OFFSET 5
+----
+
+query I nosort desc_c
+SELECT unnest((list(s ORDER BY s DESC))[1:8]) FROM t WHERE s <> ''
+----
+
+query I nosort desc_c
+SELECT s FROM t WHERE s <> '' ORDER BY s DESC LIMIT 8
+----
+
+query I nosort lt_c
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k00010'
+----
+
+query I nosort lt_c
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k00010'
+----
+
+query I nosort ge_c
+SELECT count(*) FROM t WHERE length(s) > 0 AND s >= 'k00230'
+----
+
+query I nosort ge_c
+SELECT count(*) FROM t WHERE s <> '' AND s >= 'k00230'
+----
+
+query I nosort eq_c
+SELECT count(*) FROM t WHERE length(s) > 0 AND (s = 'k00100:5' OR s = '!upd' OR s = ' late')
+----
+
+query I nosort eq_c
+SELECT count(*) FROM t WHERE s <> '' AND s IN ('k00100:5', '!upd', ' late')
+----
+
+query I nosort below_c
+SELECT count(*) FROM t WHERE length(s) > 0 AND s < 'k'
+----
+
+query I nosort below_c
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k'
+----
+
+
+# checkpointed and restarted with the appended and updated rows, then a delete of the smallest value
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads = 8
+
+query I nosort final_asc
+SELECT unnest((list(s ORDER BY s))[1:7]) FROM t WHERE s <> ''
+----
+
+query I nosort final_asc
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 7
+----
+
+query I
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 3
+----
+ late
+!upd
+k00000:0
+
+statement ok
+DELETE FROM t WHERE s = ' late'
+
+query I nosort final_del
+SELECT unnest((list(s ORDER BY s))[1:5]) FROM t WHERE s <> ''
+----
+
+query I nosort final_del
+SELECT s FROM t WHERE s <> '' ORDER BY s LIMIT 5
+----
+
+query I
+SELECT count(*) FROM t WHERE s <> '' AND s < 'k'
+----
+1
+
+# a row group of only '' and NULL ahead of a row group of strings
+statement ok
+CREATE TABLE e AS SELECT i, CASE WHEN i < 122880 THEN (CASE WHEN i % 3 = 0 THEN NULL ELSE '' END) ELSE 'p' || (i % 1000)::VARCHAR END AS s FROM range(245760) r(i)
+
+statement ok
+CHECKPOINT
+
+query I nosort e_asc
+SELECT unnest((list(s ORDER BY s))[1:5]) FROM e WHERE s <> ''
+----
+
+query I nosort e_asc
+SELECT s FROM e WHERE s <> '' ORDER BY s LIMIT 5
+----
+
+query I
+SELECT count(*) FROM e WHERE s <> '' AND s < 'zzz' AND i < 122880
+----
+0
+
+query I
+SELECT count(*) FROM e WHERE s <> '' AND s < 'zzz'
+----
+122880
+
+# values sharing their first 8 bytes: the bound's prefix equals every segment's truncated min
+statement ok
+CREATE TABLE p AS SELECT i, CASE WHEN i % 5 = 0 THEN '' ELSE 'samepref' || chr((65 + ((i * 7) % 26))::INTEGER) || (i % 1000)::VARCHAR END AS s FROM range(368640) r(i)
+
+statement ok
+INSERT INTO p VALUES (368640, 'samepref'), (368641, 'sameprefA0'), (368642, 'samepre')
+
+statement ok
+CHECKPOINT
+
+query I nosort p_asc
+SELECT unnest((list(s ORDER BY s))[1:12]) FROM p WHERE s <> ''
+----
+
+query I nosort p_asc
+SELECT s FROM p WHERE s <> '' ORDER BY s LIMIT 12
+----
+
+query I nosort p_lt
+SELECT count(*) FROM p WHERE length(s) > 0 AND s < 'sameprefB'
+----
+
+query I nosort p_lt
+SELECT count(*) FROM p WHERE s <> '' AND s < 'sameprefB'
+----
+
+# unicode strings, and a NOCASE column (NOCASE ties make the chosen rows arbitrary: compared lower-cased, against a Top-N on
+# lower(n), which pushes no bound)
+statement ok
+CREATE TABLE u AS SELECT i, CASE WHEN i % 3 = 0 THEN '' ELSE (['привет ', 'Ярмарка ', 'ёлка ', 'zeta ', 'Alpha '])[1 + (i % 5)] || (i // 997)::VARCHAR END AS s, CASE WHEN i % 3 = 0 THEN '' ELSE (['b', 'B', 'a', 'C', 'c'])[1 + (i % 5)] || (i // 3001)::VARCHAR END AS n FROM range(300000) r(i)
+
+statement ok
+CREATE TABLE c (i INTEGER, n VARCHAR COLLATE NOCASE)
+
+statement ok
+INSERT INTO c SELECT i, n FROM u
+
+statement ok
+CHECKPOINT
+
+query I nosort u_asc
+SELECT unnest((list(s ORDER BY s))[1:7]) FROM u WHERE s <> ''
+----
+
+query I nosort u_asc
+SELECT s FROM u WHERE s <> '' ORDER BY s LIMIT 7
+----
+
+query I nosort u_desc
+SELECT unnest((list(s ORDER BY s DESC))[1:8]) FROM u WHERE s <> ''
+----
+
+query I nosort u_desc
+SELECT s FROM u WHERE s <> '' ORDER BY s DESC LIMIT 8
+----
+
+query I nosort c_asc
+SELECT lower(n) AS x FROM c WHERE n <> '' ORDER BY x LIMIT 10
+----
+
+query I nosort c_asc
+SELECT lower(n) FROM (SELECT n FROM c WHERE n <> '' ORDER BY n LIMIT 10)
+----
+
+# a NOACCENT column (accent-insensitive ties make the chosen rows arbitrary: compared accent-stripped, against a Top-N on
+# strip_accents(n), which pushes no bound), after the checkpoint and after a restart
+statement ok
+CREATE TABLE na (i INTEGER, n VARCHAR COLLATE NOACCENT)
+
+statement ok
+INSERT INTO na SELECT i, CASE WHEN i % 3 = 0 THEN '' ELSE (['élan ', 'elan ', 'Ève ', 'eve ', 'àbc '])[1 + (i % 5)] || (i // 997)::VARCHAR END FROM range(300000) r(i)
+
+statement ok
+CHECKPOINT
+
+query I nosort na_asc
+SELECT strip_accents(n) AS x FROM na WHERE n <> '' ORDER BY x LIMIT 10
+----
+
+query I nosort na_asc
+SELECT strip_accents(n) FROM (SELECT n FROM na WHERE n <> '' ORDER BY n LIMIT 10)
+----
+
+query I nosort na_desc
+SELECT strip_accents(n) AS x FROM na WHERE n <> '' ORDER BY x DESC LIMIT 10
+----
+
+query I nosort na_desc
+SELECT strip_accents(n) FROM (SELECT n FROM na WHERE n <> '' ORDER BY n DESC LIMIT 10)
+----
+
+restart
+
+statement ok
+SET threads = 8
+
+query I nosort na_asc_r
+SELECT strip_accents(n) AS x FROM na WHERE n <> '' ORDER BY x LIMIT 10
+----
+
+query I nosort na_asc_r
+SELECT strip_accents(n) FROM (SELECT n FROM na WHERE n <> '' ORDER BY n LIMIT 10)
+----
+
+query I nosort na_desc_r
+SELECT strip_accents(n) AS x FROM na WHERE n <> '' ORDER BY x DESC LIMIT 10
+----
+
+query I nosort na_desc_r
+SELECT strip_accents(n) FROM (SELECT n FROM na WHERE n <> '' ORDER BY n DESC LIMIT 10)
+----

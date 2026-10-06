@@ -1,0 +1,177 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_code_keys_latemat.test
+# description: a group key or DISTINCT argument whose column has stored translations reads codes only beside a string
+# predicate on another column (the string-predicate build guard builds nothing, and stored translations build nothing);
+# the answers agree with the same data stored in memory, inside a transaction holding local rows, through a prepared
+# statement, after an update and its checkpoint, and across a restart
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_code_keys_latemat.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# b: 200003 values (each in runs of three), '' and NULL; u: a string a LIKE reads; 5 * 2^20 rows, so a scan with its
+# filters is estimated at 2^20 rows (at least kStoredCodeKeysMinScanRows)
+statement ok
+CREATE TABLE t AS SELECT i, i % 10 AS k,
+CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS b,
+'https://site-' || (i % 1009) || CASE WHEN i % 7 = 0 THEN '.mirror.net/' ELSE '.example.org/' END || (i % 4099) AS u
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+# b grouped beside a string predicate on u: code keys over b's stored translations, b read codes only
+query II
+EXPLAIN SELECT b, min(u), count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*
+
+query II
+EXPLAIN SELECT b, min(u), count(*) AS c, count(DISTINCT i) FROM t WHERE u LIKE '%mirror%' AND u NOT LIKE '%site-1.%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*
+
+# the string predicate on the key column itself, the key read by an aggregate, or no stored translations (in memory): strings
+query II
+EXPLAIN SELECT b, count(*) AS c FROM t WHERE b LIKE '%77%' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT b, max(b), count(*) AS c FROM t WHERE u LIKE '%mirror%' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT b, min(u), count(*) AS c FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+# the answers, against the in-memory copy
+query I
+SELECT count(*) FROM ((SELECT b, min(u), count(*) FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, min(u), count(*) FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, min(u), count(*) FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, min(u), count(*) FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), count(DISTINCT i) FROM t WHERE u LIKE '%mirror%' GROUP BY b) EXCEPT ALL (SELECT b, count(*), count(DISTINCT i) FROM r WHERE u LIKE '%mirror%' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT k, count(DISTINCT b) FROM t WHERE u LIKE '%mirror%' GROUP BY k) EXCEPT ALL (SELECT k, count(DISTINCT b) FROM r WHERE u LIKE '%mirror%' GROUP BY k))
+----
+0
+
+# the Top-N with its late decode: the first rows agree (ties broken on the key)
+query III
+(SELECT b, min(u), count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 10) EXCEPT ALL (SELECT b, min(u), count(*) AS c FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 10)
+----
+
+query IIIII
+SELECT b, min(u), count(*) AS c, count(DISTINCT k), sum(i) FROM t WHERE u LIKE '%mirror%' AND u NOT LIKE '%site-1.%' AND b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 3
+----
+wval-100-0123456789	https://site-301.mirror.net/301	4	4	8401330
+wval-10000-0123456789	https://site-337.mirror.net/3996	4	4	7920122
+wval-100000-0123456789	https://site-299.mirror.net/1340	4	4	11400158
+
+# a prepared statement, re-run inside a transaction holding local rows (the plan re-binds to strings) and after
+statement ok
+PREPARE p AS SELECT b, count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 2
+
+query II
+EXECUTE p
+----
+wval-100-0123456789	4
+wval-10000-0123456789	4
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t SELECT i, k, 'wval-5-0123456789', u FROM t WHERE i < 21 AND i % 7 = 0
+
+query II
+EXECUTE p
+----
+wval-5-0123456789	7
+wval-100-0123456789	4
+
+query II
+EXPLAIN SELECT b, count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 2
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+statement ok
+ROLLBACK
+
+query II
+EXECUTE p
+----
+wval-100-0123456789	4
+wval-10000-0123456789	4
+
+# an update: the column is read as without stored translations until the checkpoint rewrites them
+statement ok
+UPDATE t SET b = 'wval-5-0123456789' WHERE i = 7
+
+statement ok
+INSERT INTO r SELECT * FROM t WHERE i = 7
+
+statement ok
+DELETE FROM r WHERE i = 7 AND b IS DISTINCT FROM 'wval-5-0123456789'
+
+query II
+EXECUTE p
+----
+wval-5-0123456789	5
+wval-100-0123456789	4
+
+query I
+SELECT count(*) FROM ((SELECT b, min(u), count(*) FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, min(u), count(*) FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b))
+----
+0
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT b, min(u), count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*
+
+query II
+EXECUTE p
+----
+wval-5-0123456789	5
+wval-100-0123456789	4
+
+query I
+SELECT count(*) FROM ((SELECT b, min(u), count(*) FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, min(u), count(*) FROM r WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b))
+----
+0
+
+restart
+
+query II
+EXPLAIN SELECT b, min(u), count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC LIMIT 10
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*
+
+query II
+SELECT b, count(*) AS c FROM t WHERE u LIKE '%mirror%' AND b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 2
+----
+wval-5-0123456789	5
+wval-100-0123456789	4

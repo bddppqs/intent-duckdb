@@ -322,3 +322,100 @@ SELECT x, x + 100 AS p, count(*) FROM t_integer GROUP BY x, p HAVING p > 5000100
 8000000	8000100	10
 7000000	7000100	10
 6000000	6000100	10
+
+# a constant group key next to a non-foldable key is removed by the duplicate-groups pass that runs before
+# statistics propagation, so compressed materialization never turns it into a per-row key; the aggregate groups by the
+# real key alone, the constant is restored above it, and the answers equal those with the pass disabled
+statement ok
+CREATE TABLE t_literal AS SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE 'k' || (i % 4)::VARCHAR END AS k, i AS v FROM range(100) r(i)
+
+query II
+EXPLAIN SELECT 1, k, count(*) AS c FROM t_literal GROUP BY 1, k ORDER BY c DESC LIMIT 3
+----
+logical_opt	<REGEX>:.*Groups: k.*
+
+query II
+EXPLAIN SELECT 1, k, count(*) AS c FROM t_literal GROUP BY 1, k ORDER BY c DESC LIMIT 3
+----
+logical_opt	<!REGEX>:.*__internal_compress_integral.*
+
+query ITI
+SELECT 1, k, count(*) AS c FROM t_literal GROUP BY 1, k ORDER BY c DESC, k NULLS LAST LIMIT 3
+----
+1	k1	22
+1	k0	21
+1	k2	21
+
+# an all-constant group list keeps every group: there is no real key to retain
+query III
+SELECT 1, 2, count(*) FROM t_literal GROUP BY 1, 2
+----
+1	2	100
+
+# a casted constant and a NULL constant are constants
+query ITI
+SELECT 7::BIGINT, k, sum(v) FROM t_literal GROUP BY 1, k ORDER BY k NULLS LAST
+----
+7	k0	1032
+7	k1	1078
+7	k2	1026
+7	k3	1079
+7	NULL	735
+
+query ITI
+SELECT NULL, k, count(*) FROM t_literal GROUP BY 1, k ORDER BY k NULLS LAST
+----
+NULL	k0	21
+NULL	k1	22
+NULL	k2	21
+NULL	k3	21
+NULL	NULL	15
+
+# the removed key is usable in HAVING and ORDER BY
+query TTI
+SELECT 'x' AS t, k, count(*) AS c FROM t_literal GROUP BY t, k HAVING t = 'x' AND c > 20 ORDER BY t, k NULLS LAST
+----
+x	k0	21
+x	k1	22
+x	k2	21
+x	k3	21
+
+# an empty input stays grouped: no row
+query ITI
+SELECT 1, k, count(*) FROM t_literal WHERE v < 0 GROUP BY 1, k
+----
+
+# grouping sets keep the aggregate unchanged
+query ITI
+SELECT 1 AS one, k, count(*) AS c FROM t_literal GROUP BY GROUPING SETS ((one, k), ()) ORDER BY c, k NULLS LAST
+----
+1	NULL	15
+1	k0	21
+1	k2	21
+1	k3	21
+1	k1	22
+NULL	NULL	100
+
+# the restored constants keep their types
+query TTI
+SELECT typeof(a), typeof(b), count(*) FROM (SELECT 1 AS a, 2.5::DECIMAL(4,1) AS b, k FROM t_literal GROUP BY a, b, k) GROUP BY ALL
+----
+INTEGER	DECIMAL(4,1)	5
+
+statement ok
+SET disabled_optimizers = 'duplicate_groups'
+
+query II
+EXPLAIN SELECT 1, k, count(*) AS c FROM t_literal GROUP BY 1, k ORDER BY c DESC LIMIT 3
+----
+logical_opt	<!REGEX>:.*Groups: k.*
+
+query ITI
+SELECT 1, k, count(*) AS c FROM t_literal GROUP BY 1, k ORDER BY c DESC, k NULLS LAST LIMIT 3
+----
+1	k1	22
+1	k0	21
+1	k2	21
+
+statement ok
+RESET disabled_optimizers

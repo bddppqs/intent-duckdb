@@ -29,6 +29,8 @@ public:
 
 public:
 	void Initialize(bool initialize_dictionary = true);
+	//! Codes only (dictionary never read): every vector is emitted over `translation`, the column's stored translation
+	void InitializeCodesOnly(shared_ptr<dict_global::SegmentTranslation> translation);
 	//! Materialise the whole dictionary on demand (idempotent): a no-op for a fetch state, an FSST_ONLY segment or a
 	//! cache hit; publishes to the dictionary cache exactly as a non-deferred Initialize(true) does
 	void EnsureDictionary();
@@ -52,6 +54,10 @@ public:
 	bool AllowGlobalDictionaryScan(idx_t scan_count) const;
 	//! Emit `count` rows whose local codes are `local` over the published global dictionary
 	void ScanToGlobalDictionary(const SelectionVector &local, idx_t count, Vector &result);
+	//! ScanToGlobalDictionary for the `row_count` rows `rows` lists only: every other of the `count` rows holds the
+	//! NULL code 0 (a valid index the rows a filter dropped carry; no consumer reads them)
+	void ScanToGlobalDictionarySelected(const SelectionVector &local, const SelectionVector &rows, idx_t row_count,
+	                                    idx_t count, Vector &result);
 
 	//! Entry `dict_idx` of a state initialised without its dictionary, at `dict_offset` (the sum of the entries'
 	//! string_lengths before it): decoded into `result`'s string heap (DICT_FSST) or a view into the pinned block
@@ -67,6 +73,8 @@ public:
 	ColumnSegment &segment;
 	BufferHandle owned_handle;
 	optional_ptr<BufferHandle> handle;
+	BufferHandle code_handle;
+	bool codes_only = false;
 
 	DictFSSTMode mode;
 	idx_t dictionary_size;
@@ -104,6 +112,13 @@ public:
 	//! built when the ONE_FAILS shape is classified
 	uint32_t single_code_image[32];
 	bool single_code_image_valid = false;
+	//! a codes-only scan of a column read for its filter only: the single-code shape and the NULL slot's verdict,
+	//! classified once from the segment's translation
+	bool filter_only_classified = false;
+	bool filter_only_null_passes = false;
+	//! a codes-only scan of a column read for a key, under kCodesOnlyKeyFilterPerSegment: its pushed filter classified
+	//! once from the segment's translation as for a filter-only column (the shape above and filter_only_null_passes)
+	bool key_filter_classified = false;
 
 	//! deferred materialisation: Initialize(true) ran on a DICT_FSST/DICTIONARY segment without a cache hit and
 	//! left the whole-dictionary decode to EnsureDictionary(); the admission decided at Initialize is kept for the

@@ -675,7 +675,8 @@ class RE2 {
       case_sensitive_(true),
       perl_classes_(false),
       word_boundary_(false),
-      one_line_(false) {
+      one_line_(false),
+      tagged_dfa_(false) {
     }
 
     /*implicit*/ Options(CannedOptions);
@@ -719,6 +720,13 @@ class RE2 {
     bool one_line() const { return one_line_; }
     void set_one_line(bool b) { one_line_ = b; }
 
+    // An anchored submatch search runs a tagged DFA first, when the program
+    // is admitted (Prog::SearchTDFA); results are the same either way. Meant
+    // for an RE2 that searches many texts: the automaton is built as searches
+    // need it.
+    bool tagged_dfa() const { return tagged_dfa_; }
+    void set_tagged_dfa(bool b) { tagged_dfa_ = b; }
+
     void Copy(const Options& src) {
       *this = src;
     }
@@ -739,6 +747,7 @@ class RE2 {
     bool perl_classes_;
     bool word_boundary_;
     bool one_line_;
+    bool tagged_dfa_;
   };
 
   // Returns the options set in the constructor.

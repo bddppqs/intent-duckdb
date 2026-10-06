@@ -598,6 +598,14 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
 		if (!dynamic_filter.filter_data) {
 			return approved_tuple_count;
 		}
+		const ConstantFilter *published;
+		if (dynamic_filter.filter_data->LoadPublished(published)) {
+			// the immutable copy of the bound set last, read without the lock (kTopNBoundLockFree)
+			if (!published) {
+				return approved_tuple_count;
+			}
+			return FilterSelection(sel, vector, vdata, *published, filter_state, scan_count, approved_tuple_count);
+		}
 		auto comparison_type = ExpressionType::INVALID;
 		Value constant;
 		{

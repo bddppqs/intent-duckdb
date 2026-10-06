@@ -25,12 +25,16 @@ class ClientContext;
 class ColumnSegment;
 class DataTable;
 class PhysicalOperator;
+class PhysicalTableScan;
 class Expression;
+class LogicalGet;
 class RowGroupCollection;
+struct BoundOrderByNode;
 struct DataTableInfo;
 struct FunctionData;
 
 namespace dict_global {
+class PersistedTranslations;
 
 //! The memory_limit below which the memory-for-speed mechanisms take their small-memory form (no borrowed group keys,
 //! no MIN/MAX string arena, the global-dictionary budget a quarter of the pool); at or above it they keep their
@@ -83,6 +87,11 @@ public:
 	idx_t index_mask = 0;
 	//! Bytes reserved through BufferManager::ReserveMemory (EXTENSION), released with the entry
 	idx_t reserved = 0;
+	//! The rows of the segments whose dictionaries the build merged (the segments with a translation); a column
+	//! whose every committed row lies in them reads rows_covered == DataTable::GetTotalRows()
+	idx_t rows_covered = 0;
+	//! A column read through stored translations: a codes-only child; a code's string is read where it first occurs
+	shared_ptr<PersistedTranslations> persisted;
 
 	ColumnState GetState() const {
 		return static_cast<ColumnState>(state.load(std::memory_order_acquire));
@@ -117,6 +126,9 @@ public:
 	shared_ptr<ColumnDictionary> dict;
 	unsafe_unique_array<uint32_t> codes;
 	idx_t count;
+	//! a codes-only read of a column its scan reads for the filter only: its segment filter decides on local codes and
+	//! emits no values
+	bool filter_only = false;
 	//! This segment's handle on dict->child (ChildHandle; null when kSegmentTranslationChildHandle is off)
 	buffer_ptr<VectorChildBuffer> child;
 
@@ -143,6 +155,7 @@ struct TableDictionaries {
 	//! the storage epoch: a process-wide counter value taken at creation and at every checkpoint
 	atomic<idx_t> epoch;
 	unordered_map<idx_t, shared_ptr<ColumnDictionary>> columns;
+	unordered_map<idx_t, shared_ptr<ColumnDictionary>> persisted_columns;
 };
 //! The table's registry entry (created when `create`), or null
 shared_ptr<TableDictionaries> TableEntry(const shared_ptr<DataTableInfo> &info, bool create);
@@ -200,6 +213,22 @@ struct ScanPublication {
 		idx_t table_rows = 0;
 		//! the memory gate refuses this column's build (and its emission) for the scan's executions
 		bool gated = false;
+		//! Every consumer above the scan reads only codes, through these stored translations and this entry; else null
+		shared_ptr<PersistedTranslations> codes_only;
+		shared_ptr<ColumnDictionary> codes_only_dict;
+		//! set when the consumer decides at each execution whether the scan reads codes only: its sink stores the
+		//! decision before the scan starts, and a refused execution reads strings for the generic path; null: every
+		//! execution reads codes only
+		shared_ptr<atomic<bool>> codes_only_admitted;
+		//! the scan reads the column for its pushed filter only (MarkFilterOnlyCodes): nothing reads its values
+		bool filter_only = false;
+		//! the scan reads the column for a first-keys code group (MarkCodeGroupKey): its consumers read its codes only
+		bool group_key_codes = false;
+
+		//! the scan reads the column's codes only in this execution
+		bool ReadsCodesOnly() const {
+			return codes_only && (!codes_only_admitted || codes_only_admitted->load(std::memory_order_acquire));
+		}
 	};
 	vector<Column> columns;
 
@@ -244,6 +273,8 @@ struct CodeKey {
 	idx_t group_index;
 	idx_t chunk_index;
 	shared_ptr<ColumnDictionary> dict;
+	//! the operator emits this key's codes (INTEGER) and a projection above its Top-N decodes them (PlanLateDecode)
+	bool emit_codes = false;
 };
 
 //! The conversion of one typed aggregate's input and output
@@ -275,6 +306,69 @@ public:
 unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &child,
                                   vector<unique_ptr<Expression>> &groups, const vector<LogicalType> &output_types,
                                   const vector<unique_ptr<Expression>> &aggregates, idx_t grouping_set_count);
+//! Plan time: the published dictionary of the admitted, uncollated VARCHAR column that input column `chunk_index`
+//! of an operator over `child` resolves to (PROJECTION* / FILTER* over one seq_scan, BOUND_REFs only), when the scan
+//! publishes that column for this plan (PlanCodeKeys's conditions for one column); else null. `table` is set to the
+//! scanned table's storage when a dictionary is returned
+shared_ptr<ColumnDictionary> PlanPublishedColumn(PhysicalOperator &child, idx_t chunk_index, const LogicalType &type,
+                                                 optional_ptr<DataTable> &table);
+
+//! The publication entry of a column read through stored translations at the current epoch (segments linked), or null
+shared_ptr<ColumnDictionary> PublishPersisted(DataTable &table, idx_t storage_index);
+//! The stored translations a codes-only tag child's id names, or null
+shared_ptr<PersistedTranslations> CodesOnlyTranslationsOf(const string &child_id);
+//! Whether every table scan of the plan that reads a column codes-only through stored translations may still execute
+//! as planned: a column read codes-only at every execution still has the plan's publication entry (none while an
+//! append lies outside the translations or the column carries an update; a checkpoint starts a new one) and this
+//! transaction holds no local storage of the table; a column whose consumer decides at each execution still has the
+//! plan's translations (a checkpoint replaced them otherwise). False when a scan's does not
+bool PlanTranslationsCurrent(ClientContext &context, const PhysicalOperator &root);
+//! Plan time, a plan that reads a column through its stored translations: the client re-binds such a prepared
+//! statement whose translations went stale before it executes (a ClientContextState)
+void NoteStoredTranslationPlan(ClientContext &context);
+//! The user error of a plan that reads stale stored translations (a statement planned before a checkpoint that changed
+//! them, executed without a re-bind)
+[[noreturn]] void ThrowStaleTranslations(const string &column_name);
+
+//! Plan time, a Top-N over PROJECTION* over a grouped hash aggregate whose code keys include a column read through its
+//! stored translations: each such key that the Top-N does not order by and the projections pass through is emitted as
+//! its codes (the aggregate's and the projections' types become INTEGER there); returns the Top-N output positions to
+//! decode, each with the key's code keys (empty: nothing changed)
+struct LateDecode {
+	idx_t position;
+	shared_ptr<CodeKeys> keys;
+	idx_t key_index;
+};
+vector<LateDecode> PlanLateDecode(PhysicalOperator &child, const vector<BoundOrderByNode> &orders);
+//! The decode of one late-decoded key: its codes (INTEGER) to strings
+unique_ptr<Expression> LateDecodeExpression(const LateDecode &decode, idx_t index, const LogicalType &type);
+//! Plan time, the fused bitmap class over a column read through its stored translations: the scan emits that column's
+//! codes only in the executions `admitted` holds true for (its sink stores the decision before the scan starts)
+void MarkCodesOnly(PhysicalOperator &child, idx_t chunk_index, const shared_ptr<ColumnDictionary> &dict,
+                   shared_ptr<atomic<bool>> admitted);
+//! Plan time, a seq_scan of a DuckDB table: each uncollated VARCHAR column the scan reads for its pushed filter only (not
+//! emitted), where that filter is decided on codes (CodeTranslatable), is read codes only at every execution through its
+//! stored translations (PublishPersisted's conditions; the scan estimated at kStoredCodeKeysMinScanRows rows or more and
+//! this transaction holding no local storage of the table; kFilterOnlyCodesOnly)
+void MarkFilterOnlyCodes(ClientContext &context, PhysicalTableScan &scan);
+//! The columns a seq_scan's bind data reads codes only through stored translations, one per line, "(filter only)" after a
+//! column read for its filter alone, "(group key)" after a first-keys code group, or empty (EXPLAIN)
+string CodesOnlyColumnNames(const FunctionData *bind_data);
+//! Optimizer time, a first-keys code group (FirstKeysAggregate, kFirstKeysCodeKeys): marks column `column_index` (an
+//! index into the get's column ids) of a seq_scan's logical get gated and read codes only at every execution through
+//! `dict`'s stored translations, on the publication its bind data carries - substituted on the first mark, and shared
+//! by every copy of that bind data, so a copy of the get made after the mark reads the same codes. False (nothing
+//! marked) for a get that already carries dynamic filters, a get that is not a seq_scan of a DuckDB table reading the
+//! column once, or a dictionary without stored translations
+bool MarkCodeGroupKey(ClientContext &context, LogicalGet &get, idx_t column_index,
+                      const shared_ptr<ColumnDictionary> &dict);
+//! __dict_global_codes(child): the codes (INTEGER) of a VARCHAR column read codes only, NULL where the code is 0 (the
+//! NULL string's); any vector other than a codes-only one (a NULL constant aside) throws an InternalException
+unique_ptr<Expression> CodesExpression(unique_ptr<Expression> child);
+//! __dict_global_decode(child): codes (INTEGER) of `dict`'s stored translations to strings of `type`, NULL for code 0
+//! (the late decode of one key, LateDecodeExpression's function, over a logical child)
+unique_ptr<Expression> CodeDecodeExpression(const shared_ptr<ColumnDictionary> &dict, unique_ptr<Expression> child,
+                                            const LogicalType &type);
 
 //! The code keys of a physical hash aggregate, kept beside the operator (keyed by its address), never inside it
 void RegisterCodeKeys(const void *op, shared_ptr<CodeKeys> keys);

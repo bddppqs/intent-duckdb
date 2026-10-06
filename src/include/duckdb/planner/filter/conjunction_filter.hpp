@@ -52,6 +52,9 @@ public:
 public:
 	ConjunctionAndFilter();
 
+	//! Whether the filter passes only non-empty values: `col <> ''` or `col > ''` on VARCHAR, or an AND holding one
+	static bool ExcludesEmptyString(const TableFilter &filter);
+
 public:
 	FilterPropagateResult CheckStatistics(BaseStatistics &stats) const override;
 	string ToString(const string &column_name) const override;

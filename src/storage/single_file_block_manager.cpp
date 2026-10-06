@@ -55,6 +55,15 @@ static constexpr idx_t ENCRYPTION_METADATA_LEN = 8;
 // pool, the block ids and every segment format are unchanged: a block is decompressed when it is read from the file.
 //! A value outside upstream DuckDB's sequential storage-version range, so other readers refuse the file.
 static constexpr uint64_t BLOCK_COMPRESSION_VERSION_NUMBER = 0x40000001;
+//! The release successor of BLOCK_COMPRESSION_VERSION_NUMBER, written whenever a new file stores its blocks compressed:
+//! the block-compressed file whose DICT_FSST segments may keep their local codes in code blocks of their own and whose
+//! tables may store column translations, whose bit-packing groups may be FOR_SCALED and whose VARCHAR statistics carry
+//! the minimum non-empty value; a reader without them refuses it by its version, and this reader opens both
+static constexpr uint64_t RELEASE_STORAGE_VERSION_NUMBER = 0x40000002;
+//! Both block-compressed file versions share the layout
+static bool IsBlockCompressedVersion(uint64_t version_number) {
+	return version_number == BLOCK_COMPRESSION_VERSION_NUMBER || version_number == RELEASE_STORAGE_VERSION_NUMBER;
+}
 static constexpr idx_t BLOCK_EXTENT_ALIGNMENT = 4096;
 //! The automatic block level (zstd_block_compression_level = 0): the high level with at least this many threads
 static constexpr int32_t BLOCK_COMPRESSION_HIGH_LEVEL_THREADS = 64;
@@ -350,7 +359,7 @@ MainHeader MainHeader::Read(ReadStream &source) {
 
 	// Check the version number to determine if we can read this file.
 	if ((header.version_number < VERSION_NUMBER_LOWER || header.version_number > VERSION_NUMBER_UPPER) &&
-	    header.version_number != BLOCK_COMPRESSION_VERSION_NUMBER) {
+	    !IsBlockCompressedVersion(header.version_number)) {
 		auto version = GetDuckDBVersions(header.version_number);
 		string version_text;
 		if (!version.empty()) {
@@ -448,7 +457,7 @@ DatabaseHeader DeserializeDatabaseHeader(const MainHeader &main_header, data_ptr
 pair<idx_t, idx_t> DeserializeExtentMapPosition(const MainHeader &main_header, data_ptr_t ptr) {
 	MemoryStream source(ptr, Storage::FILE_HEADER_SIZE);
 	DatabaseHeader::Read(main_header, source);
-	if (main_header.version_number != BLOCK_COMPRESSION_VERSION_NUMBER) {
+	if (!IsBlockCompressedVersion(main_header.version_number)) {
 		return make_pair(idx_t(0), idx_t(0));
 	}
 	auto map_offset = source.Read<idx_t>();
@@ -463,6 +472,16 @@ SingleFileBlockManager::SingleFileBlockManager(AttachedDatabase &db_p, const str
                                             Storage::FILE_HEADER_SIZE - options.block_header_size.GetIndex(),
                                             options.block_header_size.GetIndex()),
       iteration_count(0), options(options) {
+}
+
+bool SingleFileBlockManager::SplitDictionarySegments() const {
+	return block_compression && options.version_number.IsValid() &&
+	       options.version_number.GetIndex() == RELEASE_STORAGE_VERSION_NUMBER;
+}
+
+bool SingleFileBlockManager::WritesStringMinNonEmpty() const {
+	return block_compression && options.version_number.IsValid() &&
+	       options.version_number.GetIndex() == RELEASE_STORAGE_VERSION_NUMBER;
 }
 
 SingleFileBlockManager::~SingleFileBlockManager() {
@@ -653,7 +672,8 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	if (kBlockCompression && options.version_number.GetIndex() >= 68 && !encryption_enabled && !options.use_direct_io) {
 		// a new file at the latest storage version stores its blocks compressed
 		block_compression = true;
-		options.version_number = BLOCK_COMPRESSION_VERSION_NUMBER;
+		options.version_number = RELEASE_STORAGE_VERSION_NUMBER;
+		scaled_frame_of_reference = true;
 		next_extent_offset = BLOCK_START;
 	}
 	db.GetStorageManager().SetStorageVersion(options.storage_version.GetIndex());
@@ -839,7 +859,8 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 	}
 
 	options.version_number = main_header.version_number;
-	block_compression = main_header.version_number == BLOCK_COMPRESSION_VERSION_NUMBER;
+	block_compression = IsBlockCompressedVersion(main_header.version_number);
+	scaled_frame_of_reference = main_header.version_number == RELEASE_STORAGE_VERSION_NUMBER;
 	if (block_compression && (main_header.IsEncrypted() || options.use_direct_io)) {
 		throw IOException("Cannot open database \"%s\": compressed blocks (storage version %llu) are not supported "
 		                  "together with encryption or direct IO",

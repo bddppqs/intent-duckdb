@@ -1,0 +1,66 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_code_keys_threshold.test
+# description: code keys over stored translations need a scan the planner estimates at kStoredCodeKeysMinScanRows rows
+# or more: the same range filter keys the larger table's column on its codes and groups the smaller table's strings, over
+# the same rows and with the same answers
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_code_keys_threshold.db readwrite latest
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# a range filter is estimated at a fifth of a table: 1,258,291 of big's 6,291,456 rows (above the threshold) and 838,860
+# of small's 4,194,304 rows (below it); both columns have 200003 distinct strings, so both store translations
+statement ok
+CREATE TABLE big AS SELECT i, 'k-' || ((i // 3) % 200003) || '-0123456789' AS b FROM range(6291456) r(i)
+
+statement ok
+CREATE TABLE small AS SELECT i, 'k-' || ((i // 3) % 200003) || '-0123456789' AS b FROM range(4194304) r(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads=8
+
+query II
+EXPLAIN SELECT b, count(*) AS n FROM big WHERE i < 300000 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<REGEX>:.*Code Keys:.*b \(stored\).*
+
+query II
+EXPLAIN SELECT b, count(*) AS n FROM small WHERE i < 300000 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<!REGEX>:.*\(stored\).*
+
+query II
+SELECT b, count(*) AS n FROM big WHERE i < 300000 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+k-0-0123456789	3
+k-1-0123456789	3
+k-10-0123456789	3
+
+query II
+SELECT b, count(*) AS n FROM small WHERE i < 300000 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+k-0-0123456789	3
+k-1-0123456789	3
+k-10-0123456789	3
+
+# every group of the codes path equals the strings path's over the same rows
+query I
+SELECT count(*) FROM ((SELECT b, count(*) FROM big WHERE i < 300000 GROUP BY b) EXCEPT ALL (SELECT b, count(*) FROM small WHERE i < 300000 GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*) FROM small WHERE i < 300000 GROUP BY b) EXCEPT ALL (SELECT b, count(*) FROM big WHERE i < 300000 GROUP BY b))
+----
+0
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM big WHERE i < 300000 GROUP BY b)
+----
+100000	300000	3	3

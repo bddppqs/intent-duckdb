@@ -230,6 +230,7 @@ void Optimizer::RunBuiltInOptimizers() {
 	RunOptimizer(OptimizerType::DUPLICATE_GROUPS, [&]() {
 		RemoveDuplicateGroups remove;
 		remove.VisitOperator(*plan);
+		RemoveDuplicateGroups::RemoveConstantGroups(*this, plan);
 	});
 
 	// then we extract common subexpressions inside the different operators

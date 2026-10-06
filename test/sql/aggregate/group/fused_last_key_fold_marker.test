@@ -1,0 +1,37 @@
+# name: test/sql/aggregate/group/fused_last_key_fold_marker.test
+# description: The last-key fold's plan marker: fold=last_key on the COUNT-only two-key shape, none on the SUM / AVG and
+#              DISTINCT shapes, and no fused kernel on a NULL-holding key
+# group: [group]
+
+statement ok
+CREATE TABLE t AS SELECT ((i // 3) * 4294967311)::BIGINT AS r3, ((i // 3) % 1000)::INTEGER AS r3b, (i % 7)::BIGINT AS y, (CASE WHEN i % 1000 = 0 THEN NULL ELSE i // 3 END)::BIGINT AS nk FROM range(2200000) t(i)
+
+query II
+EXPLAIN (FORMAT JSON) SELECT r3, r3b, count(*) AS c FROM t GROUP BY r3, r3b
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*keys=2[^"]*fold=last_key.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT r3, r3b, count(*) AS c, sum(y) AS sy FROM t GROUP BY r3, r3b
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*keys=2.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT r3, r3b, count(*) AS c, sum(y) AS sy FROM t GROUP BY r3, r3b
+----
+physical_plan	<!REGEX>:.*fold=last_key.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT r3, r3b, avg(y) AS ay FROM t GROUP BY r3, r3b
+----
+physical_plan	<!REGEX>:.*fold=last_key.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT r3b, count(DISTINCT y) AS n FROM t GROUP BY r3b
+----
+physical_plan	<!REGEX>:.*fold=last_key.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT nk, count(*) AS c FROM t GROUP BY nk
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*

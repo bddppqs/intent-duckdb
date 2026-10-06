@@ -1,8 +1,9 @@
 # name: test/sql/aggregate/distinct/stored_hash_distinct.test
 # description: The stored row hash on the fused kernel's DISTINCT class over >= 2^20 rows: grouped on one key,
 #              on two keys at the 12-byte key bound, with many groups, with folded runs crossing chunk boundaries, and
-#              ungrouped; the answers from the generator, the field hash=stored on each JSON plan (the (g, x) build reads
-#              the stored bits; the group table still hashes g)
+#              ungrouped; the answers from the generator, the field hash=stored on each grouped JSON plan (the (g, x) build
+#              reads the stored bits; the group table still hashes g); the ungrouped shape takes the set member (set=1),
+#              which stores no hash
 # group: [distinct]
 
 # t1: g = i % 1000 over x = i // 2000: each g holds 2,200 rows and 1,100 distinct x; y a million distinct values
@@ -83,11 +84,16 @@ SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT, count(*
 ----
 300000	2200000	7	8	100000
 
-# ungrouped: folded runs, and a million distinct values
+# ungrouped: folded runs, and a million distinct values (the set member: no stored hash)
 query II
 EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM t1
 ----
-physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*set=1.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM t1
+----
+physical_plan	<!REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
 
 query I
 SELECT count(DISTINCT x)::BIGINT FROM t1
@@ -102,7 +108,7 @@ SELECT count(DISTINCT x)::BIGINT FROM t2
 query II
 EXPLAIN (FORMAT JSON) SELECT count(DISTINCT y) FROM t1
 ----
-physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*set=1.*
 
 query I
 SELECT count(DISTINCT y)::BIGINT FROM t1

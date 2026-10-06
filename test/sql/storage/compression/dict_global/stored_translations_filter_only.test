@@ -1,0 +1,331 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_filter_only.test
+# description: a column a scan reads for its pushed filter only, the filter decided on codes (an empty-string or NULL
+# test), is read codes only through its stored translations; the answers agree with the same data stored in memory, and
+# after an update and its checkpoint, inside a transaction holding local rows, through a prepared statement and across a
+# restart
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_filter_only.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# b: 200003 values (each in runs of three), '' and NULL; 5 * 2^20 rows, so a scan with one filter is estimated at
+# 2^20 rows (at least kStoredCodeKeysMinScanRows)
+statement ok
+CREATE TABLE t AS SELECT i, i % 10 AS k, CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS b
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+# b read by its filter only: codes only
+query II
+EXPLAIN SELECT k, count(*) FROM t WHERE b <> '' GROUP BY k
+----
+physical_plan	<REGEX>:.*Codes Only.*
+
+# no stored translations (in memory), b emitted, or a filter not decided on codes: strings; a scan that projects no column
+# emits its filter columns, so it is not marked either
+query II
+EXPLAIN SELECT count(*) FROM t WHERE b <> ''
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT k, count(*) FROM r WHERE b <> '' GROUP BY k
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT k, max(b) FROM t WHERE b <> '' GROUP BY k
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT count(*) FROM t WHERE b > 'wval-5'
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+SELECT k, count(*) FROM t WHERE b <> '' GROUP BY k ORDER BY k
+----
+0	476147
+1	476147
+2	476147
+3	476147
+4	476147
+5	476147
+6	476148
+7	476148
+8	476148
+9	476148
+
+query III
+SELECT count(*) FILTER (WHERE b <> ''), count(*) FILTER (WHERE b = ''), count(*) FILTER (WHERE b IS NULL) FROM t
+----
+4761474	476147	5259
+
+# every filter shape decided on codes, against the in-memory copy
+query I
+SELECT count(*) FROM ((SELECT k, count(*), sum(i) FROM t WHERE b <> '' GROUP BY k) EXCEPT ALL (SELECT k, count(*), sum(i) FROM r WHERE b <> '' GROUP BY k))
+----
+0
+
+query I
+SELECT (SELECT sum(i) FROM t WHERE b = '') - (SELECT sum(i) FROM r WHERE b = '')
+----
+0
+
+query I
+SELECT (SELECT sum(i) FROM t WHERE b IS NULL) - (SELECT sum(i) FROM r WHERE b IS NULL)
+----
+0
+
+query I
+SELECT (SELECT sum(i) FROM t WHERE b IS NOT NULL AND b <> '') - (SELECT sum(i) FROM r WHERE b IS NOT NULL AND b <> '')
+----
+0
+
+query I
+SELECT (SELECT sum(i) FROM t WHERE b <> '' AND k = 3) - (SELECT sum(i) FROM r WHERE b <> '' AND k = 3)
+----
+0
+
+# the segment filter of a filter-only column decides on local codes and emits no values (a constant NULL), so a scan whose
+# operators read b beside its filter never reads it filter only: b emitted, grouped, ordered or counted; the answers
+# against the in-memory copy
+query II
+EXPLAIN SELECT k, count(*) FROM t WHERE b <> '' GROUP BY k
+----
+physical_plan	<REGEX>:.*Codes Only.*b \(filter only\).*
+
+query II
+EXPLAIN SELECT i, b FROM t WHERE b <> ''
+----
+physical_plan	<!REGEX>:.*filter only.*
+
+query I
+SELECT count(*) FROM ((SELECT i, b FROM t WHERE b <> '') EXCEPT ALL (SELECT i, b FROM r WHERE b <> ''))
+----
+0
+
+query II
+EXPLAIN SELECT b, count(*) FROM t WHERE b <> '' GROUP BY b
+----
+physical_plan	<!REGEX>:.*filter only.*
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query II
+EXPLAIN SELECT i FROM t WHERE b <> '' ORDER BY b DESC, i LIMIT 7
+----
+physical_plan	<!REGEX>:.*filter only.*
+
+query I
+SELECT count(*) FROM ((SELECT i FROM t WHERE b <> '' ORDER BY b DESC, i LIMIT 7) EXCEPT ALL (SELECT i FROM r WHERE b <> '' ORDER BY b DESC, i LIMIT 7))
+----
+0
+
+query II
+EXPLAIN SELECT count(b), count(*) FROM t WHERE b <> ''
+----
+physical_plan	<!REGEX>:.*filter only.*
+
+query II
+SELECT count(b), count(*) FROM t WHERE b <> ''
+----
+4761474	4761474
+
+# a self-join and a subquery: each scan is planned on its own, so the scan that reads b for its filter only reads codes
+# while the other scan of t reads the strings
+query II
+SELECT count(*), sum(t2.i) FROM t t1 JOIN t t2 ON t1.i = t2.i WHERE t1.b <> ''
+----
+4761474	12481918535745
+
+query I
+SELECT (SELECT max(t2.b) || '/' || min(t2.b) FROM t t1 JOIN t t2 ON t1.i = t2.i WHERE t1.b <> '') = (SELECT max(b) || '/' || min(b) FROM r WHERE b <> '')
+----
+true
+
+query I
+SELECT (SELECT count(*) || '/' || sum(t1.i) FROM t t1 JOIN t t2 ON t1.i = t2.i WHERE t1.b <> '' AND t2.b <> 'wval-7-0123456789') = (SELECT count(*) || '/' || sum(r1.i) FROM r r1 JOIN r r2 ON r1.i = r2.i WHERE r1.b <> '' AND r2.b <> 'wval-7-0123456789')
+----
+true
+
+query I
+SELECT (SELECT count(*) || '/' || sum(i) FROM t WHERE b <> '' AND i IN (SELECT i FROM t WHERE b > 'wval-5')) = (SELECT count(*) || '/' || sum(i) FROM r WHERE b <> '' AND i IN (SELECT i FROM r WHERE b > 'wval-5'))
+----
+true
+
+# IS NULL and IS NOT NULL alone are pushed as expression filters here: not decided on codes, the strings read
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b IS NULL
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+SELECT count(*), sum(i) FROM t WHERE b IS NULL
+----
+5259	13784433267
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b IS NOT NULL
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query I
+SELECT (SELECT count(*) || '/' || sum(i) FROM t WHERE b IS NOT NULL) = (SELECT count(*) || '/' || sum(i) FROM r WHERE b IS NOT NULL)
+----
+true
+
+# long strings in the first ten vectors (a vector does not fit an empty segment, so segments end inside vectors and
+# vectors straddle them): a filter-only scan reads a straddling vector through the global translation path (the translations of
+# both segments) and the others on local codes
+statement ok
+CREATE TABLE s AS SELECT i, CASE WHEN i % 11 = 0 THEN '' WHEN i < 20480 THEN concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) ELSE 'sv-' || ((i // 3) % 100003) || '-0123456789' END AS e
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('s') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND start % 2048 <> 0
+----
+true
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM s WHERE e <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*e \(filter only\).*
+
+query II
+SELECT count(*), sum(i) FROM s WHERE e <> ''
+----
+4766254	12494447455885
+
+query II
+SELECT count(*), sum(i) FROM s WHERE e = ''
+----
+476626	1249445269875
+
+statement ok
+PREPARE q AS SELECT count(*), sum(i) FROM t WHERE b <> ''
+
+query II
+EXECUTE q
+----
+4761474	12481918535745
+
+# an update: the column carries it, so a new plan reads strings and the prepared plan re-binds
+statement ok
+UPDATE t SET b = '' WHERE i = 1
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXECUTE q
+----
+4761473	12481918535744
+
+# the checkpoint writes new translations: codes only again, and the prepared plan re-binds
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*
+
+query II
+EXECUTE q
+----
+4761473	12481918535744
+
+query II
+SELECT k, count(*) FROM t WHERE b <> '' GROUP BY k ORDER BY k
+----
+0	476147
+1	476146
+2	476147
+3	476147
+4	476147
+5	476147
+6	476148
+7	476148
+8	476148
+9	476148
+
+# rows of this transaction's local storage hold strings: a new plan reads strings, the prepared plan re-binds
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (5242880, 0, 'local-row'), (5242881, 1, '')
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXECUTE q
+----
+4761474	12481923778624
+
+query II
+SELECT k, count(*) FROM t WHERE b <> '' AND k < 2 GROUP BY k ORDER BY k
+----
+0	476148
+1	476146
+
+statement ok
+ROLLBACK
+
+query II
+EXECUTE q
+----
+4761473	12481918535744
+
+# across a restart: the translations are read from the file
+restart
+
+statement ok
+SET threads=4
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*
+
+query II
+SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+4761473	12481918535744
+
+# deleted rows: the scan's selection is set before the filter, so the filter-only path reads the selected rows' local codes
+statement ok
+DELETE FROM t WHERE i % 13 = 5
+
+query II
+EXPLAIN SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+physical_plan	<REGEX>:.*b \(filter only\).*
+
+query II
+SELECT count(*), sum(i) FROM t WHERE b <> ''
+----
+4395207	11521772975896

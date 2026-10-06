@@ -1,0 +1,168 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_lazy_link.test
+# description: a table unchanged since its load is published without walking the column, each row group's segments
+# linked to their stored entries at the column's load: the answers are the ones without stored translations, at 64
+# threads, with the column loaded in some row groups before the publication, over concurrent connections, after an
+# append and after an update; a scan estimated below kStoredCodeKeysMinScanRows groups strings
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_lazy_link.db readwrite latest
+
+statement ok
+SET threads=8
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+statement ok
+CREATE TABLE t AS SELECT i, 'lz-' || ((i // 3) % 200003) || '-0123456789' AS b FROM range(8388608) r(i)
+
+statement ok
+CHECKPOINT
+
+# no column loaded before the publication: every row group's column linked at its load, by 64 threads
+restart
+
+statement ok
+SET threads=64
+
+query II
+EXPLAIN SELECT b, count(*) AS n FROM t GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<REGEX>:.*Code Keys:.*b \(stored\).*
+
+query II
+SELECT b, count(*) AS n FROM t GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+lz-0-0123456789	42
+lz-1-0123456789	42
+lz-10-0123456789	42
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200003	8388608	42	39
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200003
+
+# a scan the planner estimates below kStoredCodeKeysMinScanRows groups the strings: no stored code keys, the same answers
+# (an equality filter's distinct count takes the estimate below a fifth of the table, the default selectivity of a range
+# filter)
+query II
+EXPLAIN SELECT b, count(*) AS n FROM t WHERE i = 100 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<!REGEX>:.*\(stored\).*
+
+query II
+SELECT b, count(*) AS n FROM t WHERE i = 100 GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+lz-33-0123456789	1
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t WHERE i = 100 GROUP BY b)
+----
+1	1	1	1
+
+# the column loaded in some row groups by a string read before the publication: those linked by the publication
+restart
+
+statement ok
+SET threads=64
+
+query I
+SELECT count(*) FROM t WHERE i < 400000 AND b LIKE 'lz-1%'
+----
+133333
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200003
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200003	8388608	42	39
+
+# concurrent publications and column loads over eight connections
+restart
+
+statement ok
+SET threads=64
+
+concurrentloop k 0 8
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200003	8388608	42	39
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200003
+
+endloop
+
+# an append since the load: the publication walks the column, which no longer holds only the translations' rows
+statement ok
+INSERT INTO t VALUES (8388608, 'lz-new-0123456789')
+
+query II
+SELECT b, count(*) AS n FROM t GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+lz-0-0123456789	42
+lz-1-0123456789	42
+lz-10-0123456789	42
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200004	8388609	42	1
+
+statement ok
+CHECKPOINT
+
+# rebuilt at the checkpoint, unchanged since the load again
+restart
+
+statement ok
+SET threads=64
+
+query II
+EXPLAIN SELECT b, count(*) AS n FROM t GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+physical_plan	<REGEX>:.*Code Keys:.*b \(stored\).*
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200004	8388609	42	1
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200004
+
+# an update since the load: the publication refuses the column, which reads strings
+statement ok
+UPDATE t SET b = 'lz-upd' WHERE i < 10
+
+query II
+SELECT b, count(*) AS n FROM t GROUP BY b ORDER BY n DESC, b LIMIT 3
+----
+lz-10-0123456789	42
+lz-100-0123456789	42
+lz-1000-0123456789	42
+
+query IIII
+SELECT count(*), sum(n), max(n), min(n) FROM (SELECT b, count(*) AS n FROM t GROUP BY b)
+----
+200005	8388609	42	1
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200005

@@ -18,10 +18,12 @@ BaseStatistics StringStats::CreateUnknown(LogicalType type) {
 	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
 		string_data.min[i] = 0;
 		string_data.max[i] = 0xFF;
+		string_data.min_nonempty[i] = 0;
 	}
 	string_data.max_string_length = 0;
 	string_data.has_max_string_length = false;
 	string_data.has_unicode = true;
+	string_data.has_min_nonempty = false;
 	return result;
 }
 
@@ -32,10 +34,12 @@ BaseStatistics StringStats::CreateEmpty(LogicalType type) {
 	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
 		string_data.min[i] = 0xFF;
 		string_data.max[i] = 0;
+		string_data.min_nonempty[i] = 0xFF;
 	}
 	string_data.max_string_length = 0;
 	string_data.has_max_string_length = true;
 	string_data.has_unicode = false;
+	string_data.has_min_nonempty = true;
 	return result;
 }
 
@@ -109,6 +113,17 @@ void StringStats::Serialize(const BaseStatistics &stats, Serializer &serializer)
 	serializer.WriteProperty(202, "has_unicode", string_data.has_unicode);
 	serializer.WriteProperty(203, "has_max_string_length", string_data.has_max_string_length);
 	serializer.WriteProperty(204, "max_string_length", string_data.max_string_length);
+	// the non-empty min, written only when maintained and into a file whose version carries it (otherwise the
+	// statistics serialize as before, so an older reader keeps reading the file)
+	const bool write_min_nonempty = string_data.has_min_nonempty && serializer.GetOptions().write_string_min_nonempty;
+	uint64_t packed = 0;
+	if (write_min_nonempty) {
+		for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
+			packed = (packed << 8) | string_data.min_nonempty[i];
+		}
+	}
+	serializer.WritePropertyWithDefault<bool>(205, "has_min_nonempty", write_min_nonempty, false);
+	serializer.WritePropertyWithDefault<uint64_t>(206, "min_nonempty", packed, 0);
 }
 
 void StringStats::Deserialize(Deserializer &deserializer, BaseStatistics &base) {
@@ -118,6 +133,12 @@ void StringStats::Deserialize(Deserializer &deserializer, BaseStatistics &base) 
 	deserializer.ReadProperty(202, "has_unicode", string_data.has_unicode);
 	deserializer.ReadProperty(203, "has_max_string_length", string_data.has_max_string_length);
 	deserializer.ReadProperty(204, "max_string_length", string_data.max_string_length);
+	string_data.has_min_nonempty = deserializer.ReadPropertyWithExplicitDefault<bool>(205, "has_min_nonempty", false);
+	auto packed = deserializer.ReadPropertyWithExplicitDefault<uint64_t>(206, "min_nonempty", 0);
+	for (idx_t i = StringStatsData::MAX_STRING_MINMAX_SIZE; i > 0; i--) {
+		string_data.min_nonempty[i - 1] = UnsafeNumericCast<data_t>(packed & 0xFF);
+		packed >>= 8;
+	}
 }
 
 static int StringValueComparison(const_data_ptr_t data, idx_t len, const_data_ptr_t comparison) {
@@ -156,6 +177,10 @@ void StringStats::Update(BaseStatistics &stats, const string_t &value) {
 	if (StringValueComparison(target, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.max) > 0) {
 		memcpy(string_data.max, target, StringStatsData::MAX_STRING_MINMAX_SIZE);
 	}
+	if (size > 0 && string_data.has_min_nonempty &&
+	    StringValueComparison(target, StringStatsData::MAX_STRING_MINMAX_SIZE, string_data.min_nonempty) < 0) {
+		memcpy(string_data.min_nonempty, target, StringStatsData::MAX_STRING_MINMAX_SIZE);
+	}
 	if (size > string_data.max_string_length) {
 		string_data.max_string_length = UnsafeNumericCast<uint32_t>(size);
 	}
@@ -172,10 +197,13 @@ void StringStats::Update(BaseStatistics &stats, const string_t &value) {
 
 void StringStats::SetMin(BaseStatistics &stats, const string_t &value) {
 	ConstructValue(const_data_ptr_cast(value.GetData()), value.GetSize(), GetDataUnsafe(stats).min);
+	// a min set from outside does not vouch for the non-empty min
+	GetDataUnsafe(stats).has_min_nonempty = false;
 }
 
 void StringStats::SetMax(BaseStatistics &stats, const string_t &value) {
 	ConstructValue(const_data_ptr_cast(value.GetData()), value.GetSize(), GetDataUnsafe(stats).max);
+	GetDataUnsafe(stats).has_min_nonempty = false;
 }
 
 void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
@@ -196,6 +224,39 @@ void StringStats::Merge(BaseStatistics &stats, const BaseStatistics &other) {
 	string_data.has_unicode = string_data.has_unicode || other_data.has_unicode;
 	string_data.has_max_string_length = string_data.has_max_string_length && other_data.has_max_string_length;
 	string_data.max_string_length = MaxValue<uint32_t>(string_data.max_string_length, other_data.max_string_length);
+	if (string_data.has_min_nonempty && other_data.has_min_nonempty) {
+		if (StringValueComparison(other_data.min_nonempty, StringStatsData::MAX_STRING_MINMAX_SIZE,
+		                          string_data.min_nonempty) < 0) {
+			memcpy(string_data.min_nonempty, other_data.min_nonempty, StringStatsData::MAX_STRING_MINMAX_SIZE);
+		}
+	} else {
+		string_data.has_min_nonempty = false;
+	}
+}
+
+bool StringStats::NarrowToNonEmpty(BaseStatistics &stats, bool &no_nonempty) {
+	if (stats.GetStatsType() != StatisticsType::STRING_STATS || stats.GetType().id() != LogicalTypeId::VARCHAR) {
+		return false;
+	}
+	auto &string_data = GetDataUnsafe(stats);
+	if (!string_data.has_min_nonempty) {
+		return false;
+	}
+	// no non-empty value was seen: the non-empty min is still \xFF... (no UTF-8 string starts with \xFF) and every
+	// non-NULL value is '', so the max prefix is all zero
+	bool min_unset = true;
+	bool max_zero = true;
+	for (idx_t i = 0; i < StringStatsData::MAX_STRING_MINMAX_SIZE; i++) {
+		min_unset = min_unset && string_data.min_nonempty[i] == 0xFF;
+		max_zero = max_zero && string_data.max[i] == 0;
+	}
+	if (min_unset && !max_zero) {
+		// a value above '' without a non-empty min: statistics not maintained through Update, do not narrow
+		return false;
+	}
+	no_nonempty = min_unset;
+	memcpy(string_data.min, string_data.min_nonempty, StringStatsData::MAX_STRING_MINMAX_SIZE);
+	return true;
 }
 
 FilterPropagateResult StringStats::CheckZonemap(const BaseStatistics &stats, ExpressionType comparison_type,
@@ -317,6 +378,14 @@ void StringStats::Verify(const BaseStatistics &stats, Vector &vector, const Sele
 		                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE), string_data.max) > 0) {
 			throw InternalException("Statistics mismatch: value is bigger than max.\nStatistics: %s\nVector: %s",
 			                        stats.ToString(), vector.ToString(count));
+		}
+		if (len > 0 && string_data.has_min_nonempty &&
+		    StringValueComparison(const_data_ptr_cast(data),
+		                          MinValue<idx_t>(len, StringStatsData::MAX_STRING_MINMAX_SIZE),
+		                          string_data.min_nonempty) < 0) {
+			throw InternalException(
+			    "Statistics mismatch: non-empty value is smaller than the non-empty min.\nStatistics: %s\nVector: %s",
+			    stats.ToString(), vector.ToString(count));
 		}
 		// LCOV_EXCL_STOP
 	}

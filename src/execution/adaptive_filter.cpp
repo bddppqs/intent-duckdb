@@ -5,7 +5,13 @@
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/vector.hpp"
 
+#include "duckdb/common/tuning_defaults.hpp"
+
 namespace duckdb {
+
+bool SharedFilterOrderEnabled() {
+	return kSharedFilterOrder;
+}
 
 AdaptiveFilter::AdaptiveFilter(const Expression &expr) : observe_interval(10), execute_interval(20), warmup(true) {
 	auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
@@ -49,7 +55,83 @@ void AdaptiveFilter::EndFilter(AdaptiveFilterState state) {
 	AdaptRuntimeStatistics(duration_cast<duration<double>>(end_time - state.start_time).count());
 }
 
+SharedOrderAdaptiveFilter::SharedOrderAdaptiveFilter(const TableFilterSet &table_filters)
+    : AdaptiveFilter(table_filters) {
+}
+
+void AdaptiveFilter::AttachShared(SharedFilterOrderLocal &local, shared_ptr<AdaptiveFilterShared> shared_p) {
+	if (!SharedFilterOrderEnabled() || disable_permutations || permutation.size() <= 1 ||
+	    permutation.size() > AdaptiveFilterShared::MAX_FILTERS) {
+		return;
+	}
+	local.shared = std::move(shared_p);
+}
+
+uint64_t AdaptiveFilter::EncodeOrder() const {
+	uint64_t word = AdaptiveFilterShared::PUBLISHED;
+	for (idx_t i = 0; i < permutation.size(); i++) {
+		word |= uint64_t(permutation[i]) << (4 * i);
+	}
+	return word;
+}
+
+void AdaptiveFilter::Adopt(uint64_t word, SharedFilterOrderLocal &local) {
+	for (idx_t i = 0; i < permutation.size(); i++) {
+		permutation[i] = (word >> (4 * i)) & 0xF;
+	}
+	local.adopted = word;
+	local.follower = true;
+}
+
+void AdaptiveFilter::Publish(SharedFilterOrderLocal &local) {
+	auto word = EncodeOrder();
+	if (word != local.adopted) {
+		local.shared->order.store(word, std::memory_order_release);
+		local.adopted = word;
+	}
+}
+
+void AdaptiveFilter::ClaimOrAdopt(SharedFilterOrderLocal &local) {
+	uint64_t expected = 0;
+	auto word = EncodeOrder();
+	if (local.shared->order.compare_exchange_strong(expected, word, std::memory_order_acq_rel)) {
+		local.explorer = true;
+		local.adopted = word;
+	} else {
+		Adopt(expected, local);
+	}
+}
+
+AdaptiveFilterState AdaptiveFilter::BeginFilterShared(SharedFilterOrderLocal &local) {
+	if (local.shared && !local.explorer) {
+		// a follower (or a thread not yet settled) runs the published order, read once per vector
+		auto word = local.shared->order.load(std::memory_order_acquire);
+		if (word != local.adopted) {
+			Adopt(word, local);
+		}
+	}
+	if (permutation.size() <= 1 || disable_permutations || local.follower) {
+		return AdaptiveFilterState();
+	}
+	AdaptiveFilterState state;
+	state.start_time = high_resolution_clock::now();
+	return state;
+}
+
+void AdaptiveFilter::EndFilterShared(AdaptiveFilterState state, SharedFilterOrderLocal &local) {
+	if (permutation.size() <= 1 || disable_permutations || local.follower) {
+		// nothing to permute (a follower does not explore)
+		return;
+	}
+	auto end_time = high_resolution_clock::now();
+	AdaptWalk(duration_cast<duration<double>>(end_time - state.start_time).count(), &local);
+}
+
 void AdaptiveFilter::AdaptRuntimeStatistics(double duration) {
+	AdaptWalk(duration, nullptr);
+}
+
+void AdaptiveFilter::AdaptWalk(double duration, SharedFilterOrderLocal *local) {
 	iteration_count++;
 	runtime_sum += duration;
 
@@ -69,12 +151,20 @@ void AdaptiveFilter::AdaptRuntimeStatistics(double duration) {
 			} else {
 				// keep swap because runtime decreased, reset likeliness
 				swap_likeliness[swap_idx] = 100;
+				if (local && local->explorer) {
+					// the explorer republishes only a measured improvement
+					Publish(*local);
+				}
 			}
 			observe = false;
 
 			// reset values
 			iteration_count = 0;
 			runtime_sum = 0.0;
+			if (local && local->shared && !local->explorer) {
+				// the first thread to finish an observe cycle publishes its order and keeps exploring
+				ClaimOrAdopt(*local);
+			}
 		} else if (!observe && iteration_count == execute_interval) {
 			// save old mean to evaluate swap
 			prev_mean = runtime_sum / static_cast<double>(iteration_count);

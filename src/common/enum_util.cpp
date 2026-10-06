@@ -792,19 +792,20 @@ const StringUtil::EnumStringLiteral *GetBitpackingModeValues() {
 		{ static_cast<uint32_t>(BitpackingMode::CONSTANT), "CONSTANT" },
 		{ static_cast<uint32_t>(BitpackingMode::CONSTANT_DELTA), "CONSTANT_DELTA" },
 		{ static_cast<uint32_t>(BitpackingMode::DELTA_FOR), "DELTA_FOR" },
-		{ static_cast<uint32_t>(BitpackingMode::FOR), "FOR" }
+		{ static_cast<uint32_t>(BitpackingMode::FOR), "FOR" },
+		{ static_cast<uint32_t>(BitpackingMode::FOR_SCALED), "FOR_SCALED" }
 	};
 	return values;
 }
 
 template<>
 const char* EnumUtil::ToChars<BitpackingMode>(BitpackingMode value) {
-	return StringUtil::EnumToString(GetBitpackingModeValues(), 6, "BitpackingMode", static_cast<uint32_t>(value));
+	return StringUtil::EnumToString(GetBitpackingModeValues(), 7, "BitpackingMode", static_cast<uint32_t>(value));
 }
 
 template<>
 BitpackingMode EnumUtil::FromString<BitpackingMode>(const char *value) {
-	return static_cast<BitpackingMode>(StringUtil::StringToEnum(GetBitpackingModeValues(), 6, "BitpackingMode", value));
+	return static_cast<BitpackingMode>(StringUtil::StringToEnum(GetBitpackingModeValues(), 7, "BitpackingMode", value));
 }
 
 const StringUtil::EnumStringLiteral *GetBlockIteratorStateTypeValues() {

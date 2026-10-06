@@ -1,0 +1,252 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_key_filter_codes.test
+# description: a group key read codes only through its stored translations under a pushed filter decided on codes (an
+# empty-string or NULL test) decides that filter once per segment from the segment's translation and translates the
+# surviving rows only; the answers agree with the same data stored in memory for every such filter, over vectors that
+# straddle two segments, and after a delete, before and after its checkpoint
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_key_filter_codes.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# b: 200003 values (each in runs of three), '' and NULL; 5 * 2^20 rows, so a scan with its filters is estimated at 2^20
+# rows (at least kStoredCodeKeysMinScanRows)
+statement ok
+CREATE TABLE t AS SELECT i, i % 10 AS k, CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS b
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+# the key read codes only through its stored translations, its filter on the key column
+query II
+EXPLAIN SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*b.*Filters.*
+
+query II
+EXPLAIN SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b
+----
+physical_plan	<!REGEX>:.*filter only.*
+
+query II
+EXPLAIN SELECT b, count(*) AS c FROM t WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 5
+----
+physical_plan	<REGEX>:.*Code Keys.*b \(stored\).*Codes Only.*
+
+# every filter decided on codes, both ways against the in-memory copy
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b = '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b = '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b = '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b = '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b IS NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b IS NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b IS NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b IS NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b IS NOT NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b IS NOT NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b IS NOT NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b IS NOT NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b <> '' AND b IS NOT NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b <> '' AND b IS NOT NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b <> '' AND b IS NOT NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b <> '' AND b IS NOT NULL GROUP BY b))
+----
+0
+
+# a filter on another column first (a sparse selection reaches the key's filter), both ways
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE k < 3 AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE k < 3 AND b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE k < 3 AND b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE k < 3 AND b <> '' GROUP BY b))
+----
+0
+
+# the Top-N with its late decode (ties broken on the key), both ways
+query I
+SELECT count(*) FROM ((SELECT b, count(*) AS c FROM t WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 5) EXCEPT ALL (SELECT b, count(*) AS c FROM r WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 5))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*) AS c FROM r WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 5) EXCEPT ALL (SELECT b, count(*) AS c FROM t WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 5))
+----
+0
+
+# long strings in the first ten vectors (a vector does not fit an empty segment, so segments end inside vectors and
+# vectors straddle them): a straddling vector is read through ColumnData::Filter (the translations of both segments, the
+# per-row filter), every other vector on the segment's local codes
+statement ok
+CREATE TABLE s AS SELECT i, CASE WHEN i % 11 = 0 THEN '' WHEN i % 997 = 0 THEN NULL WHEN i < 20480 THEN concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) ELSE 'sv-' || ((i // 3) % 100003) || '-0123456789' END AS e
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE rs AS SELECT * FROM s
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('s') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND start % 2048 <> 0
+----
+true
+
+query II
+EXPLAIN SELECT e, count(*), sum(i) FROM s WHERE e <> '' GROUP BY e
+----
+physical_plan	<REGEX>:.*Code Keys.*e \(stored\).*Codes Only.*
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM s WHERE e <> '' GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM rs WHERE e <> '' GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM rs WHERE e <> '' GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM s WHERE e <> '' GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM s WHERE e = '' GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM rs WHERE e = '' GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM rs WHERE e = '' GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM s WHERE e = '' GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM s WHERE e IS NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM rs WHERE e IS NULL GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM rs WHERE e IS NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM s WHERE e IS NULL GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM s WHERE e IS NOT NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM rs WHERE e IS NOT NULL GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM rs WHERE e IS NOT NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM s WHERE e IS NOT NULL GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM s WHERE e <> '' AND e IS NOT NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM rs WHERE e <> '' AND e IS NOT NULL GROUP BY e))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*), sum(i) FROM rs WHERE e <> '' AND e IS NOT NULL GROUP BY e) EXCEPT ALL (SELECT e, count(*), sum(i) FROM s WHERE e <> '' AND e IS NOT NULL GROUP BY e))
+----
+0
+
+# a delete: the deleted rows leave the result through the deletion mask over the positional codes vector, before and
+# after the checkpoint
+statement ok
+DELETE FROM t WHERE i % 13 = 5 OR (i >= 1000000 AND i < 1004096)
+
+statement ok
+DELETE FROM r WHERE i % 13 = 5 OR (i >= 1000000 AND i < 1004096)
+
+query II
+EXPLAIN SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b
+----
+physical_plan	<REGEX>:.*Codes Only.*
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b IS NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b IS NULL GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b IS NULL GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b IS NULL GROUP BY b))
+----
+0
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM t WHERE b = '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM r WHERE b = '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*), sum(i) FROM r WHERE b = '' GROUP BY b) EXCEPT ALL (SELECT b, count(*), sum(i) FROM t WHERE b = '' GROUP BY b))
+----
+0

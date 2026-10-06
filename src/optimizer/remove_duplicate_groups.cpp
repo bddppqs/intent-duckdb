@@ -17,6 +17,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 
 namespace duckdb {
 
@@ -406,6 +407,18 @@ static bool RewriteDependentGroups(Optimizer &optimizer, unique_ptr<LogicalOpera
 	return true;
 }
 } // namespace
+
+// Run in the early duplicate-groups pass, before compressed materialization and the plan-time aggregate rewrites, so
+// they see the retained keys alone and the constant is never compressed into a per-row key. No group_stats exist yet,
+// so ProveDependentGroups admits only the constant keys here; x + k keys wait for the pass after statistics propagation.
+// Off with kRemoveConstantGroupKeys.
+void RemoveDuplicateGroups::RemoveConstantGroups(Optimizer &optimizer, unique_ptr<LogicalOperator> &plan) {
+	if (!kRemoveConstantGroupKeys || !RewriteDependentGroups(optimizer, plan, plan)) {
+		return;
+	}
+	RemoveUnusedColumns unused(optimizer);
+	unused.VisitOperator(*plan);
+}
 
 void RemoveDuplicateGroups::RemoveDependentGroups(
     Optimizer &optimizer, unique_ptr<LogicalOperator> &plan,

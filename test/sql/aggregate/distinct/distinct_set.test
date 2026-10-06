@@ -1,0 +1,141 @@
+# name: test/sql/aggregate/distinct/distinct_set.test
+# description: The fused kernel's set member: an ungrouped count(DISTINCT x) over one integer x, the operator's one
+#              aggregate, keeps the compact row x alone (no stored hash) and counts each partition's distinct x in a set of
+#              x alone. Over >= 2^20 rows of every admitted integer width (signed, negative and zero values, unsigned values
+#              at the top of the range, runs that fold, nothing that folds, a single value 0), at threads 1 and 8, the
+#              answers in closed form from the generators and equal to the grouped DISTINCT form; the set=1 field on the
+#              JSON plan of each such shape and its absence on a grouped, a mixed and a two-distinct shape; the phase-2
+#              counters on the JSON profile. No require line.
+# group: [distinct]
+
+# s1: x = i * 7919 mod 1000003 (a prime; 7919 is invertible mod it): 2,200,000 rows cover every residue, 1,000,003
+# distinct x, no two adjacent rows equal (nothing folds)
+statement ok
+CREATE TABLE s1 AS SELECT ((i * 7919) % 1000003)::BIGINT AS x FROM range(2200000) t(i);
+
+# s2: runs that fold, crossing chunk boundaries: x = i // 3, 733,334 distinct x
+statement ok
+CREATE TABLE s2 AS SELECT (i // 3)::BIGINT AS x FROM range(2200000) t(i);
+
+# s3: a 4-byte x with negative values and zero: s1's residues less 500,000, 1,000,003 distinct x in [-500000, 500002]
+statement ok
+CREATE TABLE s3 AS SELECT (((i * 7919) % 1000003) - 500000)::INTEGER AS x FROM range(2200000) t(i);
+
+# s4: a 2-byte x with negative values and zero: 30,000 distinct x in [-15000, 14999]
+statement ok
+CREATE TABLE s4 AS SELECT ((i % 30000) - 15000)::SMALLINT AS x FROM range(2200000) t(i);
+
+# s5: an unsigned 8-byte x at the top of the range (every value above 2^63): 1,000 distinct x
+statement ok
+CREATE TABLE s5 AS SELECT ((i % 1000)::UBIGINT + 18446744073709000000::UBIGINT) AS x FROM range(2200000) t(i);
+
+# s6: a single value, 0 (the set's empty-slot word): 1 distinct x
+statement ok
+CREATE TABLE s6 AS SELECT 0::BIGINT AS x FROM range(2200000) t(i);
+
+# s7: a 1-byte unsigned x: 256 distinct x, 0 included
+statement ok
+CREATE TABLE s7 AS SELECT (i % 256)::UTINYINT AS x FROM range(2200000) t(i);
+
+# the set member's field on each ungrouped count(DISTINCT x) shape, and no stored hash
+foreach t s1 s2 s3 s4 s5 s6 s7
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM ${t}
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "keys=0 distinct=1 set=1 [^"]*.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM ${t}
+----
+physical_plan	<!REGEX>:.*"Fused Distinct Aggregate": "[^"]*hash=stored.*
+
+endloop
+
+# not the set member: grouped, mixed (a non-distinct aggregate beside), two distinct aggregates
+statement ok
+CREATE TABLE g1 AS SELECT (i % 1000)::INTEGER AS g, (i // 2000)::BIGINT AS x FROM range(2200000) t(i);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) FROM g1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*set=1.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x), count(*) FROM g1
+----
+physical_plan	<!REGEX>:.*set=1.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x), count(DISTINCT g) FROM g1
+----
+physical_plan	<!REGEX>:.*set=1.*
+
+# the profile: the phase-2 counters of the set member (the distinct x counted, one output group)
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM s1
+----
+analyzed_plan	<REGEX>:.*Fused Distinct Aggregate.*set=1.*distinct_entries=1000003 groups=1 .*
+
+foreach threads 1 8
+
+statement ok
+SET threads=${threads}
+
+query I
+SELECT count(DISTINCT x) FROM s1
+----
+1000003
+
+query I
+SELECT count(DISTINCT x) FROM s2
+----
+733334
+
+query I
+SELECT count(DISTINCT x) FROM s3
+----
+1000003
+
+query I
+SELECT count(DISTINCT x) FROM s4
+----
+30000
+
+query I
+SELECT count(DISTINCT x) FROM s5
+----
+1000
+
+query I
+SELECT count(DISTINCT x) FROM s6
+----
+1
+
+query I
+SELECT count(DISTINCT x) FROM s7
+----
+256
+
+# the same answers by the grouped DISTINCT form (another operator)
+query IIIIIII
+SELECT (SELECT count(*) FROM (SELECT DISTINCT x FROM s1)), (SELECT count(*) FROM (SELECT DISTINCT x FROM s2)),
+       (SELECT count(*) FROM (SELECT DISTINCT x FROM s3)), (SELECT count(*) FROM (SELECT DISTINCT x FROM s4)),
+       (SELECT count(*) FROM (SELECT DISTINCT x FROM s5)), (SELECT count(*) FROM (SELECT DISTINCT x FROM s6)),
+       (SELECT count(*) FROM (SELECT DISTINCT x FROM s7))
+----
+1000003	733334	1000003	30000	1000	1	256
+
+# a filter that keeps no row: zero distinct x
+query I
+SELECT count(DISTINCT x) FROM s1 WHERE x > 2000000
+----
+0
+
+# a filter that keeps the negative half of s3: 500,000 distinct x
+query I
+SELECT count(DISTINCT x) FROM s3 WHERE x < 0
+----
+500000
+
+endloop

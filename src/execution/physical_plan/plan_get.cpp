@@ -11,6 +11,7 @@
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -209,6 +210,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalGet &op) {
 	                            std::move(op.extra_info), std::move(op.parameters), std::move(op.virtual_columns));
 	auto &cast_table_scan = table_scan.Cast<PhysicalTableScan>();
 	cast_table_scan.dynamic_filters = op.dynamic_filters;
+	// a VARCHAR column read for its pushed filter only, decided on codes, is read codes only (stored translations)
+	dict_global::MarkFilterOnlyCodes(context, cast_table_scan);
 	if (filter) {
 		filter->children.push_back(table_scan);
 		return *filter;

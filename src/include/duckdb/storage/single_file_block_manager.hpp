@@ -148,6 +148,16 @@ public:
 	bool BlockCompression() const {
 		return block_compression;
 	}
+	//! Whether the file may hold split DICT_FSST segments and stored column translations: a block-compressed file at
+	//! the release storage version, which a reader without them refuses
+	bool SplitDictionarySegments() const;
+	//! Whether the file is at the block-compressed version that may hold FOR_SCALED bit-packing groups
+	bool ScaledFrameOfReferenceFile() const {
+		return scaled_frame_of_reference;
+	}
+	//! Whether the file's VARCHAR statistics carry the minimum non-empty value (a file created at the release storage
+	//! version; an older block-compressed file is written without it, so an older reader keeps it)
+	bool WritesStringMinNonEmpty() const;
 
 private:
 	//! Loads the free list of the file.
@@ -266,6 +276,8 @@ private:
 	mutex single_file_block_lock;
 	//! Whether blocks are stored compressed (a file created at storage version BLOCK_COMPRESSION_VERSION_NUMBER)
 	bool block_compression = false;
+	//! Whether the file is at the version that may hold FOR_SCALED bit-packing groups (a block-compressed file)
+	bool scaled_frame_of_reference = false;
 	//! Lock for the extent map and the extent allocator
 	mutex extent_lock;
 	//! The extent of each block id

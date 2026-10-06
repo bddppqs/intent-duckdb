@@ -2,6 +2,11 @@
 # description: Selection-aware DICT_FSST filter evaluation: a selective constant filter on an INTEGER column followed by contains / NOT contains / LIKE with _ / prefix / = / IS NULL on DICT_FSST-, DICTIONARY- and FSST_ONLY-mode string columns, with selections of 0, 1, a few, 1024, 1025, 2047 and every row per vector, NULLs at referenced and unreferenced codes, an all-NULL segment, tables shorter than a vector, exactly 2048 and 2049 rows, whole-domain readers after a sparse selection; the answers are the plain engine answers at threads 1 and 8
 # group: [dict_fsst]
 
+# The straddling segments this test writes need the unaligned DICT_FSST writer, so it runs only in a build with
+# kVectorAlignedDictionarySegments off (the default writer ends every segment on a vector boundary). In the default
+# build, dict_fsst_straddled_segments_read.test reaches the same scan paths on a checked-in straddled file.
+require unaligned_dictionary_segments
+
 require vector_size 2048
 
 load {TEST_DIR}/dict_fsst_selection_aware_filter.db readwrite v1.5.0

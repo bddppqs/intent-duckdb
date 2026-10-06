@@ -3,6 +3,9 @@
 #include "duckdb/storage/compression/dict_fsst/compression.hpp"
 #include "duckdb/storage/compression/dict_fsst/decompression.hpp"
 #include "duckdb/storage/compression/dict_fsst/filter_verdict_cache.hpp"
+#include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 #include "duckdb/function/compression/compression.hpp"
 #include "duckdb/function/compression_function.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -144,7 +147,8 @@ void DictFSSTCompressionStorage::Compress(CompressionState &state_p, Vector &sca
 
 void DictFSSTCompressionStorage::FinalizeCompress(CompressionState &state_p) {
 	auto &state = state_p.Cast<DictFSSTCompressionState>();
-	state.Flush(true);
+	// the row group's last, partial vector is appended first (nothing is buffered when the writer is not aligned)
+	state.FinalizeCompress();
 }
 
 //===--------------------------------------------------------------------===//
@@ -153,6 +157,23 @@ void DictFSSTCompressionStorage::FinalizeCompress(CompressionState &state_p) {
 unique_ptr<SegmentScanState> DictFSSTCompressionStorage::StringInitScan(const QueryContext &context,
                                                                         ColumnSegment &segment) {
 	auto &buffer_manager = BufferManager::GetBufferManager(segment.db);
+	// A codes-only scan reads the stored translation and the codes (a split segment's code block, else its own block)
+	auto translation = dict_global::CodesOnlyTranslation(segment);
+	if (translation) {
+		if (dict_fsst::SegmentSplit(segment)) {
+			auto state = make_uniq<CompressedStringScanState>(segment, BufferHandle());
+			state->InitializeCodesOnly(std::move(translation));
+			return std::move(state);
+		}
+		auto state = make_uniq<CompressedStringScanState>(segment, buffer_manager.Pin(segment.block));
+		state->Initialize(false);
+		if (state->mode == DictFSSTMode::FSST_ONLY || state->dict_count != translation->count) {
+			throw IOException("A segment does not match its stored translation - the database file appears corrupted");
+		}
+		state->codes_only = true;
+		state->global_translation = std::move(translation);
+		return std::move(state);
+	}
 	auto state = make_uniq<CompressedStringScanState>(segment, buffer_manager.Pin(segment.block));
 	state->Initialize(true);
 
@@ -173,6 +194,11 @@ void DictFSSTCompressionStorage::StringScanPartial(ColumnSegment &segment, Colum
 	auto &scan_state = state.scan_state->Cast<CompressedStringScanState>();
 
 	auto start = state.GetPositionInSegment();
+	if (scan_state.codes_only && (!ALLOW_DICT_VECTORS || !scan_state.AllowGlobalDictionaryScan(scan_count) ||
+	                              result_offset != 0)) {
+		// a vector that straddles a codes-only column's segments is emitted by TryScanGlobalDictionary
+		throw InternalException("A codes-only scan of a DICT_FSST segment asked for strings");
+	}
 	if (ALLOW_DICT_VECTORS && scan_state.AllowGlobalDictionaryScan(scan_count)) {
 		scan_state.ScanToDictionaryVector(segment, result, result_offset, start, scan_count);
 	} else if (!ALLOW_DICT_VECTORS || !scan_state.AllowDictionaryScan(scan_count)) {
@@ -204,6 +230,15 @@ void DictFSSTCompressionStorage::StringFetchRow(ColumnSegment &segment, ColumnFe
 void DictFSSTSelect(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
                     const SelectionVector &sel, idx_t sel_count) {
 	auto &scan_state = state.scan_state->Cast<CompressedStringScanState>();
+	if (scan_state.codes_only) {
+		auto &local = scan_state.GetSelVec(state.GetPositionInSegment(), vector_count);
+		SelectionVector picked(MaxValue<idx_t>(sel_count, 1));
+		for (idx_t i = 0; i < sel_count; i++) {
+			picked.set_index(i, local.get_index(sel.get_index(i)));
+		}
+		scan_state.ScanToGlobalDictionary(picked, sel_count, result);
+		return;
+	}
 	if (scan_state.mode == DictFSSTMode::FSST_ONLY) {
 		// for FSST only
 		auto start = state.GetPositionInSegment();
@@ -309,6 +344,20 @@ static bool WalkDomainFilter(CompressedStringScanState &scan_state, const TableF
 			AppendDomainKey(key, nullptr);
 			return true;
 		}
+		const ConstantFilter *published;
+		if (data->LoadPublished(published)) {
+			// the immutable copy of the bound set last, read without the lock (kTopNBoundLockFree)
+			if (!published) {
+				AppendDomainKey(key, nullptr);
+				return true;
+			}
+			auto &constant = published->constant;
+			if (constant.IsNull() || constant.type().InternalType() != PhysicalType::VARCHAR) {
+				return false;
+			}
+			AppendDomainKey(key, &StringValue::Get(constant));
+			return !pass || ApplyConstantToDomain(scan_state, *published, pass);
+		}
 		ExpressionType comparison_type = ExpressionType::INVALID;
 		Value bound;
 		bool is_set = false;
@@ -397,6 +446,9 @@ static FilterPropagateResult DictFSSTCheckDomainBase(ColumnSegment &segment, Col
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	auto &scan_state = state.scan_state->Cast<CompressedStringScanState>();
+	if (scan_state.codes_only) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
 	if (&scan_state.segment != &segment || scan_state.mode == DictFSSTMode::FSST_ONLY || scan_state.dict_count == 0) {
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
@@ -533,6 +585,9 @@ static FilterPropagateResult DictFSSTCheckDomain(ColumnSegment &segment, ColumnS
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	auto &scan_state = state.scan_state->Cast<CompressedStringScanState>();
+	if (scan_state.codes_only) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
 	if (!SegmentSkipCanonicalKey(scan_state, filter).empty()) {
 		if (DictionarySegmentSkipCheckDomain(segment, state, scan_state, filter) == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			return FilterPropagateResult::FILTER_ALWAYS_FALSE;
@@ -1190,11 +1245,129 @@ static idx_t SingleCodeBlockSurvivors(CompressedStringScanState &scan_state, idx
 	return NumericCast<idx_t>(end - out);
 }
 
+//! The pushed filter of a codes-only scan, decided on codes (CodeTranslatable), classified once per scan state from the
+//! segment's translation alone: a local code stands for its class - NULL (0), the empty string (the one local code its
+//! translation maps to the column's empty code), any other - so the survivors take the single-code path over the local
+//! codes, the empty string's local code the one code (a code no row holds where the empty string's verdict is the
+//! others'). A filter not decided on codes never reaches a codes-only column: it is refused here
+static void ClassifyCodesOnlyFilter(CompressedStringScanState &scan_state, const TableFilter &filter) {
+	if (!dict_global::CodeTranslatable(filter)) {
+		throw InternalException("dict_global: a filter that is not decided on codes reached a codes-only column");
+	}
+	auto &translation = *scan_state.global_translation;
+	const auto empty_code = translation.dict->persisted->EmptyCode();
+	bool null_passes, empty_passes, other_passes;
+	dict_global::CodeClassVerdicts(filter, empty_code, null_passes, empty_passes, other_passes);
+	auto one_code = UnsafeNumericCast<uint32_t>(scan_state.dict_count);
+	if (empty_code != 0 && empty_passes != other_passes) {
+		for (idx_t local = 1; local < scan_state.dict_count; local++) {
+			if (translation.codes[local] == empty_code) {
+				one_code = UnsafeNumericCast<uint32_t>(local);
+				break;
+			}
+		}
+	}
+	// the non-NULL codes all take other_passes but the one code: ONE_FAILS when they pass, ONE_PASSES when they fail
+	scan_state.single_code_shape = other_passes ? SINGLE_CODE_ONE_FAILS : SINGLE_CODE_ONE_PASSES;
+	scan_state.single_code = one_code;
+	scan_state.single_code_image_valid = false;
+	if (other_passes && one_code < scan_state.dict_count && scan_state.dictionary_indices_width > 0 &&
+	    scan_state.dictionary_indices_width <= 32) {
+		SingleCodeBuildImage(scan_state);
+	}
+	scan_state.filter_only_null_passes = null_passes;
+}
+
+//! The survivors of a classified codes-only filter over the local codes (written to `new_sel`, their count returned);
+//! `local` is set to the local codes of the vector's rows (row i at index i) the survivors were read from
+static idx_t CodesOnlySurvivors(CompressedStringScanState &scan_state, idx_t start, idx_t vector_count,
+                                const SelectionVector &sel, idx_t sel_count, SelectionVector &new_sel,
+                                optional_ptr<const SelectionVector> &local) {
+	const bool null_passes = scan_state.filter_only_null_passes;
+	const bool whole = !sel.IsSet() && sel_count == vector_count;
+	idx_t approved = 0;
+	if (SingleCodeBlockLoop(scan_state, whole, vector_count, start)) {
+		local = &SingleCodeBlockSelVec(scan_state);
+		approved = SingleCodeBlockSurvivors(scan_state, start, null_passes, new_sel);
+	} else if (whole) {
+		local = &scan_state.GetSelVec(start, vector_count);
+		approved = SingleCodeSurvivors(scan_state, *local, vector_count, null_passes, new_sel);
+	} else {
+		local = &scan_state.GetSelVec(start, vector_count);
+		auto &codes = *local;
+		const auto c = UnsafeNumericCast<sel_t>(scan_state.single_code);
+		const bool fails = scan_state.single_code_shape == SINGLE_CODE_ONE_FAILS;
+		for (idx_t i = 0; i < sel_count; i++) {
+			const auto row = sel.get_index(i);
+			const sel_t code = codes.get_index(row);
+			new_sel.set_index(approved, row);
+			approved += code == 0 ? null_passes : (fails ? code != c : code == c);
+		}
+	}
+	return approved;
+}
+
+//! A codes-only scan of a column read for its pushed filter only (MarkFilterOnlyCodes): every filter decided on codes
+//! classifies a local code by its translation alone (ClassifyCodesOnlyFilter). No per-row translation and no vector
+//! over the global codes: nothing reads the column's values, so the result is NULL
+static void FilterOnlyCodes(CompressedStringScanState &scan_state, idx_t start, idx_t vector_count, Vector &result,
+                            SelectionVector &sel, idx_t &sel_count, const TableFilter &filter) {
+	if (!scan_state.filter_only_classified) {
+		ClassifyCodesOnlyFilter(scan_state, filter);
+		scan_state.filter_only_classified = true;
+	}
+	SelectionVector new_sel(sel_count);
+	optional_ptr<const SelectionVector> local;
+	const idx_t approved = CodesOnlySurvivors(scan_state, start, vector_count, sel, sel_count, new_sel, local);
+	if (approved < vector_count) {
+		sel.Initialize(new_sel);
+	}
+	sel_count = approved;
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, true);
+}
+
+//! A codes-only scan of a column read for a key (kCodesOnlyKeyFilterPerSegment): its pushed filter is classified once
+//! per scan state from the segment's translation as for a filter-only column, the survivors are selected on the local
+//! codes, and only the surviving rows are translated into the vector over the global codes (every other row holds the
+//! NULL code, a valid index no consumer reads: the vector stays positional over the vector's rows)
+static void KeyFilterCodes(CompressedStringScanState &scan_state, idx_t start, idx_t vector_count, Vector &result,
+                           SelectionVector &sel, idx_t &sel_count, const TableFilter &filter) {
+	if (!scan_state.key_filter_classified) {
+		ClassifyCodesOnlyFilter(scan_state, filter);
+		scan_state.key_filter_classified = true;
+	}
+	SelectionVector new_sel(sel_count);
+	optional_ptr<const SelectionVector> local;
+	const idx_t approved = CodesOnlySurvivors(scan_state, start, vector_count, sel, sel_count, new_sel, local);
+	scan_state.ScanToGlobalDictionarySelected(*local, new_sel, approved, vector_count, result);
+	if (approved < vector_count) {
+		sel.Initialize(new_sel);
+	}
+	sel_count = approved;
+}
+
 static void DictFSSTFilter(ColumnSegment &segment, ColumnScanState &state, idx_t vector_count, Vector &result,
                            SelectionVector &sel, idx_t &sel_count, const TableFilter &filter,
                            TableFilterState &filter_state) {
 	auto &scan_state = state.scan_state->Cast<CompressedStringScanState>();
 	auto start = state.GetPositionInSegment();
+	if (scan_state.codes_only && scan_state.global_translation->filter_only) {
+		FilterOnlyCodes(scan_state, start, vector_count, result, sel, sel_count, filter);
+		return;
+	}
+	if (scan_state.codes_only && kCodesOnlyKeyFilterPerSegment) {
+		KeyFilterCodes(scan_state, start, vector_count, result, sel, sel_count, filter);
+		return;
+	}
+	if (scan_state.codes_only) {
+		auto &local = scan_state.GetSelVec(start, vector_count);
+		scan_state.ScanToGlobalDictionary(local, vector_count, result);
+		auto &codes = DictionaryVector::SelVector(result);
+		dict_global::FilterCodes(*scan_state.global_translation->dict->persisted, filter, codes.data(), vector_count,
+		                         sel, sel_count);
+		return;
+	}
 	// a sparse incoming selection of a whole vector evaluates the filter only for the referenced codes; once a
 	// scan state has taken the whole-dictionary path (filter_result computed) or carries domain verdicts for this
 	// filter it stays on that path
@@ -1367,6 +1540,10 @@ CompressionFunction DictFSSTCompressionFun::GetFunction(PhysicalType data_type) 
 	res.filter = dict_fsst::DictFSSTFilter;
 	res.check_domain = dict_fsst::DictFSSTCheckDomain;
 	res.get_segment_info = dict_fsst::DictFSSTGetSegmentInfo;
+	res.serialize_state = dict_fsst::DictFSSTSerializeState;
+	res.deserialize_state = dict_fsst::DictFSSTDeserializeState;
+	res.visit_block_ids = dict_fsst::DictFSSTVisitBlockIds;
+	res.init_prefetch = dict_fsst::DictFSSTInitPrefetch;
 
 	return res;
 }

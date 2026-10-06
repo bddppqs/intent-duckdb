@@ -32,6 +32,12 @@ struct StringStatsData {
 	bool has_max_string_length;
 	//! The maximum string length in bytes
 	uint32_t max_string_length;
+	//! The minimum non-empty value of the segment, potentially truncated (\xFF... while no non-empty value was seen):
+	//! valid only when has_min_nonempty
+	data_t min_nonempty[MAX_STRING_MINMAX_SIZE];
+	//! Whether min_nonempty is maintained: false for unknown statistics, for statistics set with SetMin / SetMax and
+	//! for statistics read from a file written without it
+	bool has_min_nonempty;
 };
 
 struct StringStats {
@@ -72,6 +78,10 @@ struct StringStats {
 	DUCKDB_API static void SetMin(BaseStatistics &stats, const string_t &value);
 	DUCKDB_API static void SetMax(BaseStatistics &stats, const string_t &value);
 	DUCKDB_API static void Merge(BaseStatistics &stats, const BaseStatistics &other);
+	//! Narrows VARCHAR statistics to the values a `<> ''` conjunct passes: min becomes the non-empty min. Returns
+	//! false (and changes nothing) when the statistics do not maintain a non-empty min; sets no_nonempty when they
+	//! hold no non-empty value
+	DUCKDB_API static bool NarrowToNonEmpty(BaseStatistics &stats, bool &no_nonempty);
 	DUCKDB_API static void Verify(const BaseStatistics &stats, Vector &vector, const SelectionVector &sel, idx_t count);
 
 private:

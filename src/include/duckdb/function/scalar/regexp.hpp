@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "re2/re2.h"
 #include "duckdb/function/built_in_functions.hpp"
@@ -168,10 +169,16 @@ public:
 	duckdb_re2::StringPiece *group_buffer;
 };
 
+//! The options of a constant pattern, which a local state compiles once and runs on many rows
+inline duckdb_re2::RE2::Options ConstantPatternOptions(duckdb_re2::RE2::Options options) {
+	options.set_tagged_dfa(kRegexpTaggedDFA);
+	return options;
+}
+
 struct RegexLocalState : public FunctionLocalState {
 	explicit RegexLocalState(RegexpBaseBindData &info, bool extract_all = false)
 	    : constant_pattern(duckdb_re2::StringPiece(info.constant_string.c_str(), info.constant_string.size()),
-	                       info.options) {
+	                       ConstantPatternOptions(info.options)) {
 		if (!constant_pattern.ok()) {
 			throw InvalidInputException(constant_pattern.error());
 		}

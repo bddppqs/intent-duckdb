@@ -1,0 +1,439 @@
+# name: test/sql/storage/compression/dict_global/stored_translations.test
+# description: split DICT_FSST segments and stored column translations: codes-only and string paths agree with
+# the same data stored in memory, across restarts, appends, updates, alters and drops
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET debug_verify_blocks=true
+
+# a: 1000 groups of 2k + 1 rows (unique counts) and about 300k values repeated; b: 200003 values (each in runs of
+# three), '' and NULL; c: unique strings (no translation: its segments hold no repetition)
+statement ok
+CREATE TABLE t AS SELECT i, CASE WHEN i < 1000000 THEN 'group-' || floor(sqrt(i))::BIGINT ELSE 'other-' || ((i // 3) % 200003) END || '-xxxxxxxxxxxx' AS a,
+    CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS b,
+    'u' || i || '-0123456789abcdef' AS c,
+    'https://www.example.com/catalog/section-' || ((i // 2) % 400009) || '/item.html?ref=' || md5(((i // 2) % 400009)::VARCHAR) AS d
+FROM range(6291456) r(i)
+
+statement ok
+CHECKPOINT
+
+# a DICT_FSST segment with a dictionary of a quarter block or more keeps its codes in a code block of its own (every
+# segment of d, some of a and b); a smaller dictionary keeps its codes (the other segments of a and b)
+query III
+SELECT column_name, count(*) FILTER (WHERE len(additional_block_ids) = 1) > 0, count(*) FILTER (WHERE len(additional_block_ids) = 0) > 0
+FROM pragma_storage_info('t') WHERE segment_type = 'VARCHAR' AND column_name IN ('a', 'b', 'd') AND compression = 'DICT_FSST'
+GROUP BY ALL ORDER BY ALL
+----
+a	1	1
+b	1	1
+d	1	0
+
+# long strings: a vector does not fit an empty segment, so segments end inside vectors and vectors straddle them (every
+# segment split)
+statement ok
+CREATE TABLE w AS SELECT i, concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) AS e FROM range(1048576) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('w') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND start % 2048 <> 0
+----
+true
+
+# fewer than 2^16 distinct strings: no stored translations (the column is read as before)
+statement ok
+CREATE TABLE small AS SELECT 'value-' || (i % 1000) || '-0123456789' AS s FROM range(1048576) r(i)
+
+statement ok
+CHECKPOINT
+
+loop restarted 0 2
+
+statement ok
+CREATE OR REPLACE TEMP TABLE r AS SELECT i, CASE WHEN i < 1000000 THEN 'group-' || floor(sqrt(i))::BIGINT ELSE 'other-' || ((i // 3) % 200003) END || '-xxxxxxxxxxxx' AS a,
+    CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS b,
+    'u' || i || '-0123456789abcdef' AS c,
+    'https://www.example.com/catalog/section-' || ((i // 2) % 400009) || '/item.html?ref=' || md5(((i // 2) % 400009)::VARCHAR) AS d
+FROM range(6291456) r(i)
+
+# codes only: the group key's codes through the stored translations, decoded above the Top-N
+query II
+SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 5
+----
+group-999-xxxxxxxxxxxx	1999
+group-998-xxxxxxxxxxxx	1997
+group-997-xxxxxxxxxxxx	1995
+group-996-xxxxxxxxxxxx	1993
+group-995-xxxxxxxxxxxx	1991
+
+query II
+EXPLAIN SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 5
+----
+physical_plan	<REGEX>:.*__dict_global_decode.*TOP_N.*Code Keys: a \(stored\).*
+
+query III
+SELECT 1, a, count(*) AS n FROM t GROUP BY 1, a ORDER BY n DESC LIMIT 3
+----
+1	group-999-xxxxxxxxxxxx	1999
+1	group-998-xxxxxxxxxxxx	1997
+1	group-997-xxxxxxxxxxxx	1995
+
+# every group, codes only and string path
+query I
+SELECT count(*) FROM ((SELECT a, count(*) FROM t GROUP BY a) EXCEPT ALL (SELECT a, count(*) FROM r GROUP BY a))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, count(*) FROM t GROUP BY b) EXCEPT ALL (SELECT b, count(*) FROM r GROUP BY b))
+----
+0
+
+# the key's codes with a filter on the empty string and NULL decided on codes
+query I
+SELECT count(*) FROM ((SELECT b, count(*) c FROM t WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 20) EXCEPT ALL (SELECT b, count(*) c FROM r WHERE b <> '' GROUP BY b ORDER BY c DESC, b LIMIT 20))
+----
+0
+
+query II
+EXPLAIN SELECT b, count(*) c FROM t WHERE b <> '' GROUP BY b ORDER BY c DESC LIMIT 20
+----
+physical_plan	<REGEX>:.*Code Keys: b \(stored\).*
+
+query I
+SELECT (SELECT count(*) FROM (SELECT b FROM t WHERE b <> '' GROUP BY b)) - (SELECT count(*) FROM (SELECT b FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT b FROM t WHERE b = '' GROUP BY b)) - (SELECT count(*) FROM (SELECT b FROM r WHERE b = '' GROUP BY b))
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT b FROM t WHERE b IS NOT NULL GROUP BY b)) - (SELECT count(*) FROM (SELECT b FROM r WHERE b IS NOT NULL GROUP BY b))
+----
+0
+
+# a split column: codes from its code blocks
+query I
+SELECT count(*) FROM ((SELECT d, count(*) c FROM t GROUP BY d ORDER BY c DESC, d LIMIT 11) EXCEPT ALL (SELECT d, count(*) c FROM r GROUP BY d ORDER BY c DESC, d LIMIT 11))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT d, count(*) FROM t GROUP BY d) EXCEPT ALL (SELECT d, count(*) FROM r GROUP BY d))
+----
+0
+
+query II
+EXPLAIN SELECT d, count(*) AS n FROM t GROUP BY d ORDER BY n DESC LIMIT 5
+----
+physical_plan	<REGEX>:.*__dict_global_decode.*TOP_N.*Code Keys: d \(stored\).*
+
+query I
+SELECT (SELECT count(DISTINCT d) FROM t) - (SELECT count(DISTINCT d) FROM r)
+----
+0
+
+query I
+SELECT (SELECT sum(length(d)) FROM t WHERE d LIKE '%section-12%') - (SELECT sum(length(d)) FROM r WHERE d LIKE '%section-12%')
+----
+0
+
+# DISTINCT on codes (the fused bitmap)
+query II
+SELECT count(DISTINCT a), count(DISTINCT b) FROM t
+----
+201003	200004
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200004
+
+# the output of codes without a Top-N: decoded row by row
+query I
+SELECT count(*) FROM (SELECT b, count(*) FROM t WHERE b <> '' GROUP BY b LIMIT 7) s WHERE b NOT IN (SELECT b FROM r)
+----
+0
+
+# string paths read the segment dictionaries as before
+query I
+SELECT (SELECT count(*) FROM t WHERE a LIKE '%group-99%') - (SELECT count(*) FROM r WHERE a LIKE '%group-99%')
+----
+0
+
+query II
+SELECT min(a), max(b) FROM t
+----
+group-0-xxxxxxxxxxxx	wval-99999-0123456789
+
+query I
+SELECT (SELECT sum(length(a)) + sum(strlen(b)) FROM t) - (SELECT sum(length(a)) + sum(strlen(b)) FROM r)
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT b, min(a) FROM t WHERE b <> '' GROUP BY b) EXCEPT ALL (SELECT b, min(a) FROM r WHERE b <> '' GROUP BY b))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM t WHERE b = 'wval-5-0123456789') EXCEPT ALL (SELECT * FROM r WHERE b = 'wval-5-0123456789'))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM t ORDER BY b DESC NULLS LAST, i LIMIT 13) EXCEPT ALL (SELECT * FROM r ORDER BY b DESC NULLS LAST, i LIMIT 13))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*) c FROM w GROUP BY e ORDER BY c DESC, e LIMIT 9) EXCEPT ALL (SELECT concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) e, count(*) c FROM range(1048576) r(i) GROUP BY 1 ORDER BY c DESC, e LIMIT 9))
+----
+0
+
+query II
+EXPLAIN SELECT e, count(*) AS n FROM w GROUP BY e ORDER BY n DESC LIMIT 5
+----
+physical_plan	<REGEX>:.*__dict_global_decode.*TOP_N.*Code Keys: e \(stored\).*
+
+query I
+SELECT count(*) FROM ((SELECT e, count(*) FROM w GROUP BY e) EXCEPT ALL (SELECT concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')), count(*) FROM range(1048576) r(i) GROUP BY 1))
+----
+0
+
+query I
+SELECT count(DISTINCT e) FROM w
+----
+100003
+
+query I
+SELECT count(*) FROM ((SELECT s, count(*) FROM small GROUP BY s) EXCEPT ALL (SELECT 'value-' || (i % 1000) || '-0123456789', count(*) FROM range(1048576) r(i) GROUP BY 1))
+----
+0
+
+restart
+
+endloop
+
+# a statement prepared over stored translations, executed after a checkpoint that rebuilt them (new data): re-bound
+# before it executes, never an internal error
+statement ok
+CREATE TABLE p AS SELECT 'pv-' || ((i // 3) % 100003) || '-0123456789abcdef' AS s FROM range(1048576) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PREPARE top_p AS SELECT s, count(*) AS n FROM p GROUP BY s ORDER BY n DESC, s LIMIT 2
+
+statement ok
+PREPARE distinct_p AS SELECT count(DISTINCT s) FROM p
+
+query II
+EXPLAIN SELECT s, count(*) AS n FROM p GROUP BY s ORDER BY n DESC, s LIMIT 2
+----
+physical_plan	<REGEX>:.*Code Keys: s \(stored\).*
+
+query II
+EXECUTE top_p
+----
+pv-0-0123456789abcdef	12
+pv-1-0123456789abcdef	12
+
+query I
+EXECUTE distinct_p
+----
+100003
+
+# a checkpoint that carries the translations unchanged
+statement ok
+CHECKPOINT
+
+query II
+EXECUTE top_p
+----
+pv-0-0123456789abcdef	12
+pv-1-0123456789abcdef	12
+
+statement ok
+INSERT INTO p SELECT 'pv-new-' || (i % 3) || '-0123456789abcdef' FROM range(120) r(i)
+
+# before the checkpoint the appended rows are transient: the statement takes the standard path
+query II
+EXECUTE top_p
+----
+pv-new-0-0123456789abcdef	40
+pv-new-1-0123456789abcdef	40
+
+statement ok
+CHECKPOINT
+
+query II
+EXECUTE top_p
+----
+pv-new-0-0123456789abcdef	40
+pv-new-1-0123456789abcdef	40
+
+query I
+EXECUTE distinct_p
+----
+100006
+
+query I
+EXECUTE distinct_p
+----
+100006
+
+# prepared before a checkpoint, executed after it twice in a row, and after a restart re-prepared
+statement ok
+PREPARE top_p2 AS SELECT s, count(*) AS n FROM p WHERE s <> '' GROUP BY s ORDER BY n DESC, s LIMIT 1
+
+statement ok
+INSERT INTO p SELECT 'pv-newer-0123456789abcdef' FROM range(77) r(i)
+
+statement ok
+CHECKPOINT
+
+query II
+EXECUTE top_p2
+----
+pv-newer-0123456789abcdef	77
+
+query II
+EXECUTE top_p2
+----
+pv-newer-0123456789abcdef	77
+
+statement ok
+DEALLOCATE top_p
+
+statement ok
+DEALLOCATE top_p2
+
+statement ok
+DEALLOCATE distinct_p
+
+statement ok
+DROP TABLE p
+
+statement ok
+CHECKPOINT
+
+# an append not yet checkpointed: the codes-only path is refused (local and transient rows hold strings)
+statement ok
+INSERT INTO t SELECT i, 'appended-' || (i % 7) || '-xxxxxxxxxxxx', 'wval-5-0123456789', 'appended', 'appended-d' FROM range(6291456, 6291456 + 5000) r(i)
+
+query II
+SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 3
+----
+group-999-xxxxxxxxxxxx	1999
+group-998-xxxxxxxxxxxx	1997
+group-997-xxxxxxxxxxxx	1995
+
+query I
+SELECT count(*) FROM t WHERE b = 'wval-5-0123456789'
+----
+5030
+
+query I
+SELECT count(DISTINCT a) FROM t
+----
+201010
+
+# the next checkpoint builds the translations again over the new segments
+statement ok
+CHECKPOINT
+
+restart
+
+query II
+SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 3
+----
+group-999-xxxxxxxxxxxx	1999
+group-998-xxxxxxxxxxxx	1997
+group-997-xxxxxxxxxxxx	1995
+
+query I
+SELECT count(DISTINCT a) FROM t
+----
+201010
+
+# an update of the column: its codes are read the standard way until a checkpoint rewrites it
+statement ok
+UPDATE t SET b = 'updated-0123456789' WHERE i % 100000 = 1
+
+query I
+SELECT count(*) FROM (SELECT b FROM t WHERE b <> '' GROUP BY b) s WHERE b = 'updated-0123456789'
+----
+1
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200005
+
+statement ok
+CHECKPOINT
+
+restart
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200005
+
+# an alter that renumbers the storage indexes: no stored translation is read until the next checkpoint
+statement ok
+ALTER TABLE t DROP COLUMN i
+
+query II
+SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 2
+----
+group-999-xxxxxxxxxxxx	1999
+group-998-xxxxxxxxxxxx	1997
+
+statement ok
+CHECKPOINT
+
+restart
+
+query II
+SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY n DESC LIMIT 2
+----
+group-999-xxxxxxxxxxxx	1999
+group-998-xxxxxxxxxxxx	1997
+
+query I
+SELECT count(DISTINCT b) FROM t
+----
+200005
+
+# a dropped table frees its code blocks and translation blocks (debug_verify_blocks checks the counts)
+statement ok
+DROP TABLE t
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+CREATE TABLE t2 AS SELECT 'again-' || ((i // 3) % 100003) || '-0123456789' AS a FROM range(1048576) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(DISTINCT a) FROM t2
+----
+100003

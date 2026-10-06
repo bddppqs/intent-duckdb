@@ -14,11 +14,18 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/table/column_data.hpp"
+#include "duckdb/storage/table/row_group.hpp"
+#include "duckdb/storage/table/row_group_collection.hpp"
+#include "duckdb/storage/table/row_group_segment_tree.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/common/tuning_defaults.hpp"
 
 #include <atomic>
@@ -49,6 +56,30 @@ static bool FusedVarcharKeysEnabled() {
 	return kFusedIntegerAggregateVarcharKeys;
 }
 
+//! Phase 1 folds a COUNT-only shape's row whose key equals its partition's last row into that row's count; otherwise
+//! the grouped class appends every row
+static bool FusedLastKeyFoldEnabled() {
+	return kFusedLastKeyFold;
+}
+
+//! The last-key fold is refused where the key columns' distinct-count statistics show it cannot pay for its wider row
+//! (FusedLastKeyFoldPays); otherwise it is taken wherever it fits
+static bool FusedLastKeyFoldGuardEnabled() {
+	return kFusedLastKeyFoldStatisticsGuard;
+}
+
+//! The grouped class takes up to three keys and 16 key bytes; otherwise (and always for the DISTINCT class) two keys and
+//! 12 key bytes
+static bool FusedSixteenByteKeysEnabled() {
+	return kFusedSixteenByteKeys;
+}
+
+//! A key may be computed from one column by a deterministic scalar function (FusedIsComputedKey) below or inside its
+//! compress function; otherwise a compress takes a column reference alone
+static bool FusedComputedKeysEnabled() {
+	return kFusedComputedGroupKeys;
+}
+
 //! A grouped DISTINCT shape merges its task tables as a tree as the tasks finish (FusedTreeMerge); otherwise the last
 //! task merges every task's group table, then every thread's companion, alone
 static bool FusedDistinctTreeMergeEnabled() {
@@ -74,24 +105,40 @@ static const bool fused_atomic_reserve = kFusedAggregateAtomicReserve;
 //! Combine (needs the fetch_add reservation above)
 static const bool fused_local_allowance = kFusedAggregateLocalAllowance && fused_atomic_reserve;
 
+//! An ungrouped count(DISTINCT x) over a published VARCHAR column takes the bitmap class (FusedAdmitBitmap); otherwise
+//! every operator is decided without it
+static bool FusedDistinctBitmapEnabled() {
+	return kFusedDistinctBitmap;
+}
+
+//! An ungrouped count(DISTINCT x) over an integer x, the operator's one aggregate, takes the set member (no stored hash,
+//! phase 2 counts each partition's distinct x in a set of x alone); otherwise the DISTINCT class's (g, x) build and group
+//! fold
+static bool FusedDistinctSetEnabled() {
+	return kFusedDistinctSet;
+}
+
 //===--------------------------------------------------------------------===//
 // The row hash and the key words
 //===--------------------------------------------------------------------===//
-// The key region (the first key_bytes <= 12 bytes of the compact row) is read as one or two little-endian words, the
-// bytes past the keys masked off; the words are hashed with DuckDB's Hash(uint64_t) (MurmurHash64) and combined as
+// The key region (the first key_bytes <= 16 bytes of the compact row) is read as one or two little-endian words, the
+// bytes past the keys masked off (the second word a 32-bit load up to 12 key bytes, a 64-bit one past 12, where the row
+// is at least 16 bytes); the words are hashed with DuckDB's Hash(uint64_t) (MurmurHash64) and combined as
 // DuckDB's vector hash combines column hashes (CombineHashScalar, vector_hash.cpp). Phase 1 partitions on the top 12
 // bits; phase 2 indexes its table with the bits right below them.
 struct FusedKeyShape {
 	uint64_t mask0;
 	uint64_t mask1;
 	bool two_words;
+	bool wide;
 };
 
 static FusedKeyShape FusedGetKeyShape(idx_t key_bytes) {
 	FusedKeyShape shape;
 	shape.two_words = key_bytes > 8;
+	shape.wide = key_bytes > 12;
 	shape.mask0 = key_bytes >= 8 ? ~uint64_t(0) : (uint64_t(1) << (8 * key_bytes)) - 1;
-	shape.mask1 = shape.two_words ? (uint64_t(1) << (8 * (key_bytes - 8))) - 1 : 0;
+	shape.mask1 = shape.two_words ? (key_bytes >= 16 ? ~uint64_t(0) : (uint64_t(1) << (8 * (key_bytes - 8))) - 1) : 0;
 	return shape;
 }
 
@@ -103,7 +150,8 @@ static inline hash_t FusedCombineHash(hash_t left, hash_t right) {
 
 static inline void FusedLoadKey(const_data_ptr_t row, const FusedKeyShape &shape, uint64_t &key0, uint64_t &key1) {
 	key0 = Load<uint64_t>(row) & shape.mask0;
-	key1 = shape.two_words ? uint64_t(Load<uint32_t>(row + 8)) & shape.mask1 : 0;
+	key1 = shape.two_words ? (shape.wide ? Load<uint64_t>(row + 8) : uint64_t(Load<uint32_t>(row + 8))) & shape.mask1
+	                       : 0;
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -163,7 +211,7 @@ static inline uint32_t FusedStoredBits(hash_t hash) {
 FusedIntegerAggregate::FusedIntegerAggregate()
     : key_count(0), key_bytes(0), row_width(0), budget_bytes(0), distinct(false), group_bytes(0), fold(false),
       mixed(false), gid_keys(0), hash_stored(false), hash_offset(0), chain(false), run_kind(false),
-      run_length_offset(0) {
+      run_length_offset(0), last_key_fold(false), bitmap(false), bitmap_words(0) {
 }
 
 static bool FusedIsIntegerKeyType(PhysicalType type) {
@@ -192,7 +240,60 @@ static bool FusedIsInputType(const LogicalType &type) {
 	}
 }
 
-//! The compressed-materialization function a key may pass through: compress(BOUND_REF, constant)
+//! A computed key of one column, f(BOUND_REF, constant...): f a deterministic scalar function (CONSISTENT) with a
+//! statistics callback, exactly one child a BOUND_REF and every other child a constant
+static bool FusedIsComputedKey(const Expression &expr) {
+	if (!FusedComputedKeysEnabled() || expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if (function.function.GetStability() != FunctionStability::CONSISTENT || !function.function.HasStatisticsCallback()) {
+		return false;
+	}
+	idx_t references = 0;
+	for (auto &child : function.children) {
+		if (child->GetExpressionType() == ExpressionType::BOUND_REF) {
+			references++;
+		} else if (child->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
+			return false;
+		}
+	}
+	return references == 1;
+}
+
+//! The index the computed key's one BOUND_REF child reads
+static idx_t FusedComputedKeyColumn(const Expression &expr) {
+	for (auto &child : expr.Cast<BoundFunctionExpression>().children) {
+		if (child->GetExpressionType() == ExpressionType::BOUND_REF) {
+			return child->Cast<BoundReferenceExpression>().index;
+		}
+	}
+	throw InternalException("FusedComputedKeyColumn: no BOUND_REF child");
+}
+
+//! The computed key's statistics, its function's own callback over the column's statistics (a constant child's
+//! from its value), run on a copy of the expression (a callback may rewrite the expression it is given): null unless
+//! the range is bounded (numeric statistics with a minimum and a maximum)
+static unique_ptr<BaseStatistics> FusedComputedKeyStatistics(ClientContext &context, const Expression &expr,
+                                                             const BaseStatistics &column_stats) {
+	auto copy = expr.Copy();
+	auto &function = copy->Cast<BoundFunctionExpression>();
+	vector<BaseStatistics> child_stats;
+	for (auto &child : function.children) {
+		child_stats.push_back(child->GetExpressionType() == ExpressionType::BOUND_REF
+		                          ? column_stats.Copy()
+		                          : BaseStatistics::FromConstant(child->Cast<BoundConstantExpression>().value));
+	}
+	FunctionStatisticsInput input(function, function.bind_info.get(), child_stats, &copy);
+	auto stats = function.function.GetStatisticsCallback()(context, input);
+	if (!stats || stats->GetStatsType() != StatisticsType::NUMERIC_STATS || !NumericStats::HasMinMax(*stats)) {
+		return nullptr;
+	}
+	return stats;
+}
+
+//! The compressed-materialization function a key may pass through: compress(BOUND_REF, constant) or
+//! compress(computed key, constant)
 static bool FusedIsCompressFunction(const Expression &expr) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
 		return false;
@@ -203,7 +304,9 @@ static bool FusedIsCompressFunction(const Expression &expr) {
 	    name != "__internal_compress_integral_uinteger" && name != "__internal_compress_integral_ubigint") {
 		return false;
 	}
-	return function.children.size() == 2 && function.children[0]->GetExpressionType() == ExpressionType::BOUND_REF &&
+	return function.children.size() == 2 &&
+	       (function.children[0]->GetExpressionType() == ExpressionType::BOUND_REF ||
+	        FusedIsComputedKey(*function.children[0])) &&
 	       function.children[1]->GetExpressionType() == ExpressionType::VALUE_CONSTANT;
 }
 
@@ -239,9 +342,12 @@ static bool FusedWalkChain(PhysicalOperator &child, FusedChain &chain) {
 //! Resolves column `index` of the aggregate's input through the chain to a base-table column and reads its statistics
 //! through the scan's statistics function (none for transaction-local data): null when the column does not resolve. A
 //! key may pass through one compress function (NULL-preserving, its statistics a copy of the source's); an input may not.
+//! Below or inside that compress, a key may pass through one computed key of one column (FusedIsComputedKey), and its
+//! statistics are the computed key's (FusedComputedKeyStatistics)
 static unique_ptr<BaseStatistics> FusedResolveColumnStatistics(ClientContext &context, const FusedChain &chain,
                                                                idx_t index, bool allow_compress) {
 	bool compressed = false;
+	optional_ptr<const Expression> computed;
 	for (auto &operator_ref : chain.operators) {
 		auto &op = operator_ref.get();
 		if (op.type == PhysicalOperatorType::FILTER) {
@@ -257,8 +363,19 @@ static unique_ptr<BaseStatistics> FusedResolveColumnStatistics(ClientContext &co
 			continue;
 		}
 		if (allow_compress && !compressed && FusedIsCompressFunction(expr)) {
-			index = expr.Cast<BoundFunctionExpression>().children[0]->Cast<BoundReferenceExpression>().index;
+			auto &source = *expr.Cast<BoundFunctionExpression>().children[0];
+			if (source.GetExpressionType() == ExpressionType::BOUND_REF) {
+				index = source.Cast<BoundReferenceExpression>().index;
+			} else {
+				computed = &source;
+				index = FusedComputedKeyColumn(source);
+			}
 			compressed = true;
+			continue;
+		}
+		if (compressed && !computed && FusedIsComputedKey(expr)) {
+			computed = &expr;
+			index = FusedComputedKeyColumn(expr);
 			continue;
 		}
 		return nullptr;
@@ -286,6 +403,9 @@ static unique_ptr<BaseStatistics> FusedResolveColumnStatistics(ClientContext &co
 	} else {
 		stats = scan.function.statistics(context, scan.bind_data.get(), column_index.GetPrimaryIndex());
 	}
+	if (computed && stats) {
+		return FusedComputedKeyStatistics(context, *computed, *stats);
+	}
 	return stats;
 }
 
@@ -294,6 +414,40 @@ static bool FusedResolvesToNonNullColumn(ClientContext &context, const FusedChai
                                          bool allow_compress) {
 	auto stats = FusedResolveColumnStatistics(context, chain, index, allow_compress);
 	return stats && !stats->CanHaveNull();
+}
+
+//! Whether the last-key fold can pay for its count. The count widens the compact row from `plain` to `folded` bytes (the
+//! stored hash bits beside both), and the fold saves a row only for an input row whose key repeats: at most the input
+//! rows less its groups, and a composite key has at least as many groups as the largest distinct-count statistic of its
+//! columns. The fold is refused when folding every repeated row would still move no fewer row bytes:
+//! (rows - distinct) x folded <= rows x (folded - plain) - for a 16 -> 20 byte row, a key column with more than
+//! 0.8 x rows distinct values. The statistics describe the whole table, so only an unfiltered scan is read; a row that
+//! does not widen, a filtered input or an unknown statistic keeps the fold
+static bool FusedLastKeyFoldPays(ClientContext &context, const FusedChain &chain, const FusedIntegerAggregate &fused,
+                                 idx_t offset, idx_t rows) {
+	const idx_t hash_bytes = FusedStoredHashEnabled() ? FusedIntegerAggregate::STORED_HASH_BYTES : 0;
+	const idx_t plain = MaxValue<idx_t>(8, AlignValue<idx_t>(offset, 4)) + hash_bytes;
+	const idx_t folded = MaxValue<idx_t>(8, AlignValue<idx_t>(offset + sizeof(uint32_t), 4)) + hash_bytes;
+	if (!FusedLastKeyFoldGuardEnabled() || folded == plain || rows == 0) {
+		return true;
+	}
+	for (auto &op : chain.operators) {
+		if (op.get().type == PhysicalOperatorType::FILTER) {
+			return true;
+		}
+	}
+	if (chain.scan->table_filters && !chain.scan->table_filters->filters.empty()) {
+		return true;
+	}
+	idx_t distinct = 0;
+	for (idx_t key_idx = 0; key_idx < fused.key_count; key_idx++) {
+		auto stats = FusedResolveColumnStatistics(context, chain, fused.columns[key_idx].chunk_index, true);
+		if (stats) {
+			distinct = MaxValue<idx_t>(distinct, stats->GetDistinctCount());
+		}
+	}
+	distinct = MinValue<idx_t>(distinct, rows);
+	return (rows - distinct) * folded > rows * (folded - plain);
 }
 
 //! the base-table column (its primary index) that column `index` of the aggregate's input resolves to
@@ -372,11 +526,15 @@ static unique_ptr<FusedIntegerAggregate> FusedAdmitShape(ClientContext &context,
                                                          const vector<LogicalType> &types, optional_idx distinct_index,
                                                          TupleDataValidityType group_validity, idx_t group_estimate, bool run_kind) {
 	const bool distinct = distinct_index.IsValid();
-	// one or two keys (the DISTINCT class: zero to two), each a BOUND_REF of an integer physical type (INT8,
-	// HUGEINT and every non-integer are refused); at most 12 key bytes
+	// one to three keys (the DISTINCT class: zero to two), each a BOUND_REF of an integer physical type (INT8,
+	// HUGEINT and every non-integer are refused); at most 16 key bytes. The DISTINCT class, and every class without
+	// FusedSixteenByteKeysEnabled, keeps two keys and 12 key bytes
 	auto fused = make_uniq<FusedIntegerAggregate>();
+	const bool key16 = FusedSixteenByteKeysEnabled() && !distinct;
+	const idx_t maximum_keys = key16 ? 3 : 2;
+	const idx_t maximum_key_bytes = key16 ? FusedIntegerAggregate::MAXIMUM_KEY_BYTES : 12;
 	const idx_t key_count = groups.size();
-	if (key_count > 2 || (!distinct && key_count < 1)) {
+	if (key_count > maximum_keys || (!distinct && key_count < 1)) {
 		return nullptr;
 	}
 	idx_t offset = 0;
@@ -411,7 +569,7 @@ static unique_ptr<FusedIntegerAggregate> FusedAdmitShape(ClientContext &context,
 		offset += column.width;
 		fused->columns.push_back(column);
 	}
-	if (offset > FusedIntegerAggregate::MAXIMUM_KEY_BYTES) {
+	if (offset > maximum_key_bytes) {
 		return nullptr;
 	}
 	if (run_kind && key_count != 1) {
@@ -594,6 +752,18 @@ static unique_ptr<FusedIntegerAggregate> FusedAdmitShape(ClientContext &context,
 		fused->run_length_offset = offset;
 		offset += sizeof(uint32_t);
 	}
+	// the last-key fold: a COUNT-only shape of the grouped class (no sum state, not DISTINCT, not the run kind) carries
+	// a uint32_t count at run_length_offset, so phase 1 can fold a row into its partition's last row; taken only while
+	// the row keeps room for the stored hash bits, so the count never refuses a shape nor turns another mechanism off;
+	// and only where the statistics leave enough repeated rows to pay for the count's bytes (FusedLastKeyFoldPays)
+	if (!run_kind && !distinct && fused->sum_columns.empty() && FusedLastKeyFoldEnabled() &&
+	    MaxValue<idx_t>(8, AlignValue<idx_t>(offset + sizeof(uint32_t), 4)) + FusedIntegerAggregate::STORED_HASH_BYTES <=
+	        FusedIntegerAggregate::MAXIMUM_ROW_BYTES &&
+	    FusedLastKeyFoldPays(context, chain, *fused, offset, child.estimated_cardinality)) {
+		fused->last_key_fold = true;
+		fused->run_length_offset = offset;
+		offset += sizeof(uint32_t);
+	}
 	// the compact row: at most 32 bytes, padded to a multiple of 4 and at least 8 (the key words are read in place)
 	fused->row_width = MaxValue<idx_t>(8, AlignValue<idx_t>(offset, 4));
 	if (fused->row_width > FusedIntegerAggregate::MAXIMUM_ROW_BYTES) {
@@ -710,6 +880,124 @@ void FusedIntegerAggregate::TryAttach(ClientContext &context, PhysicalHashAggreg
 	}
 }
 
+//! The coverage bound: the reasons an execution of the bitmap class is refused (the marker's refusal=)
+enum class FusedBitmapRefusal : uint8_t { NONE = 0, LOCAL_STORAGE, STALE_DICT, COVERAGE, UPDATES, MEMORY };
+
+static const char *FusedBitmapRefusalName(uint8_t refusal) {
+	switch (static_cast<FusedBitmapRefusal>(refusal)) {
+	case FusedBitmapRefusal::NONE:
+		return "none";
+	case FusedBitmapRefusal::LOCAL_STORAGE:
+		return "local_storage";
+	case FusedBitmapRefusal::STALE_DICT:
+		return "stale_dict";
+	case FusedBitmapRefusal::COVERAGE:
+		return "coverage";
+	case FusedBitmapRefusal::UPDATES:
+		return "updates";
+	case FusedBitmapRefusal::MEMORY:
+		return "memory";
+	}
+	return "unknown";
+}
+
+//! The coverage bound of the lookup path (zero uncovered rows): why the rows a scan of `table` emits for the column of `dict`
+//! may hold a string `dict` does not, or NONE - (i) the transaction holds local storage for the table; at an execution,
+//! the column's publication is no longer `dict` (a checkpoint moved the epoch, or a republish); (ii) committed rows lie
+//! outside the segments `dict` was built from (rows_covered below GetTotalRows(): an append not yet checkpointed, a
+//! segment the build skipped), or the column carries an update. Refused, the generic path answers, so the overflow set
+//! stays empty on every execution the bound admits
+static FusedBitmapRefusal FusedBitmapCoverage(ClientContext &context, DataTable &table,
+                                              const dict_global::ColumnDictionary &dict, bool execution) {
+	if (LocalStorage::Get(context, table.db).Find(table)) {
+		return FusedBitmapRefusal::LOCAL_STORAGE;
+	}
+	if (execution && dict.persisted) {
+		// a column read through stored translations that are no longer the column's: the execution reads strings
+		if (dict_global::PublishPersisted(table, dict.storage_index).get() != &dict) {
+			return FusedBitmapRefusal::STALE_DICT;
+		}
+	} else if (execution && dict_global::Published(table, dict.storage_index).get() != &dict) {
+		return FusedBitmapRefusal::STALE_DICT;
+	}
+	if (dict.rows_covered != table.GetTotalRows()) {
+		return FusedBitmapRefusal::COVERAGE;
+	}
+	auto row_groups = table.GetRowGroupCollection()->GetRowGroups();
+	for (auto node = row_groups->GetRootSegment(); node; node = row_groups->GetNextSegment(*node)) {
+		// a column not loaded carries no update (an update loads its column first): never loaded here for the check
+		auto &row_group = node->GetNode();
+		if (row_group.IsColumnLoaded(dict.storage_index) &&
+		    row_group.GetRawColumnData(dict.storage_index).HasUpdates()) {
+			return FusedBitmapRefusal::UPDATES;
+		}
+	}
+	return FusedBitmapRefusal::NONE;
+}
+
+//! The bitmap class's gate, tried on the ungrouped operator once its distinct aggregate is found (FusedDistinctIndex):
+//! the distinct aggregate is the operator's one aggregate, its result BIGINT; x is a BOUND_REF of a plain VARCHAR (no
+//! alias) with the binary collation - neither the type's own nor a default collation; x resolves to an admitted column
+//! the scan publishes for this plan and whose dictionary is published (dict_global::PlanPublishedColumn), so the code
+//! domain [0, codes) is known; the memory bound: one bitmap per thread, threads x 8 x ceil(codes / 64) bytes within the
+//! kernel's budget GetMaxMemory() / 4; the work bound: phase 2 reads threads x ceil(codes / 64) words, at most the
+//! child's estimated input rows (the rows the generic path would sink); the coverage bound, FusedBitmapCoverage, the
+//! plan-time fast path of the per-execution re-check. Null when any condition fails: the operator is decided as before
+static unique_ptr<FusedIntegerAggregate> FusedAdmitBitmap(ClientContext &context, PhysicalUngroupedAggregate &op,
+                                                          idx_t distinct_index) {
+	if (op.aggregates.size() != 1 || op.types.size() != 1 || op.types[0].id() != LogicalTypeId::BIGINT) {
+		return nullptr;
+	}
+	auto &x = *op.aggregates[distinct_index]->Cast<BoundAggregateExpression>().children[0];
+	if (x.GetExpressionType() != ExpressionType::BOUND_REF || x.return_type.id() != LogicalTypeId::VARCHAR ||
+	    x.return_type.HasAlias() || !StringType::GetCollation(x.return_type).empty() ||
+	    !Settings::Get<DefaultCollationSetting>(context).empty()) {
+		return nullptr;
+	}
+	auto &child = op.children[0].get();
+	const auto chunk_index = x.Cast<BoundReferenceExpression>().index;
+	optional_ptr<DataTable> table;
+	auto dict = dict_global::PlanPublishedColumn(child, chunk_index, x.return_type, table);
+	if (!dict || dict->count == 0) {
+		return nullptr;
+	}
+	if (FusedBitmapCoverage(context, *table, *dict, false) != FusedBitmapRefusal::NONE) {
+		return nullptr;
+	}
+	const idx_t words = (dict->count + 63) / 64;
+	const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	const idx_t budget = BufferManager::GetBufferManager(context).GetMaxMemory() / 4;
+	if (threads * words * sizeof(uint64_t) > budget || threads * words > child.estimated_cardinality) {
+		return nullptr;
+	}
+	auto fused = make_uniq<FusedIntegerAggregate>();
+	FusedRowColumn column;
+	column.chunk_index = chunk_index;
+	column.offset = 0;
+	column.width = sizeof(uint32_t);
+	fused->columns.push_back(column);
+	FusedAggregateOutput output;
+	output.kind = FusedAggregateKind::DISTINCT_COUNT;
+	output.sum_index = 0;
+	fused->outputs.push_back(output);
+	fused->budget_bytes = budget;
+	fused->input_types = child.GetTypes();
+	fused->output_types = op.types;
+	fused->bitmap = true;
+	fused->bitmap_dict = std::move(dict);
+	fused->bitmap_words = words;
+	fused->bitmap_table = table.get();
+	// the scan reads the column's codes only in the executions the sink admits (GetGlobalSinkState decides before the
+	// scan starts; a refused execution reads strings for the generic path); a prepared plan re-binds once those
+	// translations go stale
+	fused->bitmap_codes_only = make_shared_ptr<atomic<bool>>(false);
+	dict_global::MarkCodesOnly(child, chunk_index, fused->bitmap_dict, fused->bitmap_codes_only);
+	if (fused->bitmap_dict->persisted) {
+		dict_global::NoteStoredTranslationPlan(context);
+	}
+	return fused;
+}
+
 void FusedIntegerAggregate::TryAttachUngrouped(ClientContext &context, PhysicalUngroupedAggregate &op) {
 	if (!FusedIntegerAggregateEnabled() || !FusedDistinctClassEnabled()) {
 		return;
@@ -723,11 +1011,26 @@ void FusedIntegerAggregate::TryAttachUngrouped(ClientContext &context, PhysicalU
 	if (!distinct_index.IsValid()) {
 		return;
 	}
+	// a VARCHAR x the global dictionary publishes takes the bitmap class when its gate holds; refused, or with the class
+	// off, FusedAdmitShape decides the operator as before (it refuses every VARCHAR x)
+	if (FusedDistinctBitmapEnabled()) {
+		auto bitmap = FusedAdmitBitmap(context, op, distinct_index.GetIndex());
+		if (bitmap) {
+			op.fused = std::move(bitmap);
+			return;
+		}
+	}
 	const vector<unique_ptr<Expression>> no_groups;
 	auto fused = FusedAdmitShape(context, op.children[0].get(), no_groups, op.aggregates, op.types, distinct_index,
 	                             TupleDataValidityType::CANNOT_HAVE_NULL_VALUES, op.estimated_cardinality, false);
 	if (fused) {
-		FusedArmMembers(*fused);
+		if (FusedDistinctSetEnabled() && fused->distinct && !fused->mixed && fused->key_count == 0 &&
+		    fused->gid_keys == 0 && fused->key_bytes <= sizeof(uint64_t)) {
+			// the set member: the row stays x alone (one key word, read in place), so no stored hash is kept
+			fused->distinct_set = true;
+		} else {
+			FusedArmMembers(*fused);
+		}
 		op.fused = std::move(fused);
 	}
 }
@@ -772,6 +1075,10 @@ FusedAggregateLocalState::FusedAggregateLocalState(ExecutionContext &context, co
 
 FusedAggregateLocalState::FusedAggregateLocalState(const FusedIntegerAggregate &fused)
     : drained(false), resinking(false), resinking_distinct_only(false), resinking_regular_only(false) {
+	if (fused.bitmap) {
+		// the bitmap class keeps none of the row path's buffers (its bitmap is allocated at the first chunk)
+		return;
+	}
 	const auto partitions = FusedIntegerAggregate::PARTITION_COUNT;
 	// allocated here, never inside an append
 	lines = make_unsafe_uniq_array_uninitialized<data_t>(partitions * FusedIntegerAggregate::LINE_BYTES);
@@ -811,6 +1118,30 @@ FusedAggregateLocalState::FusedAggregateLocalState(const FusedIntegerAggregate &
 unique_ptr<FusedAggregateGlobalState> FusedIntegerAggregate::GetGlobalSinkState(ClientContext &context) const {
 	auto state = make_uniq<FusedAggregateGlobalState>(BufferManager::GetBufferManager(context));
 	state->drain_threshold = budget_bytes;
+	if (bitmap) {
+		// a prepared plan runs again without re-planning, so every execution re-checks the coverage bound - local
+		// storage, the publication's identity, the coverage and updates, and the memory bound at the executing threads
+		// and memory limit - before any row is sunk; refused, the execution is abandoned at its start and takes the
+		// generic path (Sink, Combine and Finalize return false under `abandoned`, and FusedSourceState hands the
+		// source to the hash aggregate)
+		auto refusal = FusedBitmapCoverage(context, *bitmap_table, *bitmap_dict, true);
+		if (refusal == FusedBitmapRefusal::NONE) {
+			const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+			const idx_t budget = BufferManager::GetBufferManager(context).GetMaxMemory() / 4;
+			if (threads * bitmap_words * sizeof(uint64_t) > budget) {
+				refusal = FusedBitmapRefusal::MEMORY;
+			}
+		}
+		state->bitmap_refusal = static_cast<uint8_t>(refusal);
+		state->bitmap_engaged = refusal == FusedBitmapRefusal::NONE;
+		if (bitmap_codes_only) {
+			// the scan below reads this decision at its own initialisation, after the sink's global state exists
+			bitmap_codes_only->store(state->bitmap_engaged, std::memory_order_release);
+		}
+		if (!state->bitmap_engaged) {
+			state->abandoned = true;
+		}
+	}
 	return state;
 }
 
@@ -1012,6 +1343,90 @@ static void FusedAppend(FusedAggregateLocalState &lstate, idx_t row_width, idx_t
 	}
 }
 
+//! FusedAppendRows with the last-key fold. A row whose key words equal its partition's last row's adds its count
+//! to that row and is not appended (unless the sum would pass uint32_t). A full line is flushed when its partition's next
+//! row is kept, not when it fills, so the partition's last row is always the line's last row. Returns the rows appended.
+template <idx_t W>
+static idx_t FusedAppendFoldRows(FusedAggregateLocalState &lstate, const_data_ptr_t rows, const hash_t *hashes,
+                                 idx_t count, idx_t count_offset, const FusedKeyShape &shape) {
+	static constexpr idx_t ROWS_PER_LINE = FusedIntegerAggregate::LINE_BYTES / W;
+	static constexpr idx_t LINE_ROW_BYTES = ROWS_PER_LINE * W;
+	static constexpr idx_t LINES_PER_CHUNK =
+	    (FusedIntegerAggregate::CHUNK_BYTES - FusedIntegerAggregate::CHUNK_HEADER_BYTES) / LINE_ROW_BYTES;
+	auto lines = lstate.lines.get();
+	auto fill = lstate.fill.get();
+	auto cursor = lstate.cursor.get();
+	auto room = lstate.room.get();
+	idx_t appended = 0;
+	for (idx_t i = 0; i < count; i++) {
+		const auto row = rows + i * W;
+		const auto p = FusedPartitionOf(hashes[i]);
+		auto f = fill[p];
+		const auto line = lines + p * FusedIntegerAggregate::LINE_BYTES;
+		if (f > 0) {
+			const auto last = line + (f - 1) * W;
+			uint64_t key0, key1, last0, last1;
+			FusedLoadKey(row, shape, key0, key1);
+			FusedLoadKey(last, shape, last0, last1);
+			const auto sum = uint64_t(Load<uint32_t>(last + count_offset)) + Load<uint32_t>(row + count_offset);
+			if (key0 == last0 && key1 == last1 && sum <= NumericLimits<uint32_t>::Maximum()) {
+				Store<uint32_t>(uint32_t(sum), last + count_offset);
+				continue;
+			}
+			if (f == ROWS_PER_LINE) {
+				memcpy(cursor[p], line, LINE_ROW_BYTES);
+				cursor[p] += LINE_ROW_BYTES;
+				if (--room[p] == 0) {
+					// the chunk is full: seal it and take the next one now, so every later flush fits
+					auto full = lstate.tail[p];
+					Store<uint64_t>(LINES_PER_CHUNK * ROWS_PER_LINE, full + sizeof(data_ptr_t));
+					auto chunk = FusedTakeChunk(lstate);
+					Store<data_ptr_t>(chunk, full);
+					lstate.tail[p] = chunk;
+					cursor[p] = chunk + FusedIntegerAggregate::CHUNK_HEADER_BYTES;
+					room[p] = LINES_PER_CHUNK;
+				}
+				f = 0;
+			}
+		} else if (!cursor[p]) {
+			// the partition's first row: its first chunk
+			auto chunk = FusedTakeChunk(lstate);
+			lstate.head[p] = chunk;
+			lstate.tail[p] = chunk;
+			cursor[p] = chunk + FusedIntegerAggregate::CHUNK_HEADER_BYTES;
+			room[p] = LINES_PER_CHUNK;
+		}
+		memcpy(line + f * W, row, W);
+		fill[p] = UnsafeNumericCast<uint8_t>(f + 1);
+		appended++;
+	}
+	return appended;
+}
+
+static idx_t FusedAppendFold(FusedAggregateLocalState &lstate, idx_t row_width, idx_t count_offset,
+                             const FusedKeyShape &shape, idx_t count) {
+	auto rows = lstate.row_buffer.get();
+	auto hashes = lstate.hashes.get();
+	switch (row_width) {
+	case 8:
+		return FusedAppendFoldRows<8>(lstate, rows, hashes, count, count_offset, shape);
+	case 12:
+		return FusedAppendFoldRows<12>(lstate, rows, hashes, count, count_offset, shape);
+	case 16:
+		return FusedAppendFoldRows<16>(lstate, rows, hashes, count, count_offset, shape);
+	case 20:
+		return FusedAppendFoldRows<20>(lstate, rows, hashes, count, count_offset, shape);
+	case 24:
+		return FusedAppendFoldRows<24>(lstate, rows, hashes, count, count_offset, shape);
+	case 28:
+		return FusedAppendFoldRows<28>(lstate, rows, hashes, count, count_offset, shape);
+	case 32:
+		return FusedAppendFoldRows<32>(lstate, rows, hashes, count, count_offset, shape);
+	default:
+		throw InternalException("FusedAppendFold: unsupported compact row width %llu", row_width);
+	}
+}
+
 //! Moves every partial line into its partition's current chunk (always room for a line: never allocates)
 static void FusedFlushLines(FusedAggregateLocalState &lstate, idx_t row_width) {
 	for (idx_t p = 0; p < FusedIntegerAggregate::PARTITION_COUNT; p++) {
@@ -1188,6 +1603,39 @@ static idx_t FusedFoldRows(data_ptr_t rows, idx_t count, idx_t row_width, const 
 		if (kept != i) {
 			memcpy(rows + kept * row_width, row, row_width);
 		}
+		kept++;
+		previous0 = key0;
+		previous1 = key1;
+	}
+	return kept;
+}
+
+//! The last-key fold's chunk pass (the DISTINCT class's fold, carrying a count): every row's count is set to 1, and a row whose key words equal the
+//! previous kept row's adds its count to that row and is skipped. Compacts the row buffer in place; returns the rows kept
+//! (a count stays at most STANDARD_VECTOR_SIZE here)
+static idx_t FusedFoldCountRows(data_ptr_t rows, idx_t count, idx_t row_width, idx_t count_offset,
+                                const FusedKeyShape &shape) {
+	if (count == 0) {
+		return 0;
+	}
+	Store<uint32_t>(1, rows + count_offset);
+	uint64_t previous0, previous1;
+	FusedLoadKey(rows, shape, previous0, previous1);
+	auto kept_row = rows;
+	idx_t kept = 1;
+	for (idx_t i = 1; i < count; i++) {
+		const auto row = rows + i * row_width;
+		uint64_t key0, key1;
+		FusedLoadKey(row, shape, key0, key1);
+		if (key0 == previous0 && key1 == previous1) {
+			Store<uint32_t>(Load<uint32_t>(kept_row + count_offset) + 1, kept_row + count_offset);
+			continue;
+		}
+		kept_row = rows + kept * row_width;
+		if (kept != i) {
+			memcpy(kept_row, row, row_width);
+		}
+		Store<uint32_t>(1, kept_row + count_offset);
 		kept++;
 		previous0 = key0;
 		previous1 = key1;
@@ -1482,6 +1930,18 @@ static void FusedDrain(const FusedIntegerAggregate &fused, ExecutionContext &con
 		out.Reset();
 	};
 	auto append = [&](const_data_ptr_t rows, idx_t count) {
+		if (fused.last_key_fold) {
+			// a folded row re-sinks as its count's rows (exact: the fold takes COUNT-only shapes alone)
+			for (; count > 0; count--, rows += fused.row_width) {
+				for (auto repeat = Load<uint32_t>(rows + fused.run_length_offset); repeat > 0; repeat--) {
+					FusedScatterRows(fused, gstate, out, rows, 1);
+					if (out.size() == STANDARD_VECTOR_SIZE) {
+						flush();
+					}
+				}
+			}
+			return;
+		}
 		while (count > 0) {
 			const auto take = MinValue<idx_t>(count, STANDARD_VECTOR_SIZE - out.size());
 			FusedScatterRows(fused, gstate, out, rows, take);
@@ -1711,11 +2171,93 @@ static void FusedStoreHash(data_ptr_t rows, hash_t *hashes, idx_t count, idx_t r
 }
 
 //===--------------------------------------------------------------------===//
+// The bitmap class, phase 1
+//===--------------------------------------------------------------------===//
+//! Sets the chunk's code bits in the thread's bitmap (buffer-manager memory, allocated and zeroed at its first chunk): a
+//! vector over the published child reads its codes from its selection (code 0, a NULL row, is set here and excluded in
+//! phase 2); any other vector looks each non-NULL string up, a string the dictionary does not hold kept in the thread's
+//! overflow set
+static void FusedBitmapSink(const FusedIntegerAggregate &fused, DataChunk &chunk, FusedAggregateGlobalState &gstate,
+                            FusedAggregateLocalState &lstate) {
+	const idx_t count = chunk.size();
+	if (count == 0) {
+		return;
+	}
+	lstate.bitmap_rows += count;
+	if (!lstate.bitmap) {
+		const idx_t bytes = fused.bitmap_words * sizeof(uint64_t);
+		lstate.bitmap_handle = gstate.buffer_manager.Allocate(MemoryTag::HASH_TABLE, bytes, true);
+		lstate.bitmap = reinterpret_cast<uint64_t *>(lstate.bitmap_handle.Ptr());
+		memset(lstate.bitmap, 0, bytes);
+	}
+	auto bits = lstate.bitmap;
+	auto &dict = *fused.bitmap_dict;
+	auto &x = chunk.data[fused.columns[0].chunk_index];
+	if (x.GetVectorType() == VectorType::DICTIONARY_VECTOR && &DictionaryVector::Child(x) == &dict.child->data) {
+		auto &sel = DictionaryVector::SelVector(x);
+		for (idx_t i = 0; i < count; i++) {
+			const idx_t code = sel.get_index(i);
+			D_ASSERT(code < dict.count);
+			// a set bit is only read, so a run of one code (a hot value) stores nothing
+			const uint64_t mask = uint64_t(1) << (code & 63);
+			auto &word = bits[code >> 6];
+			if (!(word & mask)) {
+				word |= mask;
+			}
+		}
+		return;
+	}
+	lstate.bitmap_lookups += count;
+	UnifiedVectorFormat format;
+	x.ToUnifiedFormat(count, format);
+	auto strings = UnifiedVectorFormat::GetData<string_t>(format);
+	for (idx_t i = 0; i < count; i++) {
+		const auto idx = format.sel->get_index(i);
+		if (!format.validity.RowIsValid(idx)) {
+			continue;
+		}
+		auto &value = strings[idx];
+		const auto code = dict.Lookup(value, Hash(value));
+		if (code == dict_global::ColumnDictionary::INVALID_CODE) {
+			lstate.bitmap_overflow.insert(value.GetString());
+			continue;
+		}
+		bits[code >> 6] |= uint64_t(1) << (code & 63);
+	}
+}
+
+//! Combine: the thread's bitmap, overflow strings and input rows handed over under the lock
+static void FusedBitmapHandOver(FusedAggregateGlobalState &gstate, FusedAggregateLocalState &lstate) {
+	lock_guard<mutex> guard(gstate.lock);
+	gstate.input_rows += lstate.bitmap_rows;
+	gstate.bitmap_lookups += lstate.bitmap_lookups;
+	lstate.bitmap_rows = 0;
+	lstate.bitmap_lookups = 0;
+	if (lstate.bitmap) {
+		gstate.bitmaps.push_back(std::move(lstate.bitmap_handle));
+		lstate.bitmap = nullptr;
+	}
+	for (auto &text : lstate.bitmap_overflow) {
+		gstate.bitmap_overflow.insert(text);
+	}
+	lstate.bitmap_overflow.clear();
+}
+
+//===--------------------------------------------------------------------===//
 // Sink, Combine, Finalize
 //===--------------------------------------------------------------------===//
 bool FusedIntegerAggregate::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
                                  const PhysicalOperator &op, FusedAggregateGlobalState &gstate,
                                  FusedAggregateLocalState &lstate) const {
+	if (bitmap) {
+		if (gstate.abandoned) {
+			// this execution was refused at its start - the hash aggregate's Sink body takes the chunk
+			return false;
+		}
+		// the bitmap class never crosses, so every chunk stays in the fused path
+		FusedBitmapSink(*this, chunk, gstate, lstate);
+		return true;
+	}
 	if (lstate.resinking) {
 		return false;
 	}
@@ -1765,6 +2307,11 @@ bool FusedIntegerAggregate::Sink(ExecutionContext &context, DataChunk &chunk, Op
 	if (fold && !crossing) {
 		FusedGatherRows(*this, lstate, count);
 		append_count = FusedFoldRows(lstate.row_buffer.get(), count, row_width, FusedGetKeyShape(key_bytes));
+	} else if (last_key_fold && !crossing) {
+		// the last-key fold: the same, each kept row counting the rows it took
+		FusedGatherRows(*this, lstate, count);
+		append_count = FusedFoldCountRows(lstate.row_buffer.get(), count, row_width, run_length_offset,
+		                                  FusedGetKeyShape(key_bytes));
 	}
 	// (ii) the chunk's rows' bytes are reserved against the drain threshold; a reservation that would cross it is a
 	// crossing with nothing of the chunk appended. The companion's growth bytes are reserved with them (the
@@ -1853,7 +2400,7 @@ bool FusedIntegerAggregate::Sink(ExecutionContext &context, DataChunk &chunk, Op
 	auto rows = lstate.row_buffer.get();
 	if (fold) {
 		FusedM2Count(gstate.folded_rows, lstate, FUSED_M2_FOLDED_ROWS, count - append_count);
-	} else {
+	} else if (!last_key_fold) {
 		FusedGatherRows(*this, lstate, count);
 	}
 	if (run_kind) {
@@ -1872,6 +2419,18 @@ bool FusedIntegerAggregate::Sink(ExecutionContext &context, DataChunk &chunk, Op
 			FusedLoadKey(rows + i * row_width, shape, key0, key1);
 			hashes[i] = FusedHashKey(key0, key1, shape.two_words);
 		}
+	}
+	if (last_key_fold) {
+		// the rows the partition fold took return their reserved bytes
+		const auto appended = FusedAppendFold(lstate, row_width, run_length_offset, shape, append_count);
+		const idx_t unused = (append_count - appended) * row_width;
+		if (fused_local_allowance) {
+			FusedM2Words(lstate)[FUSED_M2_ALLOWANCE] += unused;
+		} else {
+			gstate.reserved_bytes -= unused;
+		}
+		FusedM2Count(gstate.folded_rows, lstate, FUSED_M2_FOLDED_ROWS, count - appended);
+		return true;
 	}
 	FusedAppend(lstate, row_width, append_count);
 	return true;
@@ -2005,6 +2564,15 @@ static bool FusedHandOver(const FusedIntegerAggregate &fused, FusedAggregateGlob
 bool FusedIntegerAggregate::Combine(ExecutionContext &context, OperatorSinkInput &input,
                                     const PhysicalOperator &op, FusedAggregateGlobalState &gstate,
                                     FusedAggregateLocalState &lstate) const {
+	if (bitmap) {
+		if (gstate.abandoned) {
+			// refused at its start - no bitmap to hand over; the hash aggregate's Combine runs
+			return false;
+		}
+		// no allowance words, no partition lists
+		FusedBitmapHandOver(gstate, lstate);
+		return true;
+	}
 	// the state is done sinking: its unused allowance and counters go to the global state before every path below
 	FusedM2Flush(gstate, lstate);
 	if (run_kind) {
@@ -2036,6 +2604,18 @@ bool FusedIntegerAggregate::CombineRuns(ClientContext &context, const PhysicalHa
 }
 
 bool FusedIntegerAggregate::Finalize(FusedAggregateGlobalState &gstate) const {
+	if (bitmap) {
+		if (gstate.abandoned) {
+			// refused at its start - every row is in the hash aggregate's states; FinalizeDistinct runs
+			return false;
+		}
+		// phase 2's stripes, counted in partitions_nonempty (the source's MaxThreads reads it); none without a
+		// bitmap, and then one source task emits the overflow count alone
+		gstate.partitions_nonempty =
+		    gstate.bitmaps.empty() ? 0 : (bitmap_words + BITMAP_STRIPE_WORDS - 1) / BITMAP_STRIPE_WORDS;
+		gstate.finalized = true;
+		return true;
+	}
 	if (gstate.abandoned) {
 		if (!gstate.handed_over.empty()) {
 			throw InternalException("Fused integer aggregate: partition lists left behind by the drain");
@@ -2234,8 +2814,9 @@ static void FusedBuildTable(const FusedIntegerAggregate &fused, FusedAggregateGl
 	lstate.occupancy = 0;
 	const auto shape = FusedGetKeyShape(fused.key_bytes);
 	const auto row_width = fused.row_width;
-	// the run kind folds each row's run length (a new entry starts at it, a hit adds it); the ordinary kind 1 / +1
-	const bool run_kind = fused.run_kind;
+	// the run kind folds each row's run length (a new entry starts at it, a hit adds it); the ordinary kind 1 / +1; so
+	// does a last-key-folded row's count
+	const bool run_kind = fused.run_kind || fused.last_key_fold;
 	const auto run_length_offset = fused.run_length_offset;
 	FusedRowColumn sum_input[FusedIntegerAggregate::MAXIMUM_AGGREGATES];
 	for (idx_t s = 0; s < sums; s++) {
@@ -2314,6 +2895,9 @@ static FUSED_NOINLINE void FusedBuildTableStored(const FusedIntegerAggregate &fu
 	const auto shape = FusedGetKeyShape(fused.key_bytes);
 	const auto row_width = fused.row_width;
 	const auto hash_offset = fused.hash_offset;
+	// a last-key-folded row's count (a new entry starts at it, a hit adds it)
+	const bool counted = fused.last_key_fold;
+	const auto run_length_offset = fused.run_length_offset;
 	FusedRowColumn sum_input[FusedIntegerAggregate::MAXIMUM_AGGREGATES];
 	for (idx_t s = 0; s < sums; s++) {
 		sum_input[s] = fused.columns[fused.sum_columns[s]];
@@ -2347,7 +2931,7 @@ static FUSED_NOINLINE void FusedBuildTableStored(const FusedIntegerAggregate &fu
 							if (shape.two_words) {
 								entry[1] = key1[j];
 							}
-							entry[count_word] = 1;
+							entry[count_word] = counted ? uint64_t(Load<uint32_t>(row + run_length_offset)) : 1;
 							for (idx_t s = 0; s < sums; s++) {
 								entry[count_word + 1 + s] = uint64_t(FusedLoadInput(row, sum_input[s]));
 							}
@@ -2357,7 +2941,7 @@ static FUSED_NOINLINE void FusedBuildTableStored(const FusedIntegerAggregate &fu
 							break;
 						}
 						if (entry[0] == key0[j] && (!shape.two_words || entry[1] == key1[j])) {
-							entry[count_word]++;
+							entry[count_word] += counted ? uint64_t(Load<uint32_t>(row + run_length_offset)) : 1;
 							for (idx_t s = 0; s < sums; s++) {
 								entry[count_word + 1 + s] += uint64_t(FusedLoadInput(row, sum_input[s]));
 							}
@@ -2508,6 +3092,9 @@ static FUSED_NOINLINE void FusedChainBuild(const FusedIntegerAggregate &fused, F
 	const auto shape = FusedGetKeyShape(fused.key_bytes);
 	const auto row_width = fused.row_width;
 	const auto hash_offset = fused.hash_offset;
+	// a last-key-folded row's count (a new group starts at it, a duplicate adds it)
+	const bool counted = fused.last_key_fold;
+	const auto run_length_offset = fused.run_length_offset;
 	FusedRowColumn sum_input[FusedIntegerAggregate::MAXIMUM_AGGREGATES];
 	for (idx_t s = 0; s < sums; s++) {
 		sum_input[s] = fused.columns[fused.sum_columns[s]];
@@ -2534,7 +3121,7 @@ static FUSED_NOINLINE void FusedChainBuild(const FusedIntegerAggregate &fused, F
 					ordinal = uint32_t(link);
 				}
 				if (group) {
-					group[2]++;
+					group[2] += counted ? uint64_t(Load<uint32_t>(row + run_length_offset)) : 1;
 					for (idx_t s = 0; s < sums; s++) {
 						group[3 + s] += uint64_t(FusedLoadInput(row, sum_input[s]));
 					}
@@ -2548,7 +3135,7 @@ static FUSED_NOINLINE void FusedChainBuild(const FusedIntegerAggregate &fused, F
 				group = groups + group_count * words;
 				group[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(row));
 				group[1] = (uint64_t(stored) << 32) | head;
-				group[2] = 1;
+				group[2] = counted ? uint64_t(Load<uint32_t>(row + run_length_offset)) : 1;
 				for (idx_t s = 0; s < sums; s++) {
 					group[3 + s] = uint64_t(FusedLoadInput(row, sum_input[s]));
 				}
@@ -3195,8 +3782,232 @@ static SourceResultType FusedChainScan(const FusedIntegerAggregate &fused, DataC
 	return count == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
 }
 
+//===--------------------------------------------------------------------===//
+// The bitmap class, phase 2
+//===--------------------------------------------------------------------===//
+static inline idx_t FusedPopCount(uint64_t word) {
+#if defined(__GNUC__) || defined(__clang__)
+	return idx_t(__builtin_popcountll(word));
+#else
+	idx_t result = 0;
+	for (; word; word &= word - 1) {
+		result++;
+	}
+	return result;
+#endif
+}
+
+//! Each task ORs the threads' bitmaps over the stripes it claims and counts the bits, code 0 (the NULL slot) excluded;
+//! the task that brings tasks_done up to tasks_started emits the one row, the bits counted plus the distinct overflow
+//! strings (the DISTINCT class's merge rule: every task counts itself before its first claim, so every claimed stripe
+//! is counted by a task that is done by then, and the row is emitted once)
+static SourceResultType FusedBitmapGetData(const FusedIntegerAggregate &fused, DataChunk &chunk,
+                                           FusedAggregateGlobalState &gstate, OperatorSourceInput &input) {
+	auto &source = input.global_state.Cast<FusedAggregateGlobalSourceState>();
+	auto &lstate = input.local_state.Cast<FusedAggregateLocalSourceState>();
+	if (lstate.emit_done) {
+		return SourceResultType::FINISHED;
+	}
+	lstate.emit_done = true;
+	{
+		lock_guard<mutex> guard(source.merge_lock);
+		source.tasks_started++;
+	}
+	const idx_t stripes = gstate.partitions_nonempty.load();
+	vector<const uint64_t *> sources;
+	for (auto &handle : gstate.bitmaps) {
+		sources.push_back(reinterpret_cast<const uint64_t *>(handle.Ptr()));
+	}
+	uint64_t acc[FusedIntegerAggregate::BITMAP_STRIPE_WORDS];
+	idx_t bits = 0;
+	while (true) {
+		const idx_t stripe = source.next_partition++;
+		if (stripe >= stripes) {
+			break;
+		}
+		source.claimed++;
+		const idx_t begin = stripe * FusedIntegerAggregate::BITMAP_STRIPE_WORDS;
+		const idx_t words = MinValue<idx_t>(FusedIntegerAggregate::BITMAP_STRIPE_WORDS, fused.bitmap_words - begin);
+		memcpy(acc, sources[0] + begin, words * sizeof(uint64_t));
+		for (idx_t t = 1; t < sources.size(); t++) {
+			auto src = sources[t] + begin;
+			for (idx_t w = 0; w < words; w++) {
+				acc[w] |= src[w];
+			}
+		}
+		if (begin == 0) {
+			acc[0] &= ~uint64_t(1);
+		}
+		if (begin + words == fused.bitmap_words && (fused.bitmap_dict->count & 63) != 0) {
+			// the last word's bits at or beyond the code count (the marker's padding_bits; every code is
+			// below the count, so none is ever set)
+			gstate.bitmap_padding_bits += FusedPopCount(acc[words - 1] >> (fused.bitmap_dict->count & 63));
+		}
+		for (idx_t w = 0; w < words; w++) {
+			bits += FusedPopCount(acc[w]);
+		}
+	}
+	idx_t total;
+	{
+		lock_guard<mutex> guard(source.merge_lock);
+		source.distinct_entries += bits;
+		source.tasks_done++;
+		if (source.tasks_done != source.tasks_started || source.merged) {
+			return SourceResultType::FINISHED;
+		}
+		source.merged = true;
+		source.merge_done = true;
+		total = source.distinct_entries;
+	}
+	total += gstate.bitmap_overflow.size();
+	chunk.SetCardinality(1);
+	FlatVector::GetData<int64_t>(chunk.data[0])[0] = NumericCast<int64_t>(total);
+	return SourceResultType::FINISHED;
+}
+
+//===--------------------------------------------------------------------===//
+// The set member of the DISTINCT class, phase 2
+//===--------------------------------------------------------------------===//
+//! Doubles the task's set past half load (more than 2^20 distinct x in one of 4096 partitions), re-inserting every key
+static void FusedGrowSet(FusedAggregateLocalSourceState &lstate) {
+	const auto old_capacity = lstate.capacity;
+	BufferHandle old_handle = std::move(lstate.handle);
+	auto old_table = lstate.table;
+	lstate.capacity = old_capacity * 2;
+	lstate.table_bits = FusedTableBits(lstate.capacity);
+	FusedAllocateTable(lstate, lstate.capacity, 1);
+	const auto mask = lstate.capacity - 1;
+	for (idx_t slot = 0; slot < old_capacity; slot++) {
+		const auto key = old_table[slot];
+		if (key == 0) {
+			continue;
+		}
+		auto target = FusedSlotOf(FusedHashKey(key, 0, false), lstate.table_bits);
+		while (lstate.table[target] != 0) {
+			target = (target + 1) & mask;
+		}
+		lstate.table[target] = key;
+	}
+}
+
+//! Counts partition p's distinct x: every row of every handed-over list is inserted into an open-addressing set of its
+//! key word alone (x's bytes, read in place), sized once at next_pow2(2 x rows) in [TABLE_MINIMUM_CAPACITY,
+//! TABLE_MAXIMUM_CAPACITY] and doubled past half load. The key word 0 marks an empty slot, so x = 0 is counted by a flag.
+//! A new key counts at its insert, so the set is never scanned; it is cleared (all-zero) for the next partition
+static FUSED_NOINLINE idx_t FusedBuildSet(const FusedIntegerAggregate &fused, FusedAggregateGlobalState &gstate,
+                                          FusedAggregateLocalSourceState &lstate, idx_t p) {
+	const auto rows = gstate.partition_rows[p];
+	idx_t capacity = NextPowerOfTwo(MaxValue<idx_t>(FusedIntegerAggregate::TABLE_MINIMUM_CAPACITY, 2 * rows));
+	capacity = MinValue<idx_t>(capacity, FusedIntegerAggregate::TABLE_MAXIMUM_CAPACITY);
+	if (capacity > lstate.buffer_entries) {
+		lstate.handle.Destroy();
+		lstate.table = nullptr;
+		FusedAllocateTable(lstate, capacity, 1);
+	}
+	lstate.capacity = capacity;
+	lstate.table_bits = FusedTableBits(capacity);
+	const auto shape = FusedGetKeyShape(fused.key_bytes);
+	const auto row_width = fused.row_width;
+	idx_t occupancy = 0;
+	bool zero = false;
+	uint64_t key[FusedIntegerAggregate::TABLE_BATCH];
+	hash_t hash[FusedIntegerAggregate::TABLE_BATCH];
+	for (auto &lists : gstate.handed_over) {
+		for (auto chunk = lists->heads[p]; chunk; chunk = FusedChunkNext(chunk)) {
+			const auto chunk_rows = FusedChunkRows(chunk);
+			const auto base = chunk + FusedIntegerAggregate::CHUNK_HEADER_BYTES;
+			for (idx_t batch_start = 0; batch_start < chunk_rows; batch_start += FusedIntegerAggregate::TABLE_BATCH) {
+				const auto batch = MinValue<idx_t>(FusedIntegerAggregate::TABLE_BATCH, chunk_rows - batch_start);
+				const auto batch_rows = base + batch_start * row_width;
+				for (idx_t j = 0; j < batch; j++) {
+					uint64_t unused;
+					FusedLoadKey(batch_rows + j * row_width, shape, key[j], unused);
+					hash[j] = FusedHashKey(key[j], 0, false);
+					FUSED_PREFETCH_WRITE(lstate.table + FusedSlotOf(hash[j], lstate.table_bits));
+				}
+				for (idx_t j = 0; j < batch; j++) {
+					if (key[j] == 0) {
+						zero = true;
+						continue;
+					}
+					const auto mask = lstate.capacity - 1;
+					auto slot = FusedSlotOf(hash[j], lstate.table_bits);
+					while (true) {
+						const auto present = lstate.table[slot];
+						if (present == key[j]) {
+							break;
+						}
+						if (present == 0) {
+							lstate.table[slot] = key[j];
+							if (++occupancy * 2 > lstate.capacity) {
+								FusedGrowSet(lstate);
+							}
+							break;
+						}
+						slot = (slot + 1) & mask;
+					}
+				}
+			}
+		}
+	}
+	memset(lstate.table, 0, lstate.capacity * sizeof(uint64_t));
+	return occupancy + (zero ? 1 : 0);
+}
+
+//! The set member's source: each task counts itself before its first claim, then counts the distinct x of every
+//! partition it claims (FusedBuildSet); the task that brings tasks_done up to tasks_started emits the one row, the sum
+//! (the merge rule of the bitmap class: every claimed partition is counted by a task that is done by then)
+static SourceResultType FusedSetGetData(const FusedIntegerAggregate &fused, DataChunk &chunk,
+                                        FusedAggregateGlobalState &gstate, OperatorSourceInput &input) {
+	auto &source = input.global_state.Cast<FusedAggregateGlobalSourceState>();
+	auto &lstate = input.local_state.Cast<FusedAggregateLocalSourceState>();
+	if (lstate.emit_done) {
+		return SourceResultType::FINISHED;
+	}
+	lstate.emit_done = true;
+	{
+		lock_guard<mutex> guard(source.merge_lock);
+		source.tasks_started++;
+	}
+	idx_t distinct = 0;
+	while (true) {
+		idx_t p;
+		do {
+			p = source.next_partition++;
+		} while (p < FusedIntegerAggregate::PARTITION_COUNT && gstate.partition_rows[p] == 0);
+		if (p >= FusedIntegerAggregate::PARTITION_COUNT) {
+			break;
+		}
+		source.claimed++;
+		distinct += FusedBuildSet(fused, gstate, lstate, p);
+	}
+	idx_t total;
+	{
+		lock_guard<mutex> guard(source.merge_lock);
+		source.distinct_entries += distinct;
+		source.tasks_done++;
+		if (source.tasks_done != source.tasks_started || source.merged) {
+			return SourceResultType::FINISHED;
+		}
+		source.merged = true;
+		source.merge_done = true;
+		source.groups = 1;
+		source.tasks_merged = source.tasks_done;
+		total = source.distinct_entries;
+	}
+	chunk.SetCardinality(1);
+	FlatVector::GetData<int64_t>(chunk.data[0])[0] = NumericCast<int64_t>(total);
+	return SourceResultType::FINISHED;
+}
+
 SourceResultType FusedIntegerAggregate::GetData(ExecutionContext &context, DataChunk &chunk,
                                                 FusedAggregateGlobalState &gstate, OperatorSourceInput &input) const {
+	if (bitmap) {
+		return FusedBitmapGetData(*this, chunk, gstate, input);
+	}
+	if (distinct_set) {
+		return FusedSetGetData(*this, chunk, gstate, input);
+	}
 	if (distinct) {
 		return FusedDistinctGetData(*this, chunk, gstate, input);
 	}
@@ -3265,7 +4076,30 @@ ProgressData FusedIntegerAggregate::GetProgress(FusedAggregateGlobalState &gstat
 //===--------------------------------------------------------------------===//
 string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalState> gstate,
                                            OrderPreservationType source_order) const {
-	string result = "keys=" + to_string(key_count) + (distinct ? " distinct=1" : "") +
+	if (bitmap) {
+		// the bitmap class's marker: the class, its code domain and words; with a sink state, the input rows, the threads' bitmaps
+		// and the distinct overflow strings
+		string result = "bitmap=1 codes=" + to_string(bitmap_dict->count) + " words=" + to_string(bitmap_words) +
+		                " budget_mib=" + to_string(budget_bytes >> 20);
+		if (gstate) {
+			// this execution's re-check of the coverage bound
+			result += string(" engaged=") + (gstate->bitmap_engaged ? "1" : "0") +
+			          " refusal=" + FusedBitmapRefusalName(gstate->bitmap_refusal);
+			result += " input_rows=" + to_string(gstate->input_rows.load()) +
+			          " lookup_rows=" + to_string(gstate->bitmap_lookups) +
+			          " bitmaps=" + to_string(gstate->bitmaps.size()) +
+			          " overflow=" + to_string(gstate->bitmap_overflow.size());
+			// the overflow strings' bytes and the last word's padding bits (both 0 under the coverage bound)
+			idx_t overflow_bytes = 0;
+			for (auto &text : gstate->bitmap_overflow) {
+				overflow_bytes += text.size();
+			}
+			result += " overflow_bytes=" + to_string(overflow_bytes) +
+			          " padding_bits=" + to_string(gstate->bitmap_padding_bits.load());
+		}
+		return result;
+	}
+	string result = "keys=" + to_string(key_count) + (distinct ? " distinct=1" : "") + (distinct_set ? " set=1" : "") +
 	                " aggregates=" + to_string(outputs.size()) + " partitions=" + to_string(PARTITION_COUNT) +
 	                " budget_mib=" + to_string(budget_bytes >> 20);
 	if (hash_stored) {
@@ -3281,10 +4115,14 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 		}
 	}
 	result += run_kind ? " kind=run" : " kind=rows";
+	if (last_key_fold) {
+		// phase 1 folds a row into its partition's last row
+		result += " fold=last_key";
+	}
 	result += fused_atomic_reserve ? " reserve=ldadd" : " reserve=cas";
 	if (gstate) {
 		result += " input_rows=" + to_string(gstate->input_rows.load());
-		if (distinct) {
+		if (distinct || last_key_fold) {
 			result += " folded_rows=" + to_string(gstate->folded_rows.load());
 		}
 		if (mixed) {
@@ -3310,6 +4148,10 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 
 InsertionOrderPreservingMap<string> FusedIntegerAggregate::ExtraSourceParams(GlobalSourceState &source_state) const {
 	InsertionOrderPreservingMap<string> result;
+	if (bitmap) {
+		// no phase-2 counters beyond the marker's
+		return result;
+	}
 	auto &source = source_state.Cast<FusedAggregateGlobalSourceState>();
 	if (!distinct) {
 		return result;

@@ -181,7 +181,7 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		    op.orders.size() == 1 ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_GREATERTHANOREQUALTO;
 	}
 	Value minimum_value = type.InternalType() == PhysicalType::VARCHAR ? Value("") : Value::MinimumValue(type);
-	auto base_filter = make_uniq<ConstantFilter>(comparison_type, std::move(minimum_value));
+	auto base_filter = DynamicFilterData::CreateBound(comparison_type, std::move(minimum_value));
 	auto filter_data = make_shared_ptr<DynamicFilterData>();
 	filter_data->filter = std::move(base_filter);
 

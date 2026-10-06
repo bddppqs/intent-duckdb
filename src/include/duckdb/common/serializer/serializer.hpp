@@ -34,6 +34,8 @@ public:
 
 	bool serialize_enum_as_string = false;
 	bool serialize_default_values = false;
+	//! Whether VARCHAR statistics write their minimum non-empty value (only into a file whose version carries it)
+	bool write_string_min_nonempty = false;
 	SerializationCompatibility serialization_compatibility = SerializationCompatibility::Default();
 };
 

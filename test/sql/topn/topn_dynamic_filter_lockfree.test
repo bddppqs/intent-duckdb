@@ -1,0 +1,103 @@
+# name: test/sql/topn/topn_dynamic_filter_lockfree.test
+# description: Top-N bounds whose scans read them without the bound's lock (kTopNBoundLockFree): the row-wise bound (TIMESTAMP, BIGINT descending, two keys), the zonemap re-check, the DICT_FSST domain walk over a VARCHAR bound, a bound on the probe side of a join, a bound below a DISTINCT (its scan runs in the aggregate's pipeline, before the Top-N's) and below a UNION ALL (two pipelines into one Top-N), and twenty re-executions of four prepared plans (each execution resets and re-publishes the bound); 16 threads; every answer equals the same rows taken by an ordered list aggregate, which pushes no bound
+# group: [topn]
+
+load __TEST_DIR__/topn_dynamic_filter_lockfree.db
+
+statement ok
+CREATE TABLE lf AS SELECT i AS id, TIMESTAMP '2000-01-01 00:00:00' + to_seconds(((i * 7919) % 1000003)::BIGINT) AS ts, ((i * 104729) % 1000003)::BIGINT AS k, CASE WHEN i % 7 = 0 THEN '' ELSE 'item ' || ((i * 31) % 20011)::VARCHAR END AS s, CASE WHEN i % 20011 = 7 THEN 'needle/' || i::VARCHAR ELSE 'hay/' || (i % 5000)::VARCHAR END AS tag FROM range(2000000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+SET threads = 16
+
+# a rare match: the bound is published late, after most scans started
+query I nosort rare_ts
+SELECT unnest((list(ts ORDER BY ts))[1:5]) FROM lf WHERE tag LIKE '%needle%'
+----
+
+query I nosort rare_ts
+SELECT ts FROM lf WHERE tag LIKE '%needle%' ORDER BY ts LIMIT 5
+----
+
+query I nosort k_desc
+SELECT unnest((list(k ORDER BY k DESC))[1:7]) FROM lf
+----
+
+query I nosort k_desc
+SELECT k FROM lf ORDER BY k DESC LIMIT 7
+----
+
+query I nosort s_asc
+SELECT unnest((list(s ORDER BY s))[1:9]) FROM lf WHERE s <> ''
+----
+
+query I nosort s_asc
+SELECT s FROM lf WHERE s <> '' ORDER BY s LIMIT 9
+----
+
+query II nosort ts_s
+SELECT unnest((list(ts ORDER BY ts, s))[1:8]), unnest((list(s ORDER BY ts, s))[1:8]) FROM lf WHERE s <> ''
+----
+
+query II nosort ts_s
+SELECT ts, s FROM lf WHERE s <> '' ORDER BY ts, s LIMIT 8
+----
+
+query I nosort join_k
+SELECT unnest((list(k ORDER BY k))[1:6]) FROM lf WHERE id % 3 = 0 AND id IN (SELECT id FROM lf WHERE id % 2 = 0)
+----
+
+query I nosort join_k
+SELECT b.k FROM lf a JOIN (SELECT id, k FROM lf WHERE id % 3 = 0) b ON a.id = b.id WHERE a.id % 2 = 0 ORDER BY b.k LIMIT 6
+----
+
+query I nosort dist_k
+SELECT unnest((list(k ORDER BY k))[1:5]) FROM (SELECT DISTINCT k FROM lf WHERE id % 3 = 0)
+----
+
+query I nosort dist_k
+SELECT DISTINCT k FROM lf WHERE id % 3 = 0 ORDER BY k LIMIT 5
+----
+
+query I nosort union_k
+SELECT unnest((list(k ORDER BY k DESC))[1:5]) FROM lf
+----
+
+query I nosort union_k
+SELECT k FROM (SELECT k FROM lf WHERE id % 2 = 0 UNION ALL SELECT k FROM lf WHERE id % 2 = 1) ORDER BY k DESC LIMIT 5
+----
+
+statement ok
+PREPARE rare AS SELECT ts FROM lf WHERE tag LIKE '%needle%' ORDER BY ts LIMIT 5
+
+statement ok
+PREPARE dom AS SELECT s FROM lf WHERE s <> '' ORDER BY s LIMIT 9
+
+statement ok
+PREPARE joined AS SELECT b.k FROM lf a JOIN (SELECT id, k FROM lf WHERE id % 3 = 0) b ON a.id = b.id WHERE a.id % 2 = 0 ORDER BY b.k LIMIT 6
+
+statement ok
+PREPARE dist AS SELECT DISTINCT k FROM lf WHERE id % 3 = 0 ORDER BY k LIMIT 5
+
+loop i 0 20
+
+query I nosort rare_ts
+EXECUTE rare
+----
+
+query I nosort s_asc
+EXECUTE dom
+----
+
+query I nosort join_k
+EXECUTE joined
+----
+
+query I nosort dist_k
+EXECUTE dist
+----
+
+endloop

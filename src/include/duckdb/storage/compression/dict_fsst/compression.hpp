@@ -45,6 +45,13 @@ public:
 	bool AllUnique() const;
 	void FlushEncodingBuffer();
 	idx_t CalculateRequiredSpace() const;
+	//! The bytes of the segment's own block that its local codes of `indices_space` bytes take: none once the segment
+	//! is split by its region (its settled region, which only grows, has reached the threshold after the dictionary's
+	//! encoding decision; its codes go to the code block, which holds at most one block of them), `indices_space`
+	//! otherwise
+	idx_t CodesInBlock(idx_t indices_space) const;
+	//! The dictionary region of the entries already in the segment's block (pending entries not counted)
+	idx_t SettledRegion() const;
 	DictionaryAppendState TryEncode();
 
 	bool CompressInternal(UnifiedVectorFormat &vector_format, const string_t &str, bool is_null,
@@ -52,6 +59,18 @@ public:
 	void Compress(Vector &scan_vector, idx_t count);
 	void FinalizeCompress();
 	void Flush(bool final);
+	//! The per-row append of `count` rows of a unified vector
+	void CompressRows(UnifiedVectorFormat &vector_format, idx_t count);
+	//! Append a vector of the row group whole, ending the segment before it when it does not fit
+	void CommitVector(UnifiedVectorFormat &vector_format, idx_t count);
+	//! Append `count` rows (lazy encoding of pending entries included); on a row that does not fit, undo the
+	//! vector's rows by truncation and fail
+	bool TryAppendVector(UnifiedVectorFormat &vector_format, idx_t count);
+	void RecordMapInsert(idx_t slot) {
+		if (map_slots_recording && slot != DConstants::INVALID_INDEX) {
+			map_slots.push_back(slot);
+		}
+	}
 
 public:
 	ColumnDataCheckpointData &checkpoint_data;
@@ -93,6 +112,28 @@ public:
 
 	//! How many values have we compressed so far?
 	idx_t total_tuple_count = 0;
+
+	//! The segment being flushed ends on a vector boundary short of its block (CommitVector): it is written as
+	//! a whole block, its tail zeroed, never held open as a partial block
+	bool flush_whole_block = false;
+	//! While a vector is appended on trial: the map slots it inserts
+	bool map_slots_recording = false;
+	vector<idx_t> map_slots;
+
+	//! Split segments: the open code block of local codes, its buffer, the bytes used and the segments using it
+	bool split_segments = false;
+	//! the segment being flushed is split: it has local codes and a dictionary of at least a quarter block (a smaller
+	//! dictionary is read with its codes, as before - the split would only add a code block)
+	bool split_this_segment = false;
+	block_id_t code_block = INVALID_BLOCK;
+	unsafe_unique_array<data_t> code_buffer;
+	idx_t code_used = 0;
+	idx_t code_segments = 0;
+	//! Pack the flushed segment's local codes into the open code block (opening one when they do not fit) and record
+	//! where they are on the segment
+	void SplitCodesOf(ColumnSegment &segment);
+	//! Write the open code block, if any
+	void WriteCodeBlock();
 
 private:
 	void *encoder = nullptr;

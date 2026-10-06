@@ -9,6 +9,8 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/storage/storage_extension.hpp"
+#include "duckdb/storage/storage_manager.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/exception/parser_exception.hpp"
 #include "duckdb/common/path.hpp"
@@ -898,6 +900,8 @@ bool DBConfig::CanAccessFile(const string &input_path, FileType type) {
 
 SerializationOptions::SerializationOptions(AttachedDatabase &db) {
 	serialization_compatibility = SerializationCompatibility::FromDatabase(db);
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&db.GetStorageManager().GetBlockManager());
+	write_string_min_nonempty = single_file && single_file->WritesStringMinNonEmpty();
 }
 
 SerializationCompatibility SerializationCompatibility::FromDatabase(AttachedDatabase &db) {

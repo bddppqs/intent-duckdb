@@ -1,0 +1,120 @@
+# name: test/sql/aggregate/group/fused_computed_group_key.test
+# description: The fused kernel's grouped class admits a compress over a computed key of one column - minute, hour,
+#              second, year, dayofyear and arithmetic keys, alone, first, beside a BIGINT key, in a three-key 13-byte
+#              shape, beside count(x)/sum(x), range edges at 254/256 (INTEGER and SMALLINT) - and refuses date_trunc (a
+#              TIMESTAMP, never compressed), a key over a column with NULLs, a key whose range cannot be bounded (an
+#              'infinity' timestamp) and one with no statistics callback. Every expected answer is upstream DuckDB
+#              1.5.5's on the same table
+# group: [group]
+
+statement ok
+CREATE TABLE tc AS SELECT ((i % 100003) * 4294967311)::BIGINT AS k, ((i % 1000003) * 7919 % 2147483647)::INTEGER AS v, TIMESTAMP '2019-07-01 00:00:00' + to_seconds((i * 37) % 31622400) AS ts, (CASE WHEN i % 1000 = 7 THEN NULL ELSE TIMESTAMP '2019-07-01 00:00:00' + to_seconds((i * 37) % 31622400) END) AS tn, (CASE WHEN i % 1000 = 7 THEN 'infinity'::TIMESTAMP ELSE TIMESTAMP '2019-07-01 00:00:00' + to_seconds((i * 37) % 31622400) END) AS ti, (i % 128)::INTEGER AS s, (i % 129)::INTEGER AS s2, (i % 129)::SMALLINT AS s3, (i % 1000)::INTEGER AS w, (i % 100003)::BIGINT AS b FROM range(2200000) t(i)
+
+foreach threads 1 8
+
+statement ok
+SET threads=${threads}
+
+# minute(ts) beside a BIGINT key: 9 key bytes (8 + a 0-59 minute compressed to UTINYINT)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, minute(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20288588576282395420095474
+
+# hour(ts) beside a BIGINT key
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, hour(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2073192	2200000	1	2	0	23	19118348281695391310284412
+
+# second(ts) beside a BIGINT key
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, second(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20297170896345880707839555
+
+# minute(ts) alone: 60 groups, the planner's perfect-hash aggregate (no hash aggregate to attach to)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(g, c))::HUGEINT FROM (SELECT minute(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+60	2200000	36666	36669	0	59	583974279466405965551
+
+# b * 3 alone: one computed key, a BIGINT product (0-300006) compressed to UINTEGER
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(g, c))::HUGEINT FROM (SELECT b * 3 AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+100003	2200000	21	22	0	300006	923923345244715460574093
+
+# BIGINT + minute(ts) + INTEGER = 13 key bytes, three keys (the 16-byte region)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, v, c))::HUGEINT FROM (SELECT k AS k, minute(ts) AS g, v AS v, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20287808634834378231072111
+
+# the computed key first
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(g, k, c))::HUGEINT FROM (SELECT minute(ts) AS g, k AS k, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20286237485268314522347011
+
+# year(ts): the function's statistics from the column's minimum and maximum (2019-2020), compressed with a constant
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, year(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+200006	2200000	8	14	2019	2020	1840619902682884963493319
+
+# dayofyear(ts): 1-366, a range past 255, compressed to USMALLINT (2 key bytes)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, dayofyear(ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	1	365	20305750438363516200808686
+
+# an arithmetic computed key, s * 2 over INTEGER 0-127: 0-254, the UTINYINT edge
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, s * 2 AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	254	20280828273993297597587477
+
+# s2 * 2 over INTEGER 0-128: 0-256, one past the UTINYINT edge (USMALLINT)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, s2 * 2 AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	256	20290620101881670596016055
+
+# s3 * 2 over SMALLINT 0-128: 0-256 has no narrower type, so no compress is planned; a bare computed key, refused
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, s3 * 2 AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	256	20290620101881670596016055
+
+# minute(ts) with count(w) and sum(s) beside count(*)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c, cw, ss))::HUGEINT FROM (SELECT k AS k, minute(ts) AS g, count(*) AS c, count(w) AS cw, sum(s) AS ss FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20277013124653747942680078
+
+# date_trunc('hour', ts): a TIMESTAMP key, never compressed, so refused (the generic aggregate answers)
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, date_trunc('hour', ts) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	2019-07-01 00:00:00	2020-06-30 23:00:00	20302707145290379470327914
+
+# minute(tn) over a column with NULLs: the key can hold NULL, refused
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, minute(tn) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20288537041104988587697566
+
+# minute(ti) over a column holding 'infinity': the function's range cannot be bounded (an infinity's minute is NULL), refused
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, minute(ti) AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+2200000	2200000	1	1	0	59	20288537041104988587697566
+
+# w // 7: no statistics callback, so no bounded range and no compress; refused
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), min(g), max(g), sum(hash(k, g, c))::HUGEINT FROM (SELECT k AS k, w // 7 AS g, count(*) AS c FROM tc GROUP BY ALL)
+----
+1000900	2200000	1	3	0	142	9230742926312447768011033
+
+endloop

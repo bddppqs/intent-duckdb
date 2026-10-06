@@ -23,10 +23,9 @@
 #include "duckdb/function/variant/variant_shredding.hpp"
 #include "duckdb/storage/table/geo_column_data.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 #include "duckdb/storage/compression/dict_fsst/decompression.hpp"
 #include "duckdb/common/tuning_defaults.hpp"
-
-#include <cstdlib>
 
 namespace duckdb {
 
@@ -133,6 +132,17 @@ ScanVectorType ColumnData::GetVectorScanType(ColumnScanState &state, idx_t scan_
 		// if we have updates we need to merge in the updates
 		// always need to scan flat vectors
 		return ScanVectorType::SCAN_FLAT_VECTOR;
+	}
+	if (kVectorAlignedDictionarySegments && state.current &&
+	    state.offset_in_column == state.current->GetRowStart() + state.current->GetNode().count) {
+		auto next = data.GetNextSegment(*state.current);
+		if (next) {
+			// the current segment is exhausted; a vector-aligned writer starts the vector in the next segment (initialised
+			// at its first read)
+			state.current = next;
+			state.initialized = false;
+			state.segment_checked = false;
+		}
 	}
 	// check if the current segment has enough data remaining
 	auto &current = state.current->GetNode();
@@ -248,7 +258,12 @@ bool ColumnData::TryScanGlobalDictionary(ColumnScanState &state, Vector &result,
 	idx_t remaining = count;
 	while (remaining > 0) {
 		auto &segment = node->GetNode();
-		auto translation = dict_global::FindScanTranslation(segment);
+		// a column this scan reads codes-only takes its stored translation, as the segment scans do; else the
+		// published dictionary's
+		auto translation = dict_global::CodesOnlyTranslation(segment);
+		if (!translation) {
+			translation = dict_global::FindScanTranslation(segment);
+		}
 		if (!translation || (!translations.empty() && translation->dict != translations[0]->dict)) {
 			return false;
 		}
@@ -437,6 +452,9 @@ void ColumnData::Filter(TransactionData transaction, idx_t vector_index, ColumnS
 	const auto first_segment = state.current;
 	const auto first_row = state.offset_in_column;
 	idx_t scan_count = Scan(transaction, vector_index, state, result);
+	if (dict_global::FilterCodesOnlyVector(result, scan_count, sel, s_count, filter)) {
+		return;
+	}
 
 	UnifiedVectorFormat vdata;
 	result.ToUnifiedFormat(scan_count, vdata);

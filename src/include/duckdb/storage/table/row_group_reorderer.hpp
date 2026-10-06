@@ -15,6 +15,7 @@
 #include "duckdb/common/enums/order_type.hpp"
 
 namespace duckdb {
+class TableFilterSet;
 
 enum class OrderByStatistics : uint8_t { MIN, MAX };
 enum class OrderByColumnType : uint8_t { NUMERIC, STRING };
@@ -53,6 +54,10 @@ public:
 	RowGroupReorderer(const RowGroupOrderOptions &options_p, TransactionData transaction_p);
 	optional_ptr<SegmentNode<RowGroup>> GetRootSegment(RowGroupSegmentTree &row_groups);
 	optional_ptr<SegmentNode<RowGroup>> GetNextRowGroup(SegmentNode<RowGroup> &row_group);
+	//! The scan passes only non-empty values of the order column: an ascending order by statistics that only orders
+	//! (no limit or offset pruning) keys a VARCHAR row group on its minimum non-empty value, so the row groups holding
+	//! the smallest non-empty values are scanned first and a Top-N bound tightens early (kNonEmptyMinRowGroupOrder)
+	void SetScanExcludesEmptyString(const TableFilterSet *filters, const vector<StorageIndex> &column_ids);
 
 	static Value RetrieveStat(const BaseStatistics &stats, OrderByStatistics order_by, OrderByColumnType column_type);
 	static OffsetPruningResult GetOffsetAfterPruning(OrderByStatistics order_by, OrderByColumnType column_type,
@@ -66,6 +71,7 @@ private:
 
 	idx_t offset;
 	bool initialized;
+	bool nonempty_min_key = false;
 	vector<reference<SegmentNode<RowGroup>>> ordered_row_groups;
 };
 

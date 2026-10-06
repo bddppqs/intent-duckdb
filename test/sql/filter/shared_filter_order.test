@@ -1,0 +1,130 @@
+# name: test/sql/filter/shared_filter_order.test
+# description: A table scan's pushed-filter order shared across the threads of one scan: every multi-filter scan
+#              under 8 threads (three, two and one filters in every column order, a scan whose filters empty every
+#              vector, a four-filter scan) returns the aggregate the same scan returns under 1 thread
+# group: [filter]
+
+statement ok
+PRAGMA threads=1
+
+# >= 20 row groups; c is non-empty only in every fourth 4096-row block, so the three-filter scans empty whole vectors
+statement ok
+CREATE TABLE t_af AS SELECT i::BIGINT AS i, 'a' || (i % 1000)::VARCHAR || CASE WHEN i % 3 = 0 THEN 'red' ELSE 'x' END AS a, CASE WHEN i % 5 = 0 THEN 'blue-' || (i % 7)::VARCHAR ELSE 'item' || (i % 97)::VARCHAR END AS b, CASE WHEN (i // 4096) % 4 = 0 AND i % 3 <> 1 THEN 'p' || (i % 13)::VARCHAR ELSE '' END AS c FROM range(2600000) t(i)
+
+query I
+SELECT count(DISTINCT row_group_id) >= 20 FROM pragma_storage_info('t_af')
+----
+true
+
+# the reference: every case under 1 thread
+statement ok
+CREATE TABLE ref AS SELECT 'three_abc' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%' AND c <> '' UNION ALL SELECT 'three_acb' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND c <> '' AND b NOT LIKE '%blue%' UNION ALL SELECT 'three_bac' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND a LIKE '%red%' AND c <> '' UNION ALL SELECT 'three_bca' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND c <> '' AND a LIKE '%red%' UNION ALL SELECT 'three_cab' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND a LIKE '%red%' AND b NOT LIKE '%blue%' UNION ALL SELECT 'three_cba' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND b NOT LIKE '%blue%' AND a LIKE '%red%' UNION ALL SELECT 'two_ab' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%' UNION ALL SELECT 'two_ac' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND c <> '' UNION ALL SELECT 'two_ba' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND a LIKE '%red%' UNION ALL SELECT 'two_bc' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND c <> '' UNION ALL SELECT 'two_ca' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND a LIKE '%red%' UNION ALL SELECT 'two_cb' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND b NOT LIKE '%blue%' UNION ALL SELECT 'one_a' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' UNION ALL SELECT 'one_b' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' UNION ALL SELECT 'one_c' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' UNION ALL SELECT 'emptied' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%nomatch%' AND b NOT LIKE '%item%' AND c <> '' UNION ALL SELECT 'four' AS k, count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%' AND c <> '' AND i > 1000
+
+query II
+SELECT k, n > 0 FROM ref ORDER BY k
+----
+emptied	false
+four	true
+one_a	true
+one_b	true
+one_c	true
+three_abc	true
+three_acb	true
+three_bac	true
+three_bca	true
+three_cab	true
+three_cba	true
+two_ab	true
+two_ac	true
+two_ba	true
+two_bc	true
+two_ca	true
+two_cb	true
+
+statement ok
+PRAGMA threads=8
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%' AND c <> '') q JOIN ref ON ref.k = 'three_abc' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND c <> '' AND b NOT LIKE '%blue%') q JOIN ref ON ref.k = 'three_acb' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND a LIKE '%red%' AND c <> '') q JOIN ref ON ref.k = 'three_bac' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND c <> '' AND a LIKE '%red%') q JOIN ref ON ref.k = 'three_bca' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND a LIKE '%red%' AND b NOT LIKE '%blue%') q JOIN ref ON ref.k = 'three_cab' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND b NOT LIKE '%blue%' AND a LIKE '%red%') q JOIN ref ON ref.k = 'three_cba' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%') q JOIN ref ON ref.k = 'two_ab' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND c <> '') q JOIN ref ON ref.k = 'two_ac' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND a LIKE '%red%') q JOIN ref ON ref.k = 'two_ba' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%' AND c <> '') q JOIN ref ON ref.k = 'two_bc' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND a LIKE '%red%') q JOIN ref ON ref.k = 'two_ca' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '' AND b NOT LIKE '%blue%') q JOIN ref ON ref.k = 'two_cb' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%') q JOIN ref ON ref.k = 'one_a' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE b NOT LIKE '%blue%') q JOIN ref ON ref.k = 'one_b' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE c <> '') q JOIN ref ON ref.k = 'one_c' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%nomatch%' AND b NOT LIKE '%item%' AND c <> '') q JOIN ref ON ref.k = 'emptied' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT count(*) AS n, sum(i) AS s, min(a) AS mn, max(b) AS mx FROM t_af WHERE a LIKE '%red%' AND b NOT LIKE '%blue%' AND c <> '' AND i > 1000) q JOIN ref ON ref.k = 'four' AND q.n = ref.n AND q.s IS NOT DISTINCT FROM ref.s AND q.mn IS NOT DISTINCT FROM ref.mn AND q.mx IS NOT DISTINCT FROM ref.mx
+----
+1

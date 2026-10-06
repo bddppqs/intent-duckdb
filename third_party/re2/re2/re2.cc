@@ -274,6 +274,9 @@ void RE2::Init(const StringPiece& pattern, const Options& options) {
   // and that is harder to do if the DFA has already
   // been built.
   is_one_pass_ = prog_->IsOnePass();
+
+  if (options_.tagged_dfa())
+    prog_->EnableTDFA();
 }
 
 // Returns rprog_, computing it if needed.
@@ -875,7 +878,16 @@ bool RE2::Match(const StringPiece& text,
       kind = Prog::kFullMatch;
     }
 
-    if (can_one_pass && anchor != Prog::kUnanchored) {
+    int tdfa = -1;
+    if (prog_->tdfa_admitted() && anchor == Prog::kAnchored)
+      tdfa = prog_->SearchTDFA(subtext1, text, kind, submatch, ncap);
+    if (tdfa == 0) {
+      if (!skipped_test && options_.log_errors())
+        LOG(ERROR) << "SearchTDFA inconsistency";
+      return false;
+    } else if (tdfa == 1) {
+      // submatch[0..ncap) is set
+    } else if (can_one_pass && anchor != Prog::kUnanchored) {
       if (!prog_->SearchOnePass(subtext1, text, anchor, kind, submatch, ncap)) {
         if (!skipped_test && options_.log_errors())
           LOG(ERROR) << "SearchOnePass inconsistency";

@@ -16,6 +16,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/string_map_set.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator_states.hpp"
 #include "duckdb/execution/progress_data.hpp"
@@ -25,10 +26,14 @@
 namespace duckdb {
 class BufferManager;
 class ClientContext;
+class DataTable;
 class ExecutionContext;
 class PhysicalHashAggregate;
 class PhysicalOperator;
 class PhysicalUngroupedAggregate;
+namespace dict_global {
+class ColumnDictionary;
+}
 
 //! How one aggregate of the fused path is computed from a group's states (every input is non-NULL: the gate proved it);
 //! DISTINCT_COUNT reads the group's number of distinct (g, x) entries
@@ -104,8 +109,8 @@ public:
 	//! a VARCHAR key's base-statistics distinct-count estimate at most this, and at most this many
 	//! distinct strings mapped at run time (the next one is a crossing: the drain)
 	static constexpr idx_t MAXIMUM_GIDS = 65535;
-	//! the ceilings on key bytes and compact-row bytes
-	static constexpr idx_t MAXIMUM_KEY_BYTES = 12;
+	//! the ceilings on key bytes and compact-row bytes (the grouped class's key bytes; see kFusedSixteenByteKeys)
+	static constexpr idx_t MAXIMUM_KEY_BYTES = 16;
 	static constexpr idx_t MAXIMUM_ROW_BYTES = 32;
 	static constexpr idx_t MAXIMUM_AGGREGATES = 4;
 	//! Phase 2: capacity next_pow2(2 x rows) in [1024, 2^21] entries, sized once; 16-row hash-and-prefetch batches
@@ -114,6 +119,8 @@ public:
 	static constexpr idx_t TABLE_BATCH = 16;
 	//! the stored hash bits appended to the compact row (the 32 hash bits below the partition bits)
 	static constexpr idx_t STORED_HASH_BYTES = 4;
+	//! The bitmap class: the bitmap words one phase-2 stripe covers (8 KiB of each thread's bitmap)
+	static constexpr idx_t BITMAP_STRIPE_WORDS = 1024;
 
 	FusedIntegerAggregate();
 
@@ -201,8 +208,37 @@ public:
 	bool chain;
 	//! the run kind (fed by the grouped run channel); the compact row is {key, uint32_t run length}
 	bool run_kind;
-	//! run kind: byte offset of the run length in the compact row (right after the key bytes)
+	//! run kind: byte offset of the run length in the compact row (right after the key bytes); with the last-key fold,
+	//! of the folded row's count (right after the inputs)
 	idx_t run_length_offset;
+	//! the last-key fold (kFusedLastKeyFold): a COUNT-only shape of the grouped class carries a uint32_t count, phase 1
+	//! folds each row whose key equals its partition's last row into that row's count, phase 2 adds counts, and the
+	//! drain re-sinks a folded row as its count's rows
+	bool last_key_fold;
+	//! the bitmap class (kFusedDistinctBitmap). An ungrouped count(DISTINCT x), the operator's one aggregate, whose x is
+	//! an uncollated VARCHAR column the global dictionary publishes for the plan, takes one bitmap of the published dictionary's
+	//! codes per thread: phase 1 sets each row's code bit (a vector over the published child reads its codes from its
+	//! selection; any other vector looks each string up, and a string the dictionary does not hold goes to the thread's
+	//! overflow set), phase 2 ORs the threads' bitmaps stripe by stripe across the source tasks and counts the bits, code 0
+	//! (the NULL slot) excluded, plus the distinct overflow strings. No hash, no partition, no reservation, no drain.
+	//! columns[0] is x (chunk_index alone); bitmap_words = ceil(codes / 64)
+	bool bitmap;
+	//! the set member of the DISTINCT class (kFusedDistinctSet). An ungrouped count(DISTINCT x), the operator's one
+	//! aggregate, over one integer x: the compact row is x alone (no stored hash), and phase 2 counts each partition's
+	//! distinct x by inserting it into a set of the key word alone, a new key counted at its insert - no (g, x) entry
+	//! count, no group table, no scan of the set; the task that finishes last emits the sum
+	bool distinct_set = false;
+	shared_ptr<dict_global::ColumnDictionary> bitmap_dict;
+	idx_t bitmap_words;
+	//! the coverage bound: the scanned table's storage, re-read at every execution (GetGlobalSinkState): the
+	//! transaction's local storage, the column's publication (still bitmap_dict), its coverage (rows_covered ==
+	//! GetTotalRows()), its updates and the memory bound at the executing threads and memory limit; a failure abandons
+	//! the execution to the generic path (a plain pointer: the const operator re-reads the table's mutable state, as
+	//! the plan's scan does)
+	DataTable *bitmap_table = nullptr;
+	//! a column read through stored translations: whether this execution's scan reads its codes only (set by
+	//! GetGlobalSinkState to the execution's admission; the scan reads it at its initialisation), else null
+	shared_ptr<atomic<bool>> bitmap_codes_only;
 };
 
 //! A group table of the DISTINCT class, keyed by the key words of g alone: entries {g words, distinct, count, one
@@ -282,6 +318,17 @@ public:
 	atomic<idx_t> gid_count;
 	atomic<idx_t> gid_maps;
 	atomic<idx_t> gid_rows_flat;
+
+	//! The bitmap class: the threads' bitmaps (pinned buffer-manager blocks of bitmap_words words), the union of their overflow
+	//! strings and the rows they looked up (a vector not over the published child), handed over at Combine under `lock`
+	vector<BufferHandle> bitmaps;
+	unordered_set<string> bitmap_overflow;
+	idx_t bitmap_lookups = 0;
+	//! The coverage bound: this execution's re-check (GetGlobalSinkState) - engaged, or refused with its reason (the execution is
+	//! abandoned to the generic path); and the set bits phase 2 read at or beyond the code count in the last word
+	bool bitmap_engaged = false;
+	uint8_t bitmap_refusal = 0;
+	atomic<idx_t> bitmap_padding_bits {0};
 };
 
 //! One thread's gids of one VARCHAR key column - the dictionary whose code -> gid table it caches (by
@@ -337,6 +384,13 @@ public:
 	//! run kind: the radix local sink state this state drains into, and one drain batch's run lengths
 	optional_ptr<LocalSinkState> run_radix_local;
 	unsafe_unique_array<uint16_t> drain_counts;
+	//! The bitmap class: the thread's bitmap (allocated at its first chunk), its overflow strings, its input rows and the rows it
+	//! looked up
+	BufferHandle bitmap_handle;
+	uint64_t *bitmap = nullptr;
+	unordered_set<string> bitmap_overflow;
+	idx_t bitmap_rows = 0;
+	idx_t bitmap_lookups = 0;
 };
 
 } // namespace duckdb

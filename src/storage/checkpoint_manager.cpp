@@ -1,4 +1,5 @@
 #include "duckdb/storage/checkpoint_manager.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -249,6 +250,11 @@ void SingleFileCheckpointWriter::CreateCheckpoint() {
 					for (auto &split : splits) {
 						auto overflow_block_id = std::stoll(split);
 						verify_block_usage_count[overflow_block_id]++;
+					}
+				}
+				if (segment.compression_type == "DICT_FSST") {
+					for (auto &block_id : segment.additional_blocks) {
+						verify_block_usage_count[block_id]++;
 					}
 				}
 			}
@@ -635,6 +641,8 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	    deserializer.ReadPropertyWithExplicitDefault<vector<IndexStorageInfo>>(104, "index_storage_infos", {});
 	// Absent (false) in every file but the block-compressed one, see SingleFileTableDataWriter::FinalizeTable
 	auto stats_exact = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "stats_exact", false);
+	auto translations = deserializer.ReadPropertyWithExplicitDefault<vector<dict_global::PersistedColumn>>(
+	    106, "dict_global_translations", {});
 
 	if (!index_storage_infos.empty()) {
 		bound_info.indexes = std::move(index_storage_infos);
@@ -661,6 +669,9 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	bound_info.data->total_rows = total_rows;
 	bound_info.data->stats_exact = stats_exact;
 	bound_info.data->read_metadata_pointers = read_pointers;
+	if (!translations.empty()) {
+		dict_global::StashPersisted(*bound_info.data, std::move(translations));
+	}
 }
 
 } // namespace duckdb

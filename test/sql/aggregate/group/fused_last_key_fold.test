@@ -1,0 +1,102 @@
+# name: test/sql/aggregate/group/fused_last_key_fold.test
+# description: The fused kernel's phase-1 last-key fold (kFusedLastKeyFold) over >= 2^20 rows - runs, run breaks at
+#              vector, row-group and line boundaries, interleaved keys the partition fold takes, every key unique, one
+#              key, a three-key shape, count beside count(x), the refused SUM/AVG shape and a NULL key; every expected
+#              answer is upstream DuckDB 1.5.5's on the same table, with the fold on or off
+# group: [group]
+
+statement ok
+CREATE TABLE t AS SELECT ((i // 3) * 4294967311)::BIGINT AS r3, ((i // 3) % 1000)::INTEGER AS r3b, ((i // 5000) * 4294967311)::BIGINT AS r5000, ((i // 2048) * 4294967311)::BIGINT AS r2048, ((i // 2049) * 4294967311)::BIGINT AS r2049, ((i // 1000) * 4294967311)::BIGINT AS a1, (i % 2)::INTEGER AS a2, ((i % 50) * 1000003 + (i // 200))::BIGINT AS s50, (floor(sqrt(i))::BIGINT * 4294967311)::BIGINT AS sq, (i * 2654435761)::BIGINT AS u, 7::BIGINT AS one, ((i // 4) * 4294967311)::BIGINT AS k1, ((i // 4) % 100003)::INTEGER AS k3, ((i // 2) % 60)::SMALLINT AS m, (i % 7)::BIGINT AS y, (CASE WHEN i % 1000 = 0 THEN NULL ELSE i // 3 END)::BIGINT AS nk FROM range(2200000) t(i)
+
+foreach threads 1 8
+
+statement ok
+SET threads=${threads}
+
+# runs of 3 on a BIGINT + INTEGER key; every run folds to one row
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r3, r3b, c))::HUGEINT FROM (SELECT r3, r3b, count(*) AS c FROM t GROUP BY r3, r3b)
+----
+733334	2200000	1	3	6765985097217383735055576
+
+# runs of 5,000: across vectors, row groups and threads (a run split between threads is two rows, summed in phase 2)
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r5000, c))::HUGEINT FROM (SELECT r5000, count(*) AS c FROM t GROUP BY r5000)
+----
+440	2200000	5000	5000	4037266296413317955826
+
+# runs of 2,048 ending at every vector boundary
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r2048, c))::HUGEINT FROM (SELECT r2048, count(*) AS c FROM t GROUP BY r2048)
+----
+1075	2200000	448	2048	10048001571324435153094
+
+# runs of 2,049: every run crosses a vector boundary by one row (the partition fold carries it)
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r2049, c))::HUGEINT FROM (SELECT r2049, count(*) AS c FROM t GROUP BY r2049)
+----
+1074	2200000	1423	2049	9653773279855012218133
+
+# A B A B inside each 1,000-row block: no adjacent equal row; the partition fold takes A and B unless they share a partition
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(a1, a2, c))::HUGEINT FROM (SELECT a1, a2, count(*) AS c FROM t GROUP BY a1, a2)
+----
+4400	2200000	500	500	40995704855956362387544
+
+# 50 interleaved streams: each key is 4 rows 50 apart, never adjacent; the partition fold and its line flush
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(s50, c))::HUGEINT FROM (SELECT s50, count(*) AS c FROM t GROUP BY s50)
+----
+550000	2200000	4	4	5072233531140719395077261
+
+# runs of 2j + 1 rows (1 to about 2,967): every run length against the vector and line boundaries
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(sq, c))::HUGEINT FROM (SELECT sq, count(*) AS c FROM t GROUP BY sq)
+----
+1484	2200000	1	2965	13687468547056291224067
+
+# every key unique: nothing folds
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(u, c))::HUGEINT FROM (SELECT u, count(*) AS c FROM t GROUP BY u)
+----
+2200000	2200000	1	1	20283346491360007180910301
+
+# one key for every row: each thread folds its whole stream into one row
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(one, c))::HUGEINT FROM (SELECT one, count(*) AS c FROM t GROUP BY one)
+----
+1	2200000	2200000	2200000	13974899653636512322
+
+# a three-key shape (BIGINT + INTEGER + a 0-59 SMALLINT), runs of 2
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(k1, k3, m, c))::HUGEINT FROM (SELECT k1, k3, m, count(*) AS c FROM t GROUP BY k1, k3, m)
+----
+1100000	2200000	2	2	10148079095104140809098260
+
+# count(*) beside count(y) over a non-NULL y
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r3, r3b, c, cy))::HUGEINT FROM (SELECT r3, r3b, count(*) AS c, count(y) AS cy FROM t GROUP BY r3, r3b)
+----
+733334	2200000	1	3	6769634231023632689937136
+
+# SUM and AVG beside count(*): the fold is refused (the shape stays fused, rows unfolded)
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(r3, r3b, c, sy, round(ay * c)::BIGINT))::HUGEINT FROM (SELECT r3, r3b, count(*) AS c, sum(y) AS sy, avg(y) AS ay FROM t GROUP BY r3, r3b)
+----
+733334	2200000	1	3	6768732963794048706776264
+
+# a key with NULLs: the kernel is refused, the generic aggregate answers
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(hash(nk, c))::HUGEINT FROM (SELECT nk, count(*) AS c FROM t GROUP BY nk)
+----
+733335	2200000	1	2200	6770971108078468131970188
+
+# a Top-N over the folded counts
+query II
+SELECT r5000, count(*) AS c FROM t GROUP BY r5000 ORDER BY c ASC, r5000 DESC LIMIT 3
+----
+1885490649529	5000
+1881195682218	5000
+1876900714907	5000
+
+endloop

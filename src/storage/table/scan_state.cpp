@@ -37,7 +37,21 @@ const vector<StorageIndex> &TableScanState::GetColumnIds() {
 	return column_ids;
 }
 
+//! The shared-order filter (kSharedFilterOrder) is created and deleted here alone, deleted as its own type
+//! (AdaptiveFilter has no virtual destructor); the flag is a build-time constant, so it names the type of every filter
+static void ReleaseAdaptiveFilter(unique_ptr<AdaptiveFilter> &adaptive_filter) {
+	if (adaptive_filter && SharedFilterOrderEnabled()) {
+		delete static_cast<SharedOrderAdaptiveFilter *>(adaptive_filter.release());
+	}
+	adaptive_filter.reset();
+}
+
+static SharedFilterOrderLocal &SharedOrderLocal(AdaptiveFilter &adaptive_filter) {
+	return static_cast<SharedOrderAdaptiveFilter &>(adaptive_filter).local;
+}
+
 ScanFilterInfo::~ScanFilterInfo() {
+	ReleaseAdaptiveFilter(adaptive_filter);
 }
 
 ScanFilterInfo &TableScanState::GetFilterInfo() {
@@ -57,7 +71,13 @@ void ScanFilterInfo::Initialize(ClientContext &context, TableFilterSet &filters,
                                 const vector<StorageIndex> &column_ids) {
 	D_ASSERT(!filters.filters.empty());
 	table_filters = &filters;
-	adaptive_filter = make_uniq<AdaptiveFilter>(filters);
+	ReleaseAdaptiveFilter(adaptive_filter);
+	if (!SharedFilterOrderEnabled()) {
+		adaptive_filter = make_uniq<AdaptiveFilter>(filters);
+	} else {
+		// the default filter plus the shared order's per-thread state, owned through the base-class pointer
+		adaptive_filter = make_uniq_base<AdaptiveFilter, SharedOrderAdaptiveFilter>(filters);
+	}
 	filter_list.reserve(filters.filters.size());
 	for (auto &entry : filters.filters) {
 		filter_list.emplace_back(context, entry.first, column_ids, *entry.second);
@@ -117,6 +137,9 @@ AdaptiveFilterState ScanFilterInfo::BeginFilter() const {
 	if (!adaptive_filter) {
 		return AdaptiveFilterState();
 	}
+	if (SharedFilterOrderEnabled()) {
+		return adaptive_filter->BeginFilterShared(SharedOrderLocal(*adaptive_filter));
+	}
 	return adaptive_filter->BeginFilter();
 }
 
@@ -124,7 +147,19 @@ void ScanFilterInfo::EndFilter(AdaptiveFilterState state) {
 	if (!adaptive_filter) {
 		return;
 	}
+	if (SharedFilterOrderEnabled()) {
+		adaptive_filter->EndFilterShared(state, SharedOrderLocal(*adaptive_filter));
+		return;
+	}
 	adaptive_filter->EndFilter(state);
+}
+
+void ScanFilterInfo::EndFilterEmptied(AdaptiveFilterState state) {
+	if (!adaptive_filter || !SharedFilterOrderEnabled()) {
+		// by default only the vectors with survivors are timed
+		return;
+	}
+	adaptive_filter->EndFilterShared(state, SharedOrderLocal(*adaptive_filter));
 }
 
 void ColumnScanState::NextInternal(idx_t count) {

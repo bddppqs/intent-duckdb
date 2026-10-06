@@ -69,6 +69,9 @@ public:
 
 private:
 	void ScanSegments(const std::function<void(Vector &, idx_t)> &callback);
+	//! ScanSegments in the row group's vectors (multiples of STANDARD_VECTOR_SIZE rows from its start), a vector
+	//! that spans segments assembled from its pieces
+	void ScanSegmentsAligned(const std::function<void(Vector &, idx_t)> &callback);
 	vector<CheckpointAnalyzeResult> DetectBestCompressionMethod();
 	void WriteToDisk();
 	void WritePersistentSegments(ColumnCheckpointState &state);

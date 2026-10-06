@@ -35,6 +35,7 @@
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 
 namespace duckdb {
@@ -47,6 +48,7 @@ DataTableInfo::DataTableInfo(AttachedDatabase &db, shared_ptr<TableIOManager> ta
 DataTableInfo::~DataTableInfo() {
 	// the table's global-dictionary entry is released with it (a later table at the same address starts empty)
 	dict_global::ReleaseTable(*this);
+	dict_global::ReleasePersisted(*this);
 }
 
 void DataTableInfo::BindIndexes(ClientContext &context, const char *index_type) {
@@ -80,6 +82,7 @@ DataTable::DataTable(AttachedDatabase &db, shared_ptr<TableIOManager> table_io_m
 	if (data && data->row_group_count > 0) {
 		this->row_groups->Initialize(*data);
 		row_groups->SetRowGroupAppendMode(RowGroupAppendMode::SUGGEST_NEW);
+		dict_global::AdoptPersisted(*data, *info);
 	} else {
 		this->row_groups->InitializeEmpty();
 		D_ASSERT(row_groups->GetTotalRows() == 0);
@@ -112,6 +115,7 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, ColumnDefinition
 	parent.version = DataTableVersion::ALTERED;
 	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
 	dict_global::ReleaseTable(*info);
+	dict_global::InvalidatePersisted(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_column)
@@ -162,6 +166,7 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t removed_co
 	parent.version = DataTableVersion::ALTERED;
 	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
 	dict_global::ReleaseTable(*info);
+	dict_global::InvalidatePersisted(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint &constraint)
@@ -184,6 +189,7 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, BoundConstraint 
 	parent.version = DataTableVersion::ALTERED;
 	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
 	dict_global::ReleaseTable(*info);
+	dict_global::InvalidatePersisted(*info);
 }
 
 DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_idx, const LogicalType &target_type,
@@ -222,6 +228,7 @@ DataTable::DataTable(ClientContext &context, DataTable &parent, idx_t changed_id
 	parent.version = DataTableVersion::ALTERED;
 	// the altered table shares the DataTableInfo; its column dictionaries are invalidated
 	dict_global::ReleaseTable(*info);
+	dict_global::InvalidatePersisted(*info);
 }
 
 vector<LogicalType> DataTable::GetTypes() {
@@ -1994,6 +2001,7 @@ idx_t DataTable::GetRowGroupCountWithLocalStorage(ClientContext &context) {
 
 void DataTable::CommitDropTable(CommitDropState &drop_state) {
 	row_groups->CommitDropTable(drop_state);
+	dict_global::CommitDropPersisted(*info, row_groups->GetBlockManager());
 }
 
 //===--------------------------------------------------------------------===//

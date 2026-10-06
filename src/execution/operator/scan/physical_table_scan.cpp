@@ -9,6 +9,7 @@
 #include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/execution/physical_table_scan_enum.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 #include <utility>
 
@@ -362,6 +363,10 @@ InsertionOrderPreservingMap<string> PhysicalTableScan::ParamsToString() const {
 	}
 	if (run_aggregate) {
 		result["Run Aggregate"] = run_aggregate->column_names;
+	}
+	auto codes_only = dict_global::CodesOnlyColumnNames(bind_data.get());
+	if (!codes_only.empty()) {
+		result["Codes Only"] = codes_only;
 	}
 	if (function.filter_pushdown && table_filters) {
 		result["Filters"] = GetFilterInfo(this, table_filters);

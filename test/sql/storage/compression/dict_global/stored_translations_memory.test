@@ -1,0 +1,117 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_memory.test
+# description: the stored translations' build reserves its working set in the buffer pool. Under a small memory_limit a
+# column whose build needs more than its ceiling is refused and read through its segments' dictionaries, while the load
+# completes and a column whose build fits is stored
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_memory.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET debug_verify_blocks=true
+
+# s: 100003 short values in runs of three (a working set of about 16 MB); g: 400009 long values in pairs (about 87 MB).
+# At 384 MB (below 8 GiB: a quarter) a build may take at most 96 MB in steps of 64 MB: s's build takes one step and is
+# stored, g's needs a second step and is refused
+statement ok
+SET memory_limit='384MB'
+
+statement ok
+CREATE TABLE m AS SELECT i, 'sv-' || ((i // 3) % 100003) || '-0123456789' AS s,
+    'https://www.example.com/catalog/section-' || ((i // 2) % 400009) || '/item.html?ref=' || md5(((i // 2) % 400009)::VARCHAR) || md5(((i // 2) % 400009)::VARCHAR || 'x') AS g
+FROM range(2097152) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+RESET memory_limit
+
+# both columns are split DICT_FSST columns whatever their translations
+query II
+SELECT column_name, count(*) FILTER (WHERE compression = 'DICT_FSST') > 0 FROM pragma_storage_info('m') WHERE segment_type = 'VARCHAR' GROUP BY ALL ORDER BY ALL
+----
+g	true
+s	true
+
+loop restarted 0 2
+
+statement ok
+CREATE OR REPLACE TEMP TABLE r AS SELECT i, 'sv-' || ((i // 3) % 100003) || '-0123456789' AS s,
+    'https://www.example.com/catalog/section-' || ((i // 2) % 400009) || '/item.html?ref=' || md5(((i // 2) % 400009)::VARCHAR) || md5(((i // 2) % 400009)::VARCHAR || 'x') AS g
+FROM range(2097152) r(i)
+
+# s is read through its stored translations
+query II
+EXPLAIN SELECT s, count(*) AS n FROM m GROUP BY s ORDER BY n DESC LIMIT 5
+----
+physical_plan	<REGEX>:.*Code Keys: s \(stored\).*
+
+query I
+SELECT count(*) FROM ((SELECT s, count(*) AS n FROM m GROUP BY s ORDER BY n DESC, s LIMIT 9) EXCEPT ALL (SELECT s, count(*) AS n FROM r GROUP BY s ORDER BY n DESC, s LIMIT 9))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT s, count(*), min(i) FROM m GROUP BY s) EXCEPT ALL (SELECT s, count(*), min(i) FROM r GROUP BY s))
+----
+0
+
+# g has no stored translations (its build was refused): every read takes its segments' dictionaries
+query II
+EXPLAIN SELECT g, count(*) AS n FROM m GROUP BY g ORDER BY n DESC LIMIT 5
+----
+physical_plan	<!REGEX>:.*\(stored\).*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(*) AS n FROM m GROUP BY g ORDER BY n DESC, g LIMIT 9) EXCEPT ALL (SELECT g, count(*) AS n FROM r GROUP BY g ORDER BY n DESC, g LIMIT 9))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT g, count(*), min(i) FROM m GROUP BY g) EXCEPT ALL (SELECT g, count(*), min(i) FROM r GROUP BY g))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM m WHERE g LIKE '%section-17/%' OR s = 'sv-5-0123456789') EXCEPT ALL (SELECT * FROM r WHERE g LIKE '%section-17/%' OR s = 'sv-5-0123456789'))
+----
+0
+
+query II
+SELECT count(DISTINCT s), count(DISTINCT g) FROM m
+----
+100003	400009
+
+restart
+
+endloop
+
+# the next checkpoint under the default memory_limit, after a change to the table, builds g's translations
+statement ok
+INSERT INTO m SELECT i, 'sv-new-' || i, 'g-new-' || i FROM range(2097152, 2097152 + 1000) r(i)
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT g, count(*) AS n FROM m GROUP BY g ORDER BY n DESC LIMIT 5
+----
+physical_plan	<REGEX>:.*Code Keys: g \(stored\).*
+
+statement ok
+CREATE OR REPLACE TEMP TABLE r AS SELECT i, 'sv-' || ((i // 3) % 100003) || '-0123456789' AS s,
+    'https://www.example.com/catalog/section-' || ((i // 2) % 400009) || '/item.html?ref=' || md5(((i // 2) % 400009)::VARCHAR) || md5(((i // 2) % 400009)::VARCHAR || 'x') AS g
+FROM range(2097152) r(i) UNION ALL SELECT i, 'sv-new-' || i, 'g-new-' || i FROM range(2097152, 2097152 + 1000) r(i)
+
+query I
+SELECT count(*) FROM ((SELECT g, count(*), min(i) FROM m GROUP BY g) EXCEPT ALL (SELECT g, count(*), min(i) FROM r GROUP BY g))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT s, count(*), min(i) FROM m GROUP BY s) EXCEPT ALL (SELECT s, count(*), min(i) FROM r GROUP BY s))
+----
+0

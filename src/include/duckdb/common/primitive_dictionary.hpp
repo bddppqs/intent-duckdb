@@ -82,6 +82,35 @@ public:
 		}
 	}
 
+	//! Insert as Insert<false> does; returns the slot the value took, or DConstants::INVALID_INDEX when it was present
+	//! already or the dictionary is full
+	idx_t InsertAndGetSlot(SRC value) {
+		if (full) {
+			return DConstants::INVALID_INDEX;
+		}
+		auto &entry = Lookup(value);
+		if (!entry.IsEmpty()) {
+			return DConstants::INVALID_INDEX;
+		}
+		if (size + 1 > maximum_size) {
+			full = true;
+			return DConstants::INVALID_INDEX;
+		}
+		entry.value = value;
+		entry.index = size++;
+		return NumericCast<idx_t>(&entry - dictionary);
+	}
+
+	//! Undo the latest inserts: `slots` are the slots they took (InsertAndGetSlot), `old_size` and `old_full` the state
+	//! before them. Linear probing keeps every earlier entry reachable: none of them probed past a later insert
+	void RemoveLatest(const vector<idx_t> &slots, idx_t old_size, bool old_full) {
+		for (auto slot : slots) {
+			dictionary[slot].index = INVALID_INDEX;
+		}
+		size = old_size;
+		full = old_full;
+	}
+
 	//! Get dictionary index of an already inserted value
 	uint32_t GetIndex(const SRC &value) const {
 		const auto &entry = Lookup(value);

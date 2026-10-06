@@ -1,0 +1,324 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_first_keys_codes.test
+# description: GROUP BY ... LIMIT k rewritten into a first-keys pass keys a VARCHAR column with stored translations, read
+# for its identity only, on its codes: both scans read it codes only, the first-keys pass pushes no key filter and the SEMI
+# join no join filter for it, and the at most k output keys are decoded after the LIMIT; the answers are exact against
+# the same data stored in memory, inside a transaction holding local rows, through a prepared statement, after an update
+# and its checkpoint, across a restart and under query verification (where the rewrite keeps string keys)
+# group: [dict_global]
+
+# no PRAGMA enable_verification but in its own queries at the end: its serializer round trip (Planner::VerifyPlan) replaces
+# the optimized plan by a deserialized copy, and the code keys' two internal functions are not catalog entries, so the
+# rewrite keeps string keys under verification (first_keys_aggregate_limit.test's reason)
+
+load __TEST_DIR__/stored_translations_first_keys_codes.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# u: 52429 values in runs of 100, never NULL (its statistics prove it: the SEMI condition is =), spread over a range no
+# narrower integer holds (compressed materialization keeps it BIGINT, so the first-keys key filter on it is pushed); s:
+# 200003 values (each in runs of three), '' and NULL - row 0 holds NULL, so NULL is among the first keys (IS NOT
+# DISTINCT FROM); n: 200003 values, never NULL (=); v: an aggregate input; 5 * 2^20 rows, so a scan with its filters is
+# estimated at 2^20 rows (at least kStoredCodeKeysMinScanRows)
+statement ok
+CREATE TABLE t AS SELECT i, (i // 100) * 1000000007 AS u,
+CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS s,
+'nval-' || ((i // 3) % 200003) || '-0123456789' AS n, (i % 1000)::INTEGER AS v
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+# s keyed on its codes: both scans read it codes only, the first-keys pass pushes u's key filter only
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*STREAMING_FIRST_KEYS.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Join Type: SEMI.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Codes Only:.*s \(group key\).*Codes Only:.*s \(group key\).*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Probe Columns: 0, -.*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Key Filters: pushed.*
+
+# at run time the probe scan holds u's key filter and join filter, and no filter on s
+query II
+EXPLAIN ANALYZE SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+analyzed_plan	<REGEX>:.*Dynamic Filters:.*u.*
+
+query II
+EXPLAIN ANALYZE SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+analyzed_plan	<!REGEX>:.*(s='|s>=|s<=|s>|s<|s IS NULL).*
+
+# k rows, every one a member of the full relation with its exact count, all distinct (the first-keys test's checks)
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8)
+----
+8
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+query I
+SELECT count(DISTINCT (u, s)) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8)
+----
+8
+
+# every admitted aggregate is exact
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c, count(v) AS cv, sum(v) AS sv, min(v) AS mn, max(v) AS mx, avg(v) AS av FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c, count(v) AS cv, sum(v) AS sv, min(v) AS mn, max(v) AS mx, avg(v) AS av FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c AND l.cv = f.cv AND l.sv = f.sv AND l.mn = f.mn AND l.mx = f.mx AND l.av = f.av
+----
+8
+
+# NULL keys among the first k keys, each group exact. The order is what this checks: GROUP BY ... LIMIT k without ORDER
+# BY keeps the first k groups the scan finds, so the first vector's keys (rows 0, 997 and 1994 among them, fewer than
+# 1024 keys) are all taken; SQL leaves the k groups open, and upstream DuckDB may keep others
+query I
+SELECT count(*) >= 3 FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 1024) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c WHERE l.s IS NULL
+----
+true
+
+# LIMIT 1 and LIMIT 1024
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 1)
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 1024) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+1024
+
+# every group of a filtered input (at most 1024 of them; a FILTER over two columns, so the scan is estimated at the
+# table's rows and the FILTER caches its small output chunks): the same rows both ways against the in-memory copy
+query II
+EXPLAIN SELECT u, s, count(*), sum(v) FROM t WHERE (i + u) % 10000 = 7 GROUP BY u, s LIMIT 1024
+----
+physical_plan	<REGEX>:.*Codes Only:.*s \(group key\).*Codes Only:.*s \(group key\).*
+
+query I
+SELECT count(*) FROM ((SELECT u, s, count(*), sum(v) FROM t WHERE (i + u) % 10000 = 7 GROUP BY u, s LIMIT 1024) EXCEPT ALL (SELECT u, s, count(*), sum(v) FROM r WHERE (i + u) % 10000 = 7 GROUP BY u, s))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT u, s, count(*), sum(v) FROM r WHERE (i + u) % 10000 = 7 GROUP BY u, s) EXCEPT ALL (SELECT u, s, count(*), sum(v) FROM t WHERE (i + u) % 10000 = 7 GROUP BY u, s LIMIT 1024))
+----
+0
+
+# a VARCHAR key that is never NULL (the SEMI condition is =)
+query II
+EXPLAIN SELECT u, n, count(*) FROM t GROUP BY u, n LIMIT 8
+----
+physical_plan	<REGEX>:.*Codes Only:.*n \(group key\).*Codes Only:.*n \(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, n, count(*) AS c FROM t GROUP BY u, n LIMIT 8) l JOIN (SELECT u, n, count(*) AS c FROM r GROUP BY u, n) f ON l.u = f.u AND l.n = f.n AND l.c = f.c
+----
+8
+
+# two code groups on one scan
+query I
+SELECT count(*) FROM (SELECT s, n, count(*) AS c, sum(v) AS sv FROM t GROUP BY s, n LIMIT 8) l JOIN (SELECT s, n, count(*) AS c, sum(v) AS sv FROM r GROUP BY s, n) f ON l.s IS NOT DISTINCT FROM f.s AND l.n = f.n AND l.c = f.c AND l.sv = f.sv
+----
+8
+
+# a WHERE on other columns that is not pushed into the scan: a FILTER above it slices the codes
+query II
+EXPLAIN SELECT u, s, count(*) FROM t WHERE (u + v) % 3 = 0 GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*FILTER.*Codes Only:.*s \(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t WHERE (u + v) % 3 = 0 GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r WHERE (u + v) % 3 = 0 GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+# a FILTER that keeps a few rows of each vector (its small output chunks are cached by the operator): the codes, not the
+# codes-only column, reach it
+query II
+EXPLAIN SELECT u, s, count(*) FROM t WHERE (u + v) % 1000 = 7 GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*FILTER.*Codes Only:.*s \(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t WHERE (u + v) % 1000 = 7 GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r WHERE (u + v) % 1000 = 7 GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+# the same caching queries - the FILTER's small chunks and the SEMI join's at LIMIT 8 - with the caching operators off
+statement ok
+SET enable_caching_operators=false
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t WHERE (u + v) % 1000 = 7 GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r WHERE (u + v) % 1000 = 7 GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+statement ok
+SET enable_caching_operators=true
+
+# refusals: the key read by an aggregate, a string predicate on the key, a collated key, a table under 1000000 rows (no
+# stored translations, the scan estimated below kStoredCodeKeysMinScanRows), the in-memory copy: string keys
+query II
+EXPLAIN SELECT u, s, count(s) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(s) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(s) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t WHERE s LIKE '%77%' GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+statement ok
+CREATE TABLE tc(i BIGINT, u BIGINT, s VARCHAR COLLATE NOCASE)
+
+statement ok
+INSERT INTO tc SELECT i, u, s FROM t
+
+statement ok
+CREATE TABLE small AS SELECT * FROM t WHERE i < 500000
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM tc GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM small GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM r GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+# under query verification the rewrite keeps string keys (the off path): the copy's answers
+statement ok
+PRAGMA enable_verification
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8
+
+statement ok
+PRAGMA disable_verification
+
+# a prepared statement, re-run inside a transaction holding local rows (the plan re-binds to string keys) and after
+statement ok
+PREPARE p AS SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM t GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+
+query I
+EXECUTE p
+----
+8
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t SELECT i, u, 'wval-5-0123456789', n, v FROM t WHERE i < 21 AND i % 7 = 0
+
+query I
+EXECUTE p
+----
+8
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+statement ok
+ROLLBACK
+
+query I
+EXECUTE p
+----
+8
+
+# an update: the column is read as without stored translations until the checkpoint rewrites them
+statement ok
+UPDATE t SET s = 'wval-5-0123456789' WHERE i = 7
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<!REGEX>:.*\(group key\).*
+
+query I
+EXECUTE p
+----
+8
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Codes Only:.*s \(group key\).*Codes Only:.*s \(group key\).*
+
+query I
+EXECUTE p
+----
+8
+
+restart
+
+statement ok
+SET threads=4
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 8
+----
+physical_plan	<REGEX>:.*Codes Only:.*s \(group key\).*Codes Only:.*s \(group key\).*
+
+query I
+SELECT count(*) FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT 8) l JOIN (SELECT u, s, count(*) AS c FROM t GROUP BY u, s) f ON l.u = f.u AND l.s IS NOT DISTINCT FROM f.s AND l.c = f.c
+----
+8

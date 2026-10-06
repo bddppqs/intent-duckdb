@@ -1,0 +1,134 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_segment_boundary_read.test
+# description: Persistent DICT_FSST segments (DICT_FSST, DICTIONARY and FSST_ONLY modes, three row groups) read whole, through filters and around every segment start, a vector that starts exactly where a segment ends among them; answers equal to an in-memory copy
+# group: [dict_fsst]
+
+# a reader test in either build (no geometry is asserted here): with kVectorAlignedDictionarySegments on, every segment of
+# the long-string columns ends on a vector boundary and the scan reads the vector that starts there from the next segment;
+# with it off the segments start inside vectors
+
+require vector_size 2048
+
+statement ok
+ATTACH '__TEST_DIR__/segment_boundary_read.db' AS a (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+ATTACH ':memory:' AS plain
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE a.t AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://www.example-' || (((i // 3) * 7919) % 7001)::VARCHAR || '.org/' || CASE WHEN (i // 3) % 13 = 0 THEN 'needle/' ELSE 'path/' END || repeat('p', (i % 37)::INT) || '/' || (i % 911)::VARCHAR END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'cat-' || (i % 37)::VARCHAR END AS d, 'unique-value-' || i::VARCHAR || '-' || repeat('u', (i % 29)::INT) AS u FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT a
+
+statement ok
+CREATE TABLE plain.t AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://www.example-' || (((i // 3) * 7919) % 7001)::VARCHAR || '.org/' || CASE WHEN (i // 3) % 13 = 0 THEN 'needle/' ELSE 'path/' END || repeat('p', (i % 37)::INT) || '/' || (i % 911)::VARCHAR END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'cat-' || (i % 37)::VARCHAR END AS d, 'unique-value-' || i::VARCHAR || '-' || repeat('u', (i % 29)::INT) AS u FROM range(300000) tbl(i)
+
+# the long-string columns fill several DICT_FSST segments per row group
+
+query II
+SELECT count(*) FILTER (WHERE column_name = 's') > 6, count(*) FILTER (WHERE column_name = 'u') > 6 FROM pragma_storage_info('a.t') WHERE segment_type = 'VARCHAR' AND compression = 'DICT_FSST' AND start > 0
+----
+true	true
+
+# read whole: every row of every column equals the copy's
+
+query I
+SELECT count(*) FROM a.t x FULL OUTER JOIN plain.t y USING (i) WHERE x.i IS NULL OR y.i IS NULL OR x.k IS DISTINCT FROM y.k OR x.s IS DISTINCT FROM y.s OR x.d IS DISTINCT FROM y.d OR x.u IS DISTINCT FROM y.u
+----
+0
+
+query I
+SELECT (SELECT [count(*), count(s), count(d), count(u), sum(length(s)), sum(length(d)), sum(length(u))] FROM a.t) = (SELECT [count(*), count(s), count(d), count(u), sum(length(s)), sum(length(d)), sum(length(u))] FROM plain.t)
+----
+true
+
+# windows of three rows around every segment start of every string column (a scan that skips to the window and reads the
+# vector that begins there), and the whole vector that starts at each segment start of s
+
+query II
+SELECT count(*) FILTER (WHERE x.s IS DISTINCT FROM y.s OR x.d IS DISTINCT FROM y.d OR x.u IS DISTINCT FROM y.u), count(*) > 0 FROM (SELECT DISTINCT start AS b FROM pragma_storage_info('a.t') WHERE segment_type = 'VARCHAR' AND column_name IN ('s', 'd', 'u') AND start > 0) w, a.t x, plain.t y WHERE x.i BETWEEN w.b - 1 AND w.b + 1 AND y.i = x.i
+----
+0	true
+
+query II
+SELECT bool_and((SELECT list(s ORDER BY i) FROM a.t WHERE i >= w.b AND i < w.b + 2048) IS NOT DISTINCT FROM (SELECT list(s ORDER BY i) FROM plain.t WHERE i >= w.b AND i < w.b + 2048)), count(*) > 0 FROM (SELECT DISTINCT start AS b FROM pragma_storage_info('a.t') WHERE segment_type = 'VARCHAR' AND column_name = 's' AND start > 0) w
+----
+true	true
+
+# filters through the DICT_FSST, DICTIONARY and FSST_ONLY segments; the selective filters on k first evaluate the string
+# filter on the selected rows only
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE contains(s, 'needle')) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE contains(s, 'needle')) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE NOT contains(s, 'needle')) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE NOT contains(s, 'needle')) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE s LIKE '%example-1_.org/needle%') AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE s LIKE '%example-1_.org/needle%') AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE s = (SELECT s FROM plain.t WHERE i = 123457)) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE s = (SELECT s FROM plain.t WHERE i = 123457)) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE s <> '') AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE s <> '') AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE s = '') AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE s = '') AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE s IS NULL) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE s IS NULL) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE prefix(s, 'https://www.example-12')) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE prefix(s, 'https://www.example-12')) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(d), 'sum': sum(i), 'mn': min(d), 'mx': max(d)} FROM a.t WHERE d = 'cat-5' OR d IN ('cat-17', 'cat-36')) AS x, (SELECT {'n': count(*), 'v': count(d), 'sum': sum(i), 'mn': min(d), 'mx': max(d)} FROM plain.t WHERE d = 'cat-5' OR d IN ('cat-17', 'cat-36')) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(u), 'sum': sum(i), 'mn': min(u), 'mx': max(u)} FROM a.t WHERE u LIKE 'unique-value-12%') AS x, (SELECT {'n': count(*), 'v': count(u), 'sum': sum(i), 'mn': min(u), 'mx': max(u)} FROM plain.t WHERE u LIKE 'unique-value-12%') AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE k < 300 AND contains(s, 'needle')) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE k < 300 AND contains(s, 'needle')) AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE k = 2047 AND s <> '') AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE k = 2047 AND s <> '') AS y)
+----
+true	true
+
+query II
+SELECT x IS NOT DISTINCT FROM y, x.n > 0 FROM (SELECT (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM a.t WHERE k < 1 AND NOT contains(s, 'needle')) AS x, (SELECT {'n': count(*), 'v': count(s), 'sum': sum(i), 'mn': min(s), 'mx': max(s)} FROM plain.t WHERE k < 1 AND NOT contains(s, 'needle')) AS y)
+----
+true	true
+
+# grouping on the dictionary columns
+
+query I
+SELECT count(*) FROM ((SELECT s, d, count(*) AS c FROM a.t GROUP BY ALL EXCEPT SELECT s, d, count(*) AS c FROM plain.t GROUP BY ALL) UNION ALL (SELECT s, d, count(*) AS c FROM plain.t GROUP BY ALL EXCEPT SELECT s, d, count(*) AS c FROM a.t GROUP BY ALL))
+----
+0

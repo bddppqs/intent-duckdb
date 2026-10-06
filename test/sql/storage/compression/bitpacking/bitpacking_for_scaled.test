@@ -1,0 +1,200 @@
+# name: test/sql/storage/compression/bitpacking/bitpacking_for_scaled.test
+# description: FOR_SCALED: in a block-compressed file at 0x40000002, a bit-packed group whose offsets from its minimum share a common divisor stores them divided by it
+# group: [bitpacking]
+
+require block_size 262144
+
+require vector_size 2048
+
+require skip_reload
+
+# the same rows in a block-compressed file (latest) and in a file that never holds FOR_SCALED (v1.4.0)
+statement ok
+ATTACH '__TEST_DIR__/for_scaled_new.db' AS vnew (STORAGE_VERSION 'latest')
+
+statement ok
+ATTACH '__TEST_DIR__/for_scaled_old.db' AS vold (STORAGE_VERSION 'v1.4.0')
+
+statement ok
+PRAGMA force_compression = 'bitpacking'
+
+# common divisors 10^6 (us: seconds as microseconds), 10^3, 7, 256 (edge: offsets near 2^63) and none (plain); a divisor in
+# every other group (mixed); NULLs; negative values; a range FOR cannot hold (wide); the unsigned 64-bit top (uedge); the
+# narrow, timestamp, date and decimal types; HUGEINT keeps FOR
+statement ok
+CREATE TABLE vnew.t AS SELECT
+	i,
+	(1614556800 + (i * 7919) % 2678400) * 1000000 AS us,
+	((i * 104729) % 1000003) * 1000 - 500000000 AS ms,
+	((i * 7919) % 4096) * 7 AS seven,
+	(i * 7919) % 1000003 AS plain,
+	CASE WHEN i // 2048 % 2 = 0 THEN ((i * 31) % 5000) * 1000000 ELSE (i * 31) % 5000 END AS mixed,
+	CASE WHEN i % 5 = 0 THEN NULL ELSE ((i * 13) % 100000) * 1000000 END AS nulls,
+	-(((i * 7919) % 2678400) * 1000000) - 4611686018427387904 AS negative,
+	CASE WHEN i % 2 = 0 THEN -4611686018427387904 + ((i * 17) % 1024) * 256 ELSE 4611686018427387648 - ((i * 13) % 1024) * 256 END AS edge,
+	(CASE WHEN i % 2 = 0 THEN -9223372036854775000 + ((i * 17) % 1024) * 1000 ELSE 9223372036854775000 - ((i * 13) % 1024) * 1000 END)::BIGINT AS wide,
+	(18446744073709550000 - ((i * 7919) % 1000003) * 1000)::UBIGINT AS uedge,
+	(((i * 13) % 300) * 100)::SMALLINT AS small,
+	(((i * 7) % 12) * 10 - 60)::TINYINT AS tiny,
+	(((i * 7919) % 1000003) * 1000)::INTEGER AS int32,
+	TIMESTAMP '2021-03-01' + to_seconds((i * 7919) % 2678400) AS ts,
+	(TIMESTAMP '2021-03-01' + to_seconds((i * 7919) % 2678400))::TIMESTAMP_MS AS ts_ms,
+	DATE '2021-03-01' + (((i * 7) % 31) * 7)::INTEGER AS dt,
+	(((i * 7919) % 4096) * 1000000)::HUGEINT AS huge,
+	(((i * 7919) % 1000003) * 100)::DECIMAL(18, 2) AS dec
+FROM range(300000) r(i)
+
+statement ok
+CREATE TABLE vold.t AS FROM vnew.t
+
+statement ok
+CHECKPOINT vnew
+
+statement ok
+CHECKPOINT vold
+
+query TT
+SELECT column_name, bool_or(coalesce(segment_info, '') LIKE '%FOR_SCALED%') FROM pragma_storage_info('vnew.t')
+WHERE segment_type NOT IN ('VALIDITY') GROUP BY ALL ORDER BY column_name
+----
+dec	true
+dt	true
+edge	true
+huge	false
+i	false
+int32	true
+mixed	true
+ms	true
+negative	true
+nulls	true
+plain	false
+seven	true
+small	true
+tiny	true
+ts	true
+ts_ms	true
+uedge	true
+us	true
+wide	false
+
+# mixed: the 74 groups of 2048 rows with the divisor are FOR_SCALED, the 73 without it keep their mode (DELTA_FOR)
+query II
+SELECT sum(coalesce(TRY_CAST(regexp_extract(segment_info, 'FOR_SCALED: (\d+)', 1) AS INTEGER), 0)),
+	sum(coalesce(TRY_CAST(regexp_extract(segment_info, '(^|, )DELTA_FOR: (\d+)', 2) AS INTEGER), 0))
+FROM pragma_storage_info('vnew.t') WHERE column_name = 'mixed' AND segment_type NOT IN ('VALIDITY')
+----
+74	73
+
+query I
+SELECT count(*) FROM pragma_storage_info('vold.t') WHERE segment_info LIKE '%FOR_SCALED%'
+----
+0
+
+# every row reads back as written (the answers below are upstream DuckDB v1.5.2's over the same SELECT)
+query I
+SELECT count(*) FROM (FROM vnew.t EXCEPT ALL FROM vold.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM vold.t EXCEPT ALL FROM vnew.t)
+----
+0
+
+query IIIIIIIII
+SELECT count(*), min(us), max(us), sum(ms), min(negative), max(edge), min(edge), min(wide), max(wide) FROM vnew.t
+----
+300000	1614556800000000	1617235195000000	-225459000	-4611688696822387904	4611686018427387392	-4611686018427387904	-9223372036854775000	9223372036854774000
+
+query IIIIIIIIII
+SELECT max(uedge), min(uedge), count(nulls), sum(nulls), sum(small), sum(tiny), sum(int32), min(dt), max(dt), sum(dec) FROM vnew.t
+----
+18446744073709550000	18446744072709550000	240000	12000000000000000	4485000000	-1500000	149986541729000	2021-03-01	2021-09-27	14998654172900.00
+
+# filters on the zone maps of FOR_SCALED segments
+query I
+SELECT count(*) FROM vnew.t WHERE ts >= TIMESTAMP '2021-03-15 00:00:00' AND ts < TIMESTAMP '2021-03-16 00:00:00'
+----
+9680
+
+query II
+SELECT count(*), sum(epoch_us(ts)) % 1000000007 FROM vnew.t WHERE us BETWEEN 1614920000000000 AND 1615020000000000
+----
+11202	440743358
+
+query IIIIIIII
+SELECT i, us, edge, uedge, ts, ts_ms, mixed, nulls FROM vnew.t WHERE i IN (1, 2047, 2049, 123457, 299999) ORDER BY i
+----
+1	1614564719000000	4611686018427384320	18446744073701631000	2021-03-01 02:11:59	2021-03-01 02:11:59	31000000	13000000
+2047	1614696593000000	4611686018427128832	18446744073499405000	2021-03-02 14:49:53	2021-03-02 14:49:53	3457000000	26611000000
+2049	1614712431000000	4611686018427384320	18446744073483567000	2021-03-02 19:13:51	2021-03-02 19:13:51	3519	26637000000
+123457	1614596783000000	4611686018427302400	18446744073056498000	2021-03-01 11:06:23	2021-03-01 11:06:23	2167000000	4941000000
+299999	1617186481000000	4611686018427235328	18446744073024594000	2021-03-31 10:28:01	2021-03-31 10:28:01	4969000000	99987000000
+
+# fetches by row id
+query IIIIIIII
+SELECT i, us, edge, uedge, ts, ts_ms, mixed, nulls FROM vnew.t WHERE rowid IN (1, 2047, 2049, 123457, 299999) ORDER BY i
+----
+1	1614564719000000	4611686018427384320	18446744073701631000	2021-03-01 02:11:59	2021-03-01 02:11:59	31000000	13000000
+2047	1614696593000000	4611686018427128832	18446744073499405000	2021-03-02 14:49:53	2021-03-02 14:49:53	3457000000	26611000000
+2049	1614712431000000	4611686018427384320	18446744073483567000	2021-03-02 19:13:51	2021-03-02 19:13:51	3519	26637000000
+123457	1614596783000000	4611686018427302400	18446744073056498000	2021-03-01 11:06:23	2021-03-01 11:06:23	2167000000	4941000000
+299999	1617186481000000	4611686018427235328	18446744073024594000	2021-03-31 10:28:01	2021-03-31 10:28:01	4969000000	99987000000
+
+# a delete and an update after the checkpoint, a second checkpoint, a detach and a reattach
+statement ok
+DELETE FROM vnew.t WHERE i % 7 = 3
+
+statement ok
+DELETE FROM vold.t WHERE i % 7 = 3
+
+statement ok
+UPDATE vnew.t SET us = us + 1000000 WHERE i % 1000 = 1
+
+statement ok
+UPDATE vold.t SET us = us + 1000000 WHERE i % 1000 = 1
+
+statement ok
+CHECKPOINT vnew
+
+statement ok
+CHECKPOINT vold
+
+statement ok
+DETACH vnew
+
+statement ok
+DETACH vold
+
+# a new block-compressed file is created at the version that admits FOR_SCALED (0x40000002, little-endian after the
+# magic "DUCK"); the v1.4.0 file keeps upstream's 67
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_new.db')
+----
+4455434B	0200004000000000
+
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_old.db')
+----
+4455434B	4300000000000000
+
+statement ok
+ATTACH '__TEST_DIR__/for_scaled_new.db' AS vnew
+
+statement ok
+ATTACH '__TEST_DIR__/for_scaled_old.db' AS vold
+
+query I
+SELECT count(*) FROM (FROM vnew.t EXCEPT ALL FROM vold.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM vold.t EXCEPT ALL FROM vnew.t)
+----
+0
+
+query IIIIIIII
+SELECT count(*), sum(us) % 1000000007, sum(seven), sum(mixed), sum(negative) % 1000000007, sum(edge) % 1000000007, sum(huge), sum(uedge) % 1000000007 FROM vnew.t
+----
+257143	625628974	3684915409	322448717280170	-593513420	-211005266	526416487000000	135935768

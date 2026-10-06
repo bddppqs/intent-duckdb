@@ -8,6 +8,7 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/operator/aggregate/run_aggregate.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
@@ -281,10 +282,15 @@ public:
 	    : TableScanGlobalState(context, bind_data_p), bind_data(bind_data_p->Cast<TableScanBindData>()),
 	      duck_table(bind_data.table.Cast<DuckTableEntry>()), tx(DuckTransaction::Get(context, duck_table.catalog)),
 	      storage(duck_table.GetStorage()), total_rows(storage.GetTotalRows()) {
+		if (SharedFilterOrderEnabled()) {
+			shared_filter_order = make_shared_ptr<AdaptiveFilterShared>();
+		}
 	}
 
 public:
 	ParallelTableScanState state;
+	//! this scan execution's shared filter order (kSharedFilterOrder), attached to every thread's adaptive filter
+	shared_ptr<AdaptiveFilterShared> shared_filter_order;
 	//! the columns this scan publishes (the planner's mark on the PhysicalTableScan), set on this thread
 	//! around every storage call that initializes a segment scan or a column build (may be null)
 	shared_ptr<dict_global::ScanPublication> global_scan_publication;
@@ -311,9 +317,19 @@ public:
 			    make_uniq<RowGroupReorderer>(*bind_data.order_options, TransactionData(tx));
 			l_state->scan_state.local_state.reorderer =
 			    make_uniq<RowGroupReorderer>(*bind_data.order_options, TransactionData(tx));
+			l_state->scan_state.table_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
+			l_state->scan_state.local_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
 		}
 
 		l_state->scan_state.Initialize(std::move(storage_ids), context.client, input.filters, input.sample_options);
+		if (shared_filter_order) {
+			auto adaptive_filter = l_state->scan_state.GetFilterInfo().GetAdaptiveFilter();
+			if (adaptive_filter) {
+				// with the shared order, ScanFilterInfo::Initialize constructed the derived filter
+				auto &shared_filter = static_cast<SharedOrderAdaptiveFilter &>(*adaptive_filter);
+				shared_filter.AttachShared(shared_filter.local, shared_filter_order);
+			}
+		}
 
 		if (ParallelCollectionScanState::PiecesEnabled()) {
 			auto sink = context.pipeline ? context.pipeline->GetSink() : optional_ptr<PhysicalOperator>();
@@ -439,6 +455,12 @@ unique_ptr<GlobalTableFunctionState> DuckTableScanInitGlobal(ClientContext &cont
 		auto transaction = TransactionData(DuckTransaction::Get(context, storage.GetAttached()));
 		g_state->state.scan_state.reorderer = make_uniq<RowGroupReorderer>(*bind_data.order_options, transaction);
 		g_state->state.local_state.reorderer = make_uniq<RowGroupReorderer>(*bind_data.order_options, transaction);
+		vector<StorageIndex> storage_ids;
+		for (auto &col : input.column_indexes) {
+			storage_ids.push_back(bind_data.table.GetStorageIndex(col));
+		}
+		g_state->state.scan_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
+		g_state->state.local_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
 	}
 
 	g_state->global_scan_publication = dict_global::ScanPublicationOf(input.bind_data.get());

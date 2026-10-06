@@ -241,6 +241,13 @@ public:
 	//! Direct accessors, fall outside of general use but can be useful to some extensions
 	ColumnData &GetRawColumnData(const StorageIndex &c) const;
 	ColumnData &GetRawColumnData(storage_t c) const;
+	//! Whether column `c` is in memory: one not loaded carries no update (an update loads its column first), and
+	//! GetRawColumnData on it reads its metadata
+	bool IsColumnLoaded(storage_t c) const {
+		return ColumnIsLoaded(c);
+	}
+	//! IsColumnLoaded read under the row group's lock: ordered against a LoadColumn of `c` in progress
+	bool IsColumnLoadedLocked(storage_t c) const;
 
 private:
 	optional_ptr<RowVersionManager> GetVersionInfo();

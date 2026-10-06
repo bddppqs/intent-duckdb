@@ -5,6 +5,7 @@
 #include "duckdb/common/serializer/binary_deserializer.hpp"
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
@@ -213,6 +214,22 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 	auto block_manager = dynamic_cast<SingleFileBlockManager *>(&checkpoint_manager.GetBlockManager());
 	if (block_manager && block_manager->BlockCompression()) {
 		serializer.WritePropertyWithDefault<bool>(105, "stats_exact", collection.StatsExact(), false);
+	}
+	// The admitted VARCHAR columns' stored translations (split-dictionary files only; kept when the metadata is reused)
+	if (block_manager && block_manager->SplitDictionarySegments()) {
+		auto translations = dict_global::PersistAtCheckpoint(context, GetDatabase(), info, collection,
+		                                                     table.GetStorage().Columns(),
+		                                                     checkpoint_manager.GetBlockManager(),
+		                                                     existing_pointer.IsValid());
+		if (debug_verify_blocks) {
+			for (auto &column : translations) {
+				for (auto &block : column.blocks) {
+					checkpoint_manager.verify_block_usage_count[block]++;
+				}
+			}
+		}
+		serializer.WritePropertyWithDefault<vector<dict_global::PersistedColumn>>(106, "dict_global_translations",
+		                                                                         translations);
 	}
 }
 

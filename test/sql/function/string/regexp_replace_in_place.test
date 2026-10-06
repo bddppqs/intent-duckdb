@@ -1,0 +1,202 @@
+# name: test/sql/function/string/regexp_replace_in_place.test
+# description: regexp_replace: anchored captures, repeats, character classes, flags and UTF-8, the global option, invalid rewrites, NULL, and constant and per-row patterns
+# group: [string]
+
+# Anchored captures, repeats, character classes, flags and UTF-8
+query T
+SELECT replace(regexp_replace('key=value', '^([a-z]+)=.*$', '\1'), chr(10), '<NL>')
+----
+key
+
+query T
+SELECT replace(regexp_replace('key=va' || chr(10) || 'lue', '^([a-z]+)=.*$', '\1'), chr(10), '<NL>')
+----
+key=va<NL>lue
+
+query T
+SELECT replace(regexp_replace('key=va' || chr(10) || 'lue', '^([a-z]+)=.*$', '\1', 's'), chr(10), '<NL>')
+----
+key
+
+query T
+SELECT replace(regexp_replace('2024-abc', '^(\d+)-[a-z]*$', '\1'), chr(10), '<NL>')
+----
+2024
+
+query T
+SELECT replace(regexp_replace('2024-abC', '^(\d+)-[a-z]*$', '\1'), chr(10), '<NL>')
+----
+2024-abC
+
+query T
+SELECT replace(regexp_replace('2024-abC', '^(\d+)-[a-z]*$', '\1', 'i'), chr(10), '<NL>')
+----
+2024
+
+query T
+SELECT replace(regexp_replace('mail to bob@example.com', '(\w+)@[^ ]*$', '\1'), chr(10), '<NL>')
+----
+mail to bob
+
+query T
+SELECT replace(regexp_replace('bob@x y', '(\w+)@[^ ]*$', '\1'), chr(10), '<NL>')
+----
+bob@x y
+
+query T
+SELECT replace(regexp_replace('abc  ', '^(.*?)\s*$', '[\1]'), chr(10), '<NL>')
+----
+[abc]
+
+query T
+SELECT replace(regexp_replace('aaabbb', '^(a+)b*$', '\1'), chr(10), '<NL>')
+----
+aaa
+
+query T
+SELECT replace(regexp_replace('aaabbc', '^(a+)b*$', '\1'), chr(10), '<NL>')
+----
+aaabbc
+
+query T
+SELECT replace(regexp_replace('12абв', '^(\d+)[а-я]*$', '\1'), chr(10), '<NL>')
+----
+12
+
+query T
+SELECT replace(regexp_replace('12абвZ', '^(\d+)[а-я]*$', '\1'), chr(10), '<NL>')
+----
+12абвZ
+
+query T
+SELECT replace(regexp_replace('ééxyz', '^(é+)[^\n]*$', '<\1>'), chr(10), '<NL>')
+----
+<éé>
+
+query T
+SELECT replace(regexp_replace('x' || chr(10) || '' || chr(10) || '', '(?s)^(x).*$', '\1'), chr(10), '<NL>')
+----
+x
+
+query T
+SELECT replace(regexp_replace('id:42 tail', '^(\w+):.*\z', '\1'), chr(10), '<NL>')
+----
+id
+
+query T
+SELECT replace(regexp_replace('k;v;w', '^(\w+);.*?$', '\1'), chr(10), '<NL>')
+----
+k
+
+query T
+SELECT replace(regexp_replace('k=v', '^(\w)=.*$', '<\0>'), chr(10), '<NL>')
+----
+<k=v>
+
+query T
+SELECT replace(regexp_replace('x: abc def', '(\w+) [a-z]*$', '#\1'), chr(10), '<NL>')
+----
+x: #abc
+
+query T
+SELECT replace(regexp_replace('😀😀tail', '^(😀+).*$', '\1'), chr(10), '<NL>')
+----
+😀😀
+
+query T
+SELECT replace(regexp_replace('tail😀' || chr(10) || '', '^(t)[^😀]*$', '\1'), chr(10), '<NL>')
+----
+tail😀<NL>
+
+query T
+SELECT replace(regexp_replace('', '^(a*).*$', 'X\1'), chr(10), '<NL>')
+----
+X
+
+query T
+SELECT replace(regexp_replace('', '^(a+).*$', 'X'), chr(10), '<NL>')
+----
+(empty)
+
+query T
+SELECT replace(regexp_replace('abc', '^(a).*$', '\x'), chr(10), '<NL>')
+----
+abc
+
+query T
+SELECT replace(regexp_replace('abc', '^(a).*$', '\2'), chr(10), '<NL>')
+----
+abc
+
+query T
+SELECT replace(regexp_replace('abc', '^(a).*$', '\\\1'), chr(10), '<NL>')
+----
+\a
+
+query T
+SELECT replace(regexp_replace('aXX', '^(a)x*$', '\1', 'i'), chr(10), '<NL>')
+----
+a
+
+# Other patterns
+query T
+SELECT replace(regexp_replace('aabb', '^(a+)(b*)$', '\2\1'), chr(10), '<NL>')
+----
+bbaa
+
+query T
+SELECT replace(regexp_replace('a' || chr(10) || 'b', '(?m)^(a).*$', '<\1>'), chr(10), '<NL>')
+----
+<a><NL>b
+
+query T
+SELECT replace(regexp_replace('abc', '^(\w+).+$', '\1'), chr(10), '<NL>')
+----
+ab
+
+query T
+SELECT replace(regexp_replace('abc', '([a-z]+)$', '<\1>'), chr(10), '<NL>')
+----
+<abc>
+
+query T
+SELECT replace(regexp_replace('abc', '(.*)$', '[\1]'), chr(10), '<NL>')
+----
+[abc]
+
+query T
+SELECT replace(regexp_replace('one two', '(o)', '0', 'g'), chr(10), '<NL>')
+----
+0ne tw0
+
+query T
+SELECT replace(regexp_replace('a.b.c', '\.', '/'), chr(10), '<NL>')
+----
+a/b.c
+
+# NULL input
+query T
+SELECT regexp_replace(NULL, '^(a).*$', '\1')
+----
+NULL
+
+statement ok
+CREATE TABLE patterns AS SELECT * FROM (VALUES (0, 'k1=v1', '^(\w+)=.*$'), (1, 'k2=v' || chr(10) || '2', '^(\w+)=.*$'), (2, '2024-xyz', '^(\d+)-[a-z]*$'), (3, 'aabb', '^(a+)(b*)$')) t(id, s, p)
+
+# a pattern per row
+query IT
+SELECT id, replace(regexp_replace(s, p, '<\1>'), chr(10), '<NL>') FROM patterns ORDER BY id
+----
+0	<k1>
+1	k2=v<NL>2
+2	<2024>
+3	<aa>
+
+# one constant pattern over a column
+query IT
+SELECT id, replace(regexp_replace(s, '^(\w+)=.*$', '<\1>'), chr(10), '<NL>') FROM patterns ORDER BY id
+----
+0	<k1>
+1	k2=v<NL>2
+2	2024-xyz
+3	aabb

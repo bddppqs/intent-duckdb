@@ -1,0 +1,102 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_caching.test
+# description: a FILTER between a scan and the consumer of a column with stored translations (a code key, a distinct
+# bitmap) keeps the column a string column: a FILTER caches its small output chunks by appending them, and the append
+# copies strings, which a codes-only vector does not hold; the answers agree with caching operators on and off and with
+# the same data stored in memory
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_caching.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# s: 200003 values (each in runs of three), '' and NULL; (u + v) % 1000 = 7 reads two columns, so no scan takes it: a
+# FILTER passes one row in a thousand, and its output chunks of a few rows each are cached
+statement ok
+CREATE TABLE t AS SELECT i, (i // 100) * 1000000007 AS u,
+CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS s,
+'nval-' || ((i // 3) % 200003) || '-0123456789' AS n, (i % 1000)::INTEGER AS v
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+statement ok
+SET enable_caching_operators=true
+
+# a FILTER between the scan and its consumer (a code key, a distinct bitmap): the scan does not read s codes only
+query II
+EXPLAIN SELECT s, count(*) FROM t WHERE (u + v) % 1000 = 7 GROUP BY s
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+EXPLAIN SELECT count(DISTINCT s) FROM t WHERE (u + v) % 1000 = 7
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+# the filter pushed into the scan: no FILTER, and the scan reads s codes only
+query II
+EXPLAIN SELECT s, count(*) FROM t WHERE s <> '' GROUP BY s
+----
+physical_plan	<REGEX>:.*Codes Only.*
+
+# a SEMI join between the scan and its consumer: the scan does not read s codes only
+query II
+EXPLAIN SELECT s, count(*) FROM t WHERE v IN (SELECT v FROM t WHERE (u + v) % 1000 = 7) GROUP BY s
+----
+physical_plan	<!REGEX>:.*Codes Only.*
+
+query II
+SELECT count(*), count(DISTINCT s) FROM (SELECT s, count(*) AS c FROM t WHERE (u + v) % 1000 = 7 GROUP BY s)
+----
+4762	4761
+
+query I
+SELECT count(DISTINCT s) FROM t WHERE (u + v) % 1000 = 7
+----
+4761
+
+query II
+SELECT count(*), count(DISTINCT s) FROM (SELECT s, count(*) AS c FROM t WHERE s <> '' GROUP BY s)
+----
+200003	200003
+
+query II
+SELECT count(*), count(DISTINCT s) FROM (SELECT s, count(*) AS c FROM t WHERE v IN (SELECT v FROM t WHERE (u + v) % 1000 = 7) GROUP BY s)
+----
+188077	188076
+
+# against the in-memory copy
+query I
+SELECT count(*) FROM ((SELECT s, count(*), sum(i) FROM t WHERE (u + v) % 1000 = 7 GROUP BY s) EXCEPT ALL (SELECT s, count(*), sum(i) FROM r WHERE (u + v) % 1000 = 7 GROUP BY s))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT s, count(*), sum(i) FROM r WHERE (u + v) % 1000 = 7 GROUP BY s) EXCEPT ALL (SELECT s, count(*), sum(i) FROM t WHERE (u + v) % 1000 = 7 GROUP BY s))
+----
+0
+
+# caching operators off: the same answers
+statement ok
+SET enable_caching_operators=false
+
+query II
+SELECT count(*), count(DISTINCT s) FROM (SELECT s, count(*) AS c FROM t WHERE (u + v) % 1000 = 7 GROUP BY s)
+----
+4762	4761
+
+query I
+SELECT count(DISTINCT s) FROM t WHERE (u + v) % 1000 = 7
+----
+4761
+
+statement ok
+RESET enable_caching_operators

@@ -2,6 +2,10 @@
 #include "duckdb/common/typedefs.hpp"
 #include "fsst.h"
 #include "duckdb/common/fsst.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+#include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
+#include "duckdb/storage/table/column_checkpoint_state.hpp"
+#include "duckdb/storage/block_manager.hpp"
 
 #if defined(__MVS__) && !defined(alloca)
 #define alloca __builtin_alloca
@@ -20,6 +24,7 @@ DictFSSTCompressionState::DictFSSTCompressionState(ColumnDataCheckpointData &che
           1                                                                // maximum_target_capacity_p (byte capacity)
           ),
       analyze(std::move(analyze_p)) {
+	split_segments = SplitSegmentsEnabled(info.GetBlockManager());
 	CreateEmptySegment();
 }
 
@@ -89,9 +94,11 @@ idx_t DictFSSTCompressionState::Finalize() {
 	}
 	required_space += string_lengths_space;
 	required_space = AlignValue<idx_t>(required_space);
+	const idx_t region_space = required_space;
 	required_space += dictionary_indices_space;
 
-	D_ASSERT(info.GetBlockSize() >= required_space);
+	D_ASSERT(info.GetBlockSize() >= region_space &&
+	         (info.GetBlockSize() >= required_space || (split_segments && dictionary_indices_space <= info.GetBlockSize())));
 
 	// calculate ptr and offsets
 	auto base_ptr = current_handle.Ptr();
@@ -117,6 +124,15 @@ idx_t DictFSSTCompressionState::Finalize() {
 	// Write the string lengths of the dictionary
 	BitpackingPrimitives::PackBuffer<uint32_t, false>(base_ptr + string_lengths_dest, string_lengths.data(), dict_count,
 	                                                  string_lengths_width);
+	// split by its region, or because its codes do not fit beside it (CodesInBlock counts them outside the block from a
+	// settled region at the threshold, aligned: a few bytes under it unaligned)
+	split_this_segment = split_segments && dictionary_indices_space > 0 &&
+	                     (string_lengths_dest + string_lengths_space >= info.GetBlockSize() / 4 ||
+	                      dictionary_indices_dest + dictionary_indices_space > info.GetBlockSize());
+	if (split_this_segment) {
+		// a split segment: its local codes go to the code block (SplitCodesOf), the segment ends with its string lengths
+		return string_lengths_dest + string_lengths_space;
+	}
 	// Write the dictionary indices (selection vector)
 	BitpackingPrimitives::PackBuffer<sel_t, false>(base_ptr + dictionary_indices_dest,
 	                                               (sel_t *)(dictionary_indices.data()), tuple_count,
@@ -148,6 +164,28 @@ idx_t DictFSSTCompressionState::CalculateRequiredSpace() const {
 	required_space += dictionary_indices_space;
 
 	return required_space;
+}
+
+idx_t DictFSSTCompressionState::CodesInBlock(idx_t indices_space) const {
+	// before the encoding decision (REGULAR) the dictionary is raw and may shrink when encoded: its codes are counted
+	const idx_t block_size = info.GetBlockSize();
+	if (kSplitCodesOutsideSegmentBlock && split_segments && append_state != DictionaryAppendState::REGULAR &&
+	    SettledRegion() >= block_size / 4 && indices_space <= block_size) {
+		return 0;
+	}
+	return indices_space;
+}
+
+idx_t DictFSSTCompressionState::SettledRegion() const {
+	idx_t region = AlignValue<idx_t>(sizeof(dict_fsst_compression_header_t));
+	region += dictionary_offset;
+	region = AlignValue<idx_t>(region);
+	if (IsEncoded(append_state)) {
+		region += symbol_table_size;
+		region = AlignValue<idx_t>(region);
+	}
+	region += string_lengths_space;
+	return AlignValue<idx_t>(region);
 }
 
 void DictFSSTCompressionState::FlushEncodingBuffer() {
@@ -183,7 +221,8 @@ void DictFSSTCompressionState::FlushEncodingBuffer() {
 	taken_space = AlignValue<idx_t>(taken_space);
 	taken_space += string_lengths_space;
 	taken_space = AlignValue<idx_t>(taken_space);
-	taken_space += dictionary_indices_space;
+	// the codes' bytes in this block, as the room check counted them when it admitted the pending entries
+	taken_space += CodesInBlock(dictionary_indices_space);
 	taken_space = AlignValue<idx_t>(taken_space);
 	taken_space += dictionary_offset;
 	D_ASSERT(taken_space < info.GetBlockSize());
@@ -229,9 +268,11 @@ void DictFSSTCompressionState::FlushEncodingBuffer() {
 	required_space = AlignValue<idx_t>(required_space);
 	required_space += string_lengths_space;
 	required_space = AlignValue<idx_t>(required_space);
+	const idx_t region_space = required_space;
 	required_space += dictionary_indices_space;
 
-	D_ASSERT(required_space <= info.GetBlockSize());
+	D_ASSERT(region_space <= info.GetBlockSize() &&
+	         (required_space <= info.GetBlockSize() || (split_segments && dictionary_indices_space <= info.GetBlockSize())));
 
 	D_ASSERT(string_lengths_space != 0);
 	to_encode_string_sum = 0;
@@ -280,6 +321,17 @@ void DictFSSTCompressionState::Flush(bool final) {
 	current_segment->count = tuple_count;
 
 	auto segment_size = Finalize();
+	if (split_this_segment) {
+		SplitCodesOf(*current_segment);
+	}
+	if (flush_whole_block) {
+		// a segment ended on a vector boundary: no small segment is likely to fill the rest of this block, and a partial
+		// block is held open (and its buffer pinned) until the writer's final flush, which writes them one by one; it is
+		// written whole now, by this thread
+		auto block_size = info.GetBlockSize();
+		memset(current_handle.Ptr() + segment_size, 0, block_size - segment_size);
+		segment_size = block_size;
+	}
 	auto &state = checkpoint_data.GetCheckpointState();
 	state.FlushSegment(std::move(current_segment), std::move(current_handle), segment_size);
 
@@ -337,7 +389,7 @@ static inline bool AddLookup(DictFSSTCompressionState &state, idx_t lookup, cons
 	}
 	required_space += state.string_lengths_space;
 	required_space = AlignValue<idx_t>(required_space);
-	required_space += new_dictionary_indices_space;
+	required_space += state.CodesInBlock(new_dictionary_indices_space);
 
 	idx_t available_space = state.info.GetBlockSize();
 	if (APPEND_STATE == DictionaryAppendState::REGULAR) {
@@ -420,7 +472,7 @@ static inline bool AddToDictionary(DictFSSTCompressionState &state, const string
 	}
 	required_space += new_string_lengths_space;
 	required_space = AlignValue<idx_t>(required_space);
-	required_space += new_dictionary_indices_space;
+	required_space += state.CodesInBlock(new_dictionary_indices_space);
 
 	idx_t available_space = state.info.GetBlockSize();
 	if (APPEND_STATE == DictionaryAppendState::REGULAR) {
@@ -450,7 +502,7 @@ static inline bool AddToDictionary(DictFSSTCompressionState &state, const string
 		}
 		state.to_encode_string_sum += str_len;
 		auto &uncompressed_string = state.dictionary_encoding_buffer.back();
-		state.current_string_map.Insert(uncompressed_string);
+		state.RecordMapInsert(state.current_string_map.InsertAndGetSlot(uncompressed_string));
 	} else {
 		state.string_lengths.push_back(str_len);
 		auto baseptr =
@@ -458,7 +510,7 @@ static inline bool AddToDictionary(DictFSSTCompressionState &state, const string
 		memcpy(baseptr + state.dictionary_offset, str.GetData(), str_len);
 		string_t dictionary_string((const char *)(baseptr + state.dictionary_offset), str_len); // NOLINT
 		state.dictionary_offset += str_len;
-		state.current_string_map.Insert(dictionary_string);
+		state.RecordMapInsert(state.current_string_map.InsertAndGetSlot(dictionary_string));
 	}
 	state.dict_count++;
 
@@ -840,6 +892,16 @@ DictionaryAppendState DictFSSTCompressionState::TryEncode() {
 void DictFSSTCompressionState::Compress(Vector &scan_vector, idx_t count) {
 	UnifiedVectorFormat vector_format;
 	scan_vector.ToUnifiedFormat(count, vector_format);
+	if (!kVectorAlignedDictionarySegments || (total_tuple_count + tuple_count) % STANDARD_VECTOR_SIZE != 0) {
+		CompressRows(vector_format, count);
+		return;
+	}
+	// the checkpointer feeds this column the row group's vectors (ScanSegmentsAligned): each is appended whole, so a
+	// segment ends on a vector boundary unless one vector does not fit an empty segment
+	CommitVector(vector_format, count);
+}
+
+void DictFSSTCompressionState::CompressRows(UnifiedVectorFormat &vector_format, idx_t count) {
 	auto strings = UnifiedVectorFormat::GetData<string_t>(vector_format);
 
 	EncodedInput encoded_input;
@@ -875,8 +937,167 @@ void DictFSSTCompressionState::Compress(Vector &scan_vector, idx_t count) {
 	}
 }
 
+bool DictFSSTCompressionState::TryAppendVector(UnifiedVectorFormat &vector_format, idx_t count) {
+	// what an append changes, as it was before the vector: the appends are undone by truncating back to it
+	const idx_t old_tuple_count = tuple_count;
+	const uint32_t old_dict_count = dict_count;
+	const idx_t old_dictionary_offset = dictionary_offset;
+	const idx_t old_string_lengths_space = string_lengths_space;
+	const idx_t old_string_lengths = string_lengths.size();
+	const bitpacking_width_t old_string_lengths_width = string_lengths_width;
+	const idx_t old_dictionary_indices_space = dictionary_indices_space;
+	const idx_t old_dictionary_indices = dictionary_indices.size();
+	const bitpacking_width_t old_dictionary_indices_width = dictionary_indices_width;
+	const idx_t old_encoding_buffer = dictionary_encoding_buffer.size();
+	const idx_t old_to_encode_string_sum = to_encode_string_sum;
+	const idx_t old_map_size = current_string_map.GetSize();
+	const bool old_map_full = current_string_map.IsFull();
+	auto old_stats = current_segment->stats.statistics.Copy();
+
+	auto strings = UnifiedVectorFormat::GetData<string_t>(vector_format);
+	EncodedInput encoded_input;
+	map_slots_recording = true;
+	map_slots.clear();
+	bool fits = true;
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = vector_format.sel->get_index(i);
+		auto &str = strings[idx];
+		auto is_null = !vector_format.validity.RowIsValid(idx);
+		if (!CompressInternal(vector_format, str, is_null, encoded_input, i, count, false)) {
+			fits = false;
+			break;
+		}
+		if (!is_null) {
+			UncompressedStringStorage::UpdateStringStats(current_segment->stats, str);
+		} else {
+			current_segment->stats.statistics.SetHasNullFast();
+		}
+		tuple_count++;
+	}
+	map_slots_recording = false;
+	if (fits) {
+		return true;
+	}
+	tuple_count = old_tuple_count;
+	dict_count = old_dict_count;
+	dictionary_indices_space = old_dictionary_indices_space;
+	dictionary_indices.resize(old_dictionary_indices);
+	dictionary_indices_width = old_dictionary_indices_width;
+	if (append_state == DictionaryAppendState::ENCODED && string_lengths.size() > old_string_lengths) {
+		// the pending entries were encoded inside the vector (in creation order, after the encoded ones): every entry
+		// before the vector is encoded now, those of the vector are cut off the end, and nothing is pending
+		string_lengths.resize(old_dict_count);
+		uint32_t longest = 0;
+		dictionary_offset = 0;
+		for (auto length : string_lengths) {
+			dictionary_offset += length;
+			longest = MaxValue(longest, length);
+		}
+		string_lengths_width = MaxValue(old_string_lengths_width, BitpackingPrimitives::MinimumBitWidth(longest));
+		real_string_lengths_width = string_lengths_width;
+		string_lengths_space = BitpackingPrimitives::GetRequiredSize(dict_count, string_lengths_width);
+		dictionary_encoding_buffer.clear();
+		to_encode_string_sum = 0;
+	} else {
+		dictionary_offset = old_dictionary_offset;
+		string_lengths_space = old_string_lengths_space;
+		string_lengths.resize(old_string_lengths);
+		string_lengths_width = old_string_lengths_width;
+		dictionary_encoding_buffer.resize(old_encoding_buffer);
+		to_encode_string_sum = old_to_encode_string_sum;
+	}
+	current_string_map.RemoveLatest(map_slots, old_map_size, old_map_full);
+	current_segment->stats.statistics = std::move(old_stats);
+	return false;
+}
+
+void DictFSSTCompressionState::CommitVector(UnifiedVectorFormat &vector_format, idx_t count) {
+	if (count == 0) {
+		return;
+	}
+	// the steps a full segment takes, each tried at the vector's start (where they leave a vector boundary): the
+	// whole-vector append, the encoding of the dictionary or of its pending entries, then a new segment
+	bool appended = TryAppendVector(vector_format, count);
+	if (!appended && tuple_count > 0) {
+		if (append_state == DictionaryAppendState::REGULAR) {
+			append_state = TryEncode();
+			D_ASSERT(append_state != DictionaryAppendState::REGULAR);
+			appended = TryAppendVector(vector_format, count);
+		} else if (append_state == DictionaryAppendState::ENCODED && !dictionary_encoding_buffer.empty()) {
+			FlushEncodingBuffer();
+			appended = TryAppendVector(vector_format, count);
+		}
+		if (!appended) {
+			flush_whole_block = true;
+			Flush(false);
+			flush_whole_block = false;
+			appended = TryAppendVector(vector_format, count);
+		}
+	}
+	if (!appended) {
+		// a vector the empty segment does not hold whole (or only after its own encoding): row by row, as upstream does
+		CompressRows(vector_format, count);
+	}
+}
+
 void DictFSSTCompressionState::FinalizeCompress() {
 	Flush(true);
+	WriteCodeBlock();
+}
+
+void DictFSSTCompressionState::SplitCodesOf(ColumnSegment &segment) {
+	auto &block_manager = info.GetBlockManager();
+	const idx_t block_size = info.GetBlockSize();
+	const idx_t size = dictionary_indices_space;
+	D_ASSERT(size <= block_size);
+	if (code_block != INVALID_BLOCK && AlignValue<idx_t>(code_used) + size > block_size) {
+		WriteCodeBlock();
+	}
+	if (code_block == INVALID_BLOCK) {
+		if (!code_buffer) {
+			code_buffer = make_unsafe_uniq_array_uninitialized<data_t>(block_size);
+		}
+		// a block id of the writer's kind: newly used for an optimistic write, checkpointed for a checkpoint
+		code_block = checkpoint_data.GetCheckpointState().GetPartialBlockManager().GetFreeBlockId();
+		code_used = 0;
+		code_segments = 0;
+	}
+	const idx_t offset = AlignValue<idx_t>(code_used);
+	if (offset > code_used) {
+		memset(code_buffer.get() + code_used, 0, offset - code_used);
+	}
+	BitpackingPrimitives::PackBuffer<sel_t, false>(code_buffer.get() + offset, (sel_t *)(dictionary_indices.data()),
+	                                               tuple_count, dictionary_indices_width);
+	SplitCodes codes;
+	codes.block = code_block;
+	codes.offset = NumericCast<uint32_t>(offset);
+	codes.size = NumericCast<uint32_t>(size);
+	codes.dict_count = dict_count;
+	codes.mode = static_cast<uint8_t>(ConvertToMode(append_state));
+	codes.indices_width = dictionary_indices_width;
+	SetSegmentSplit(segment, codes);
+	if (code_segments > 0) {
+		// every segment of the code block holds one reference to it (a segment's drop releases one)
+		block_manager.IncreaseBlockReferenceCount(code_block);
+	}
+	code_segments++;
+	code_used = offset + size;
+}
+
+void DictFSSTCompressionState::WriteCodeBlock() {
+	if (code_block == INVALID_BLOCK) {
+		return;
+	}
+	auto &block_manager = info.GetBlockManager();
+	auto block = block_manager.CreateBlock(code_block, nullptr);
+	const idx_t block_size = info.GetBlockSize();
+	memcpy(block->buffer, code_buffer.get(), code_used);
+	memset(block->buffer + code_used, 0, block_size - code_used);
+	block_manager.Write(QueryContext(checkpoint_data.GetCheckpointState().GetPartialBlockManager().GetClientContext()),
+	                    *block, code_block);
+	code_block = INVALID_BLOCK;
+	code_used = 0;
+	code_segments = 0;
 }
 
 } // namespace dict_fsst

@@ -83,6 +83,7 @@ set(RE2_SOURCES
     re2/set.cc
     re2/simplify.cc
     re2/stringpiece.cc
+    re2/tdfa.cc
     re2/tostring.cc
     re2/unicode_casefold.cc
     re2/unicode_groups.cc

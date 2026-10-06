@@ -25,6 +25,8 @@ public:
 	}
 
 	void VisitOperator(LogicalOperator &op) override;
+	//! Removes a constant group key next to a retained non-foldable key before statistics propagation
+	static void RemoveConstantGroups(Optimizer &optimizer, unique_ptr<LogicalOperator> &plan);
 	static void RemoveDependentGroups(Optimizer &optimizer, unique_ptr<LogicalOperator> &plan,
 	                                  column_binding_map_t<unique_ptr<BaseStatistics>> &statistics_map);
 

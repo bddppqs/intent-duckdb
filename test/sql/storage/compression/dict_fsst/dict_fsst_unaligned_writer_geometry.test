@@ -1,0 +1,39 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_unaligned_writer_geometry.test
+# description: With kVectorAlignedDictionarySegments off the DICT_FSST writer is the unaligned one: a long-string column writes segments that start inside a vector (the premise of the straddled-segment tests that require that build); answers unchanged
+# group: [dict_fsst]
+
+# runs only in a build with kVectorAlignedDictionarySegments off (the default build's aligned geometry is
+# dict_fsst_vector_aligned_segments.test's)
+require unaligned_dictionary_segments
+
+require vector_size 2048
+
+statement ok
+ATTACH '__TEST_DIR__/unaligned_writer_geometry.db' AS a (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+ATTACH ':memory:' AS plain
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE a.t AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://www.example-' || (((i // 3) * 7919) % 7001)::VARCHAR || '.org/' || CASE WHEN (i // 3) % 13 = 0 THEN 'needle/' ELSE 'path/' END || repeat('p', (i % 37)::INT) || '/' || (i % 911)::VARCHAR END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'cat-' || (i % 37)::VARCHAR END AS d, 'unique-value-' || i::VARCHAR || '-' || repeat('u', (i % 29)::INT) AS u FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT a
+
+statement ok
+CREATE TABLE plain.t AS SELECT i::BIGINT AS i, (i % 2048)::INTEGER AS k, CASE WHEN i % 97 = 0 THEN NULL WHEN i % 89 = 0 THEN '' ELSE 'https://www.example-' || (((i // 3) * 7919) % 7001)::VARCHAR || '.org/' || CASE WHEN (i // 3) % 13 = 0 THEN 'needle/' ELSE 'path/' END || repeat('p', (i % 37)::INT) || '/' || (i % 911)::VARCHAR END AS s, CASE WHEN i % 101 = 0 THEN NULL ELSE 'cat-' || (i % 37)::VARCHAR END AS d, 'unique-value-' || i::VARCHAR || '-' || repeat('u', (i % 29)::INT) AS u FROM range(300000) tbl(i)
+
+# segments of the long-string columns start inside vectors
+
+query II
+SELECT count(*) FILTER (WHERE column_name = 's' AND start % 2048 <> 0) > 0, count(*) FILTER (WHERE column_name = 'u' AND start % 2048 <> 0) > 0 FROM pragma_storage_info('a.t') WHERE segment_type = 'VARCHAR' AND compression = 'DICT_FSST'
+----
+true	true
+
+query I
+SELECT count(*) FROM a.t x FULL OUTER JOIN plain.t y USING (i) WHERE x.i IS NULL OR y.i IS NULL OR x.k IS DISTINCT FROM y.k OR x.s IS DISTINCT FROM y.s OR x.d IS DISTINCT FROM y.d OR x.u IS DISTINCT FROM y.u
+----
+0

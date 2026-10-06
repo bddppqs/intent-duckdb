@@ -4,6 +4,8 @@
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 namespace duckdb {
 namespace dict_fsst {
@@ -85,21 +87,31 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	string_lengths_width = (bitpacking_width_t)(Load<uint8_t>(data_ptr_cast(&header_ptr->string_lengths_width)));
 
 	auto string_lengths_space = BitpackingPrimitives::GetRequiredSize(dict_count, string_lengths_width);
+	auto split = SegmentSplit(segment);
 	auto dictionary_indices_space =
-	    BitpackingPrimitives::GetRequiredSize(segment.count.load(), dictionary_indices_width);
+	    split ? 0 : BitpackingPrimitives::GetRequiredSize(segment.count.load(), dictionary_indices_width);
 
 	auto dictionary_dest = AlignValue<idx_t>(DictFSSTCompression::DICTIONARY_HEADER_SIZE);
 	auto symbol_table_dest = AlignValue<idx_t>(dictionary_dest + dictionary_size);
 	auto string_lengths_dest = AlignValue<idx_t>(symbol_table_dest + symbol_table_size);
 	auto dictionary_indices_dest = AlignValue<idx_t>(string_lengths_dest + string_lengths_space);
 
-	const auto total_space = segment.GetBlockOffset() + dictionary_indices_dest + dictionary_indices_space;
-	if (total_space > segment.GetBlockSize()) {
+	const auto total_space = segment.GetBlockOffset() +
+	                         (split ? string_lengths_dest + string_lengths_space
+	                                : dictionary_indices_dest + dictionary_indices_space);
+	if (total_space > segment.GetBlockSize() ||
+	    (split && (split->dict_count != dict_count || split->indices_width != dictionary_indices_width))) {
 		throw IOException(
 		    "Failed to scan dictionary string - index was out of range. Database file appears to be corrupted.");
 	}
 	dict_ptr = data_ptr_cast(baseptr + dictionary_dest);
-	dictionary_indices_ptr = data_ptr_cast(baseptr + dictionary_indices_dest);
+	if (split) {
+		auto block = SplitCodeHandle(segment);
+		code_handle = BufferManager::GetBufferManager(segment.db).Pin(block);
+		dictionary_indices_ptr = code_handle.Ptr() + split->offset;
+	} else {
+		dictionary_indices_ptr = data_ptr_cast(baseptr + dictionary_indices_dest);
+	}
 	string_lengths_ptr = data_ptr_cast(baseptr + string_lengths_dest);
 
 	bool cache_dictionary = initialize_dictionary && mode == DictFSSTMode::DICT_FSST &&
@@ -153,7 +165,30 @@ void CompressedStringScanState::Initialize(bool initialize_dictionary) {
 	cache_dictionary_admitted = cache_dictionary;
 }
 
+void CompressedStringScanState::InitializeCodesOnly(shared_ptr<dict_global::SegmentTranslation> translation) {
+	auto split = SegmentSplit(segment);
+	if (!split || !translation) {
+		throw InternalException("InitializeCodesOnly: a segment without split codes or a translation");
+	}
+	codes_only = true;
+	baseptr = nullptr;
+	dict_ptr = nullptr;
+	string_lengths_ptr = nullptr;
+	mode = static_cast<DictFSSTMode>(split->mode);
+	dict_count = split->dict_count;
+	dictionary_size = 0;
+	string_lengths_width = 0;
+	dictionary_indices_width = split->indices_width;
+	auto block = SplitCodeHandle(segment);
+	code_handle = BufferManager::GetBufferManager(segment.db).Pin(block);
+	dictionary_indices_ptr = code_handle.Ptr() + split->offset;
+	global_translation = std::move(translation);
+}
+
 void CompressedStringScanState::EnsureDictionary() {
+	if (codes_only) {
+		throw InternalException("EnsureDictionary on a codes-only scan of a split DICT_FSST segment");
+	}
 	if (dictionary || !dictionary_deferred) {
 		return;
 	}
@@ -408,6 +443,24 @@ void CompressedStringScanState::ScanToGlobalDictionary(const SelectionVector &lo
 	auto codes = global_translation->codes.get();
 	for (idx_t i = 0; i < count; i++) {
 		out[i] = UnsafeNumericCast<sel_t>(codes[local.get_index(i)]);
+	}
+	result.Dictionary(global_translation->VectorChild(), *global_dictionary_sel);
+}
+
+void CompressedStringScanState::ScanToGlobalDictionarySelected(const SelectionVector &local,
+                                                               const SelectionVector &rows, idx_t row_count,
+                                                               idx_t count, Vector &result) {
+	if (!global_dictionary_sel || global_dictionary_sel_size < count) {
+		global_dictionary_sel_size = MaxValue<idx_t>(count, STANDARD_VECTOR_SIZE);
+		global_dictionary_sel = make_buffer<SelectionVector>(global_dictionary_sel_size);
+	}
+	auto out = global_dictionary_sel->data();
+	auto codes = global_translation->codes.get();
+	// every row holds a valid code: the NULL code 0 where the filter dropped the row, its own where the row survives
+	memset(out, 0, count * sizeof(sel_t));
+	for (idx_t i = 0; i < row_count; i++) {
+		const auto row = rows.get_index(i);
+		out[row] = UnsafeNumericCast<sel_t>(codes[local.get_index(row)]);
 	}
 	result.Dictionary(global_translation->VectorChild(), *global_dictionary_sel);
 }

@@ -1,4 +1,10 @@
 #include "duckdb/storage/compression/dict_fsst/filter_verdict_cache.hpp"
+#include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
+#include "duckdb/storage/compression/dict_global/persisted_translation.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
 
 #include "duckdb/function/scalar/string_common.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -237,6 +243,11 @@ struct DictFSSTSegmentState : public UncompressedStringSegmentState {
 	bool translation_present = false;
 	idx_t translation_generation = 0;
 	weak_ptr<ObjectCacheEntry> translation;
+	//! Split segments: the code array, its block's handle and the link to the stored translations (under `lock`)
+	SplitCodes split;
+	shared_ptr<BlockHandle> code_handle;
+	shared_ptr<dict_global::PersistedTranslations> translations;
+	idx_t translation_entry = 0;
 };
 
 static optional_ptr<DictFSSTSegmentState> SegmentCache(ColumnSegment &segment) {
@@ -247,16 +258,144 @@ static optional_ptr<DictFSSTSegmentState> SegmentCache(ColumnSegment &segment) {
 	return state ? dynamic_cast<DictFSSTSegmentState *>(state.get()) : nullptr;
 }
 
+//! The segment's DICT_FSST state whatever the segment-local reference setting (it always is one)
+static optional_ptr<DictFSSTSegmentState> SegmentState(const ColumnSegment &segment) {
+	auto state = segment.GetSegmentState();
+	return state ? dynamic_cast<DictFSSTSegmentState *>(state.get()) : nullptr;
+}
+
 unique_ptr<CompressedSegmentState> DictFSSTInitSegment(ColumnSegment &segment, block_id_t block_id,
                                                        optional_ptr<ColumnSegmentState> segment_state) {
-	auto result = UncompressedStringStorage::StringInitSegment(segment, block_id, segment_state);
-	if (!SegmentCacheEnabled()) {
-		return result;
+	// a split segment's serialized state is its code array, not the uncompressed string state's overflow blocks
+	optional_ptr<SplitSegmentState> split;
+	if (segment_state) {
+		split = dynamic_cast<SplitSegmentState *>(segment_state.get());
 	}
-	// the standard state holds nothing but the deserialized overflow block ids at this point
+	auto result = UncompressedStringStorage::StringInitSegment(segment, block_id, split ? nullptr : segment_state);
+	// always the DICT_FSST state (the segment-local references are read only when enabled; SegmentCache)
 	auto state = make_uniq<DictFSSTSegmentState>();
 	state->on_disk_blocks = std::move(result->Cast<UncompressedStringSegmentState>().on_disk_blocks);
+	if (split) {
+		state->split = split->codes;
+	}
 	return std::move(state);
+}
+
+//===--------------------------------------------------------------------===//
+// Split segments
+SplitSegmentState::SplitSegmentState(const SplitCodes &codes_p) : codes(codes_p) {
+	blocks.push_back(codes.block);
+}
+
+void SplitSegmentState::Serialize(Serializer &serializer) const {
+	serializer.WriteProperty<block_id_t>(1, "code_block", codes.block);
+	serializer.WriteProperty<uint32_t>(2, "code_offset", codes.offset);
+	serializer.WriteProperty<uint32_t>(3, "code_size", codes.size);
+	serializer.WriteProperty<uint32_t>(4, "dict_count", codes.dict_count);
+	serializer.WriteProperty<uint8_t>(5, "mode", codes.mode);
+	serializer.WriteProperty<uint8_t>(6, "indices_width", codes.indices_width);
+}
+
+unique_ptr<ColumnSegmentState> SplitSegmentState::Deserialize(Deserializer &deserializer) {
+	SplitCodes codes;
+	codes.block = deserializer.ReadProperty<block_id_t>(1, "code_block");
+	codes.offset = deserializer.ReadProperty<uint32_t>(2, "code_offset");
+	codes.size = deserializer.ReadProperty<uint32_t>(3, "code_size");
+	codes.dict_count = deserializer.ReadProperty<uint32_t>(4, "dict_count");
+	codes.mode = deserializer.ReadProperty<uint8_t>(5, "mode");
+	codes.indices_width = deserializer.ReadProperty<uint8_t>(6, "indices_width");
+	return make_uniq<SplitSegmentState>(codes);
+}
+
+bool SplitSegmentsEnabled(BlockManager &block_manager) {
+	if (!kSplitDictionarySegments || block_manager.InMemory()) {
+		return false;
+	}
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&block_manager);
+	return single_file && single_file->SplitDictionarySegments();
+}
+
+optional_ptr<const SplitCodes> SegmentSplit(ColumnSegment &segment) {
+	auto state = SegmentState(segment);
+	if (!state || !state->split.IsSplit()) {
+		return nullptr;
+	}
+	return &state->split;
+}
+
+void SetSegmentSplit(ColumnSegment &segment, const SplitCodes &codes) {
+	auto state = SegmentState(segment);
+	if (!state) {
+		throw InternalException("SetSegmentSplit: a DICT_FSST segment without its segment state");
+	}
+	state->split = codes;
+	state->code_handle.reset();
+}
+
+shared_ptr<BlockHandle> SplitCodeHandle(ColumnSegment &segment) {
+	auto state = SegmentState(segment);
+	if (!state || !state->split.IsSplit()) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(state->lock);
+	if (!state->code_handle) {
+		state->code_handle = segment.block->GetBlockManager().RegisterBlock(state->split.block);
+	}
+	return state->code_handle;
+}
+
+shared_ptr<dict_global::PersistedTranslations> SegmentTranslationLink(ColumnSegment &segment, idx_t &entry) {
+	auto state = SegmentState(segment);
+	if (!state) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(state->lock);
+	entry = state->translation_entry;
+	return state->translations;
+}
+
+void LinkSegmentTranslation(ColumnSegment &segment, shared_ptr<dict_global::PersistedTranslations> translations,
+                            idx_t entry) {
+	auto state = SegmentState(segment);
+	if (!state) {
+		return;
+	}
+	lock_guard<mutex> guard(state->lock);
+	state->translations = std::move(translations);
+	state->translation_entry = entry;
+}
+
+unique_ptr<ColumnSegmentState> DictFSSTSerializeState(ColumnSegment &segment) {
+	auto split = SegmentSplit(segment);
+	if (!split) {
+		// an unsplit segment: no state, as before
+		return nullptr;
+	}
+	return make_uniq<SplitSegmentState>(*split);
+}
+
+unique_ptr<ColumnSegmentState> DictFSSTDeserializeState(Deserializer &deserializer) {
+	return SplitSegmentState::Deserialize(deserializer);
+}
+
+void DictFSSTVisitBlockIds(const ColumnSegment &segment, BlockIdVisitor &visitor) {
+	auto state = SegmentState(segment);
+	if (state && state->split.IsSplit()) {
+		visitor.Visit(state->split.block);
+	}
+}
+
+void DictFSSTInitPrefetch(ColumnSegment &segment, PrefetchState &prefetch_state) {
+	auto split = SegmentSplit(segment);
+	if (!split) {
+		prefetch_state.AddBlock(segment.block);
+		return;
+	}
+	// a scan that reads only this segment's codes never reads its own block (the dictionary)
+	if (!dict_global::SegmentReadsCodesOnly(segment)) {
+		prefetch_state.AddBlock(segment.block);
+	}
+	prefetch_state.AddBlock(SplitCodeHandle(segment));
 }
 
 SegmentDictionaryLookup LookupSegmentDictionary(ColumnSegment &segment, shared_ptr<ObjectCacheEntry> &entry) {

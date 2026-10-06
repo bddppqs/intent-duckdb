@@ -1,5 +1,6 @@
 #include "duckdb/storage/table/column_data_checkpointer.hpp"
 
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/table/update_segment.hpp"
@@ -100,6 +101,66 @@ void ColumnDataCheckpointer::ScanSegments(const std::function<void(Vector &, idx
 			col_data.CheckpointScan(segment, scan_state, count, scan_vector);
 			callback(scan_vector, count);
 		}
+	}
+}
+
+void ColumnDataCheckpointer::ScanSegmentsAligned(const std::function<void(Vector &, idx_t)> &callback) {
+	Vector scan_vector(intermediate.GetType(), nullptr);
+	auto &first_state = checkpoint_states[0];
+	auto &col_data = first_state.get().original_column;
+
+	// the vector being assembled from pieces, and the scan states of the segments its pieces point into
+	unique_ptr<Vector> assembled;
+	idx_t filled = 0;
+	vector<unique_ptr<ColumnScanState>> held;
+	for (auto &segment_node : col_data.data.SegmentNodes()) {
+		auto &segment = segment_node.GetNode();
+		auto scan_state = make_uniq<ColumnScanState>(nullptr);
+		scan_state->current = segment_node;
+		segment.InitializeScan(*scan_state);
+		for (idx_t base_row_index = 0; base_row_index < segment.count;) {
+			const idx_t count = MinValue<idx_t>(segment.count - base_row_index, STANDARD_VECTOR_SIZE - filled);
+			scan_state->offset_in_column = segment_node.GetRowStart() + base_row_index;
+			if (filled == 0 && count == STANDARD_VECTOR_SIZE) {
+				// a whole vector of one segment, as ScanSegments reads it
+				scan_vector.Reference(intermediate);
+				col_data.CheckpointScan(segment, *scan_state, count, scan_vector);
+				callback(scan_vector, count);
+			} else {
+				// a piece: scanned alone, its rows (the string_t, which point into the held segment or the piece's
+				// heap, and their validity) placed after the rows already assembled
+				if (!assembled) {
+					assembled = make_uniq<Vector>(intermediate.GetType(), STANDARD_VECTOR_SIZE);
+				}
+				Vector piece(intermediate.GetType(), count);
+				col_data.CheckpointScan(segment, *scan_state, count, piece);
+				auto source = FlatVector::GetData<string_t>(piece);
+				auto target = FlatVector::GetData<string_t>(*assembled);
+				auto &source_validity = FlatVector::Validity(piece);
+				auto &target_validity = FlatVector::Validity(*assembled);
+				for (idx_t i = 0; i < count; i++) {
+					target[filled + i] = source[i];
+					if (!source_validity.RowIsValid(i)) {
+						target_validity.SetInvalid(filled + i);
+					}
+				}
+				StringVector::AddHeapReference(*assembled, piece);
+				filled += count;
+				if (filled == STANDARD_VECTOR_SIZE) {
+					callback(*assembled, filled);
+					assembled.reset();
+					filled = 0;
+					held.clear();
+				}
+			}
+			base_row_index += count;
+		}
+		if (filled > 0) {
+			held.push_back(std::move(scan_state));
+		}
+	}
+	if (filled > 0) {
+		callback(*assembled, filled);
 	}
 }
 
@@ -327,13 +388,19 @@ void ColumnDataCheckpointer::WriteToDisk() { // Analyze the candidate functions 
 	}
 
 	// Scan over the existing segment + changes and compress the data
-	ScanSegments([&](Vector &scan_vector, idx_t count) {
+	auto compress = [&](Vector &scan_vector, idx_t count) {
 		for (idx_t i = 0; i < checkpoint_states.size(); i++) {
 			auto &function = analyze_result[i].function;
 			auto &compression_state = compression_states[i];
 			function->compress(*compression_state, scan_vector, count);
 		}
-	});
+	};
+	if (kVectorAlignedDictionarySegments && intermediate.GetType().InternalType() == PhysicalType::VARCHAR &&
+	    analyze_result[0].function->type == CompressionType::COMPRESSION_DICT_FSST) {
+		ScanSegmentsAligned(compress);
+	} else {
+		ScanSegments(compress);
+	}
 
 	// Finalize the compression
 	for (idx_t i = 0; i < checkpoint_states.size(); i++) {

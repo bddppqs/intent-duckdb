@@ -1,0 +1,170 @@
+# name: test/sql/aggregate/group/fused_three_key_groups.test
+# description: The fused kernel's grouped class admits three keys and 16 key bytes: cases over >= 2^20 rows (a
+#              BIGINT + INTEGER + small-integer shape, 13 / 14 / 16 key bytes admitted, 17 bytes and four keys refused,
+#              the DISTINCT class at 13-16 bytes refused, the 32 / 40 / 28-byte row-width boundary, keys differing only
+#              in bytes 12-15), expected rows in closed form from the generator, and an EXPLAIN per shape asserting the
+#              marker keys=n (and its absence on refused twins). A byte count is read from the physical aggregate list
+#              after the optimizer (keys at their width after the planner's compression, each distinct input once,
+#              row = max(8, align4)); with kFusedSixteenByteKeys off every 13-16-byte and three-key case is refused
+# group: [group]
+
+# t: j = i % 1000003 fixes k1 (8 bytes, range > 2^32) and k3 (INTEGER, 4 bytes); k2 = j2 * 2^32 + 91 * j2 with j2 = i % 999983 (8 bytes, range > 2^32, k2 >> 32 = j2). 1000003 is 43 mod 60, 3 mod 250 and 1003
+# mod 1500, so the two or three rows of one j differ in m, u and w2, and (j, j2) is injective on [0, 2200000): every
+# grouping below on t has 2,200,000 groups of one row
+statement ok
+CREATE TABLE t AS SELECT ((i % 1000003) * 4294967311)::BIGINT AS k1, ((i % 999983) * 4294967387)::BIGINT AS k2, ((i % 1000003) * 7919 % 2147483647)::INTEGER AS k3, (i % 60)::SMALLINT AS m, (i % 1500)::SMALLINT AS w2, (i % 250)::UTINYINT AS u, (i % 7)::BIGINT AS y, (i % 5)::BIGINT AS z, (i % 3)::BIGINT AS w, (i % 11)::INTEGER AS v, (i % 13)::BIGINT AS x FROM range(2200000) t(i);
+
+# t2: few groups on wide keys, so the DISTINCT class passes its group estimate ceiling (2^20) and the key width alone
+# decides: g8 (8 bytes), g4 (INTEGER, 4 bytes) and g2 (SMALLINT, 2 bytes) are functions of i % 100 (never compressed);
+# s2 = i % 1500
+# holds 15 values per g; e1 = (i % 100000) * 4294967311 and e2 = (i % 22) * 2^32 + 305419896: two BIGINT keys (ranges
+# > 2^32) equal in their first 12 bytes whenever e1 is, differing in bytes 12-15; (i % 100000, i % 22) repeats every
+# 1,100,000 rows: 1,100,000 groups of two rows
+statement ok
+CREATE TABLE t2 AS SELECT ((i % 100) * 4294967311)::BIGINT AS g8, ((i % 100) * 1000003)::INTEGER AS g4, ((i % 100) * 300)::SMALLINT AS g2, (i % 3)::UTINYINT AS b1, (i % 250)::UTINYINT AS u, (i % 1500)::SMALLINT AS s2, (i % 7919)::INTEGER AS v4, ((i % 100000) * 4294967311)::BIGINT AS e1, ((i % 22) * 4294967296 + 305419896)::BIGINT AS e2 FROM range(2200000) t(i);
+
+# BIGINT + INTEGER + a 0-59 SMALLINT compressed to UTINYINT = 13 key bytes, count_star, row 16
+query II
+EXPLAIN SELECT k1, k3, m, count(*) AS c FROM t GROUP BY k1, k3, m
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=3.*__internal_compress_integra.*l_utinyint.*
+
+query IIIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(m)::BIGINT, min(m), max(m), max(c), max(k1) FROM (SELECT k1, k3, m, count(*) AS c FROM t GROUP BY k1, k3, m)
+----
+2200000	2200000	64899600	0	59	1	4294975900934622
+
+# 13 key bytes, the scratch form (a UTINYINT key, no compression)
+query II
+EXPLAIN SELECT k1, k3, u, count(*) AS c FROM t GROUP BY k1, k3, u
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=3.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(u)::BIGINT, min(u), max(u), max(c) FROM (SELECT k1, k3, u, count(*) AS c FROM t GROUP BY k1, k3, u)
+----
+2200000	2200000	273900000	0	249	1
+
+# 14 key bytes (a 0-1499 SMALLINT key, 2 bytes, not compressed)
+query II
+EXPLAIN SELECT k1, k3, w2, count(*) AS c FROM t GROUP BY k1, k3, w2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=3.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(w2)::BIGINT, min(w2), max(w2), max(c) FROM (SELECT k1, k3, w2, count(*) AS c FROM t GROUP BY k1, k3, w2)
+----
+2200000	2200000	1648650000	0	1499	1
+
+# 16 key bytes, the boundary: BIGINT + BIGINT (two keys up to 12 bytes only without the 16-byte region); the bytes
+# 12-15 case is this query
+query II
+EXPLAIN SELECT k1, k2, count(*) AS c FROM t GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=2.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, max(c), max(k1), max(k2), sum(k2 >> 32)::BIGINT FROM (SELECT k1, k2, count(*) AS c FROM t GROUP BY k1, k2)
+----
+2200000	2200000	1	4294975900934622	4294890077587034	1019971700867
+
+# keys differing only in bytes 12-15: e2's low word is one constant, so a group is told apart by e2's high
+# word alone
+query II
+EXPLAIN SELECT e1, e2, count(*) AS c FROM t2 GROUP BY e1, e2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=2.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, min(c), max(c), sum(e2 >> 32)::BIGINT FROM (SELECT e1, e2, count(*) AS c FROM t2 GROUP BY e1, e2)
+----
+1100000	2200000	2	2	11550000
+
+# 13 key bytes with a SMALLINT sum input at bytes 13-14 of the row, inside the second key word (masked off): 300 groups
+# (i % 300) of 7,333 or 7,334 rows
+query II
+EXPLAIN SELECT g8, g4, b1, count(*) AS c, sum(s2) AS ss FROM t2 GROUP BY g8, g4, b1
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=3.*
+
+query IIIIII
+SELECT count(*)::BIGINT, sum(c)::BIGINT, sum(ss)::BIGINT, min(c), max(c), sum(b1)::BIGINT FROM (SELECT g8, g4, b1, count(*) AS c, sum(s2) AS ss FROM t2 GROUP BY g8, g4, b1)
+----
+300	2200000	1648650000	7333	7334	300
+
+# the row-width boundary: two uncompressed BIGINT keys + sum_no_overflow(y BIGINT) +
+# sum_no_overflow(z BIGINT) = 32 bytes, admitted
+query II
+EXPLAIN SELECT k1, k2, sum(y) AS sy, sum(z) AS sz FROM t GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=2.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(sy)::BIGINT, sum(sz)::BIGINT, max(sy)::BIGINT, max(sz)::BIGINT FROM (SELECT k1, k2, sum(y) AS sy, sum(z) AS sz FROM t GROUP BY k1, k2)
+----
+2200000	6599995	4400000	6	4
+
+# keys + sum_no_overflow(y BIGINT) + sum_no_overflow(v INTEGER) = 28 bytes, admitted (the stored hash fits beside it,
+# 28 + 4 <= 32); count(x) over a non-NULL x folds into count_star and adds no column (count(x), sum(y) reads
+# 24 bytes), so no case uses it
+query II
+EXPLAIN SELECT k1, k2, sum(y) AS sy, sum(v) AS sv FROM t GROUP BY k1, k2
+----
+physical_plan	<REGEX>:.*Fused Aggregate.*keys=2.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(sy)::BIGINT, sum(sv)::BIGINT, max(sy)::BIGINT, max(sv)::BIGINT FROM (SELECT k1, k2, sum(y) AS sy, sum(v) AS sv FROM t GROUP BY k1, k2)
+----
+2200000	6599995	11000000	6	10
+
+# the DISTINCT class keeps two keys and 12 bytes: (g8, g2) + x = s2 is 12 bytes, admitted
+query II
+EXPLAIN SELECT g8, g2, count(DISTINCT s2) AS n FROM t2 GROUP BY g8, g2
+----
+physical_plan	<REGEX>:.*Fused Distinct Aggregate.*
+
+query IIIII
+SELECT count(*)::BIGINT, sum(n)::BIGINT, min(n), max(n), sum(g2)::BIGINT FROM (SELECT g8, g2, count(DISTINCT s2) AS n FROM t2 GROUP BY g8, g2)
+----
+100	1500	15	15	1485000
+
+# refused twins: 17 key bytes (BIGINT + BIGINT + a UTINYINT key)
+query II
+EXPLAIN SELECT k1, k2, u, count(*) AS c FROM t GROUP BY k1, k2, u
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+# four keys (14 key bytes)
+query II
+EXPLAIN SELECT k1, k3, m, u, count(*) AS c FROM t GROUP BY k1, k3, m, u
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+# the 40-byte row: + sum_no_overflow(w BIGINT)
+query II
+EXPLAIN SELECT k1, k2, sum(y) AS sy, sum(z) AS sz, sum(w) AS sw FROM t GROUP BY k1, k2
+----
+physical_plan	<!REGEX>:.*Fused Aggregate.*
+
+# the DISTINCT class at 13, 14 and 16 bytes: (g8, g4) + x = u, s2, v4 (the 12-byte twin above differs in g2 for g4)
+query II
+EXPLAIN SELECT g8, g4, count(DISTINCT u) AS n FROM t2 GROUP BY g8, g4
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query II
+EXPLAIN SELECT g8, g4, count(DISTINCT s2) AS n FROM t2 GROUP BY g8, g4
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query II
+EXPLAIN SELECT g8, g4, count(DISTINCT v4) AS n FROM t2 GROUP BY g8, g4
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+# the DISTINCT case on t: (k1, k3) + x = u, 13 bytes (its group estimate, about 2.2 million, is also above the 2^20
+# ceiling)
+query II
+EXPLAIN SELECT k1, k3, count(DISTINCT u) AS n FROM t GROUP BY k1, k3
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*

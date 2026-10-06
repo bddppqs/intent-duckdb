@@ -1,0 +1,403 @@
+# name: test/sql/aggregate/distinct/distinct_code_bitmap.test
+# description: The fused kernel's bitmap class: an ungrouped count(DISTINCT x) over a VARCHAR the global dictionary
+#              publishes answers as the generic path does
+# group: [distinct]
+
+# The first pass plans before the column's dictionary is published (the generic route); every later pass takes the bitmap
+# class. The expected values are upstream DuckDB's on the same table. The column holds NULL
+# rows (code 0, the NULL slot, never counted) and empty strings (a value, counted).
+
+statement ok
+ATTACH '__TEST_DIR__/distinct_code_bitmap.db' AS bm (STORAGE_VERSION 'v1.5.0')
+
+statement ok
+USE bm
+
+statement ok
+SET force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t AS SELECT (i % 13)::SMALLINT AS grp, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN '' ELSE 'catalog entry ' || (hash(i // 3) % 40000)::VARCHAR END AS p FROM range(1100000) r(i)
+
+statement ok
+CHECKPOINT
+
+# the refused column: no DICT_FSST segment, so no dictionary is published and the class never attaches
+statement ok
+SET force_compression='uncompressed'
+
+statement ok
+CREATE TABLE u AS SELECT * FROM t
+
+statement ok
+CHECKPOINT
+
+statement ok
+SET threads=8
+
+loop pass 0 3
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39997
+
+# a pushed filter: the published vectors sliced
+query I
+SELECT count(DISTINCT p) FROM t WHERE grp = 3
+----
+30704
+
+# no surviving row
+query I
+SELECT count(DISTINCT p) FROM t WHERE grp = 99
+----
+0
+
+# another aggregate beside it (refused: the generic path)
+query II
+SELECT count(DISTINCT p), count(*) FROM t
+----
+39997	1100000
+
+# a collation (refused: the generic path)
+query I
+SELECT count(DISTINCT p COLLATE nocase) FROM t
+----
+39997
+
+query I
+SELECT count(DISTINCT p) FROM u
+----
+39997
+
+endloop
+
+# published by now: the class is attached (this check fails with kFusedDistinctBitmap off; every answer above and
+# below holds either way)
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM t
+----
+physical_plan	<REGEX>:.*bitmap=1.*
+
+query II
+EXPLAIN SELECT count(DISTINCT p), count(*) FROM t
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM u
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+# (a) transaction-local rows: the transaction holds local storage for t, so the class is not attached (the coverage bound) and the
+# generic path counts a string the dictionary does not hold once, a string it holds and a NULL adding nothing
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (1, 'a string the dictionary does not hold'), (1, 'catalog entry 7'), (1, NULL), (2, 'a string the dictionary does not hold')
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM t
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39998
+
+statement ok
+ROLLBACK
+
+# one thread: one bitmap
+statement ok
+SET threads=1
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39997
+
+query I
+SELECT count(DISTINCT p) FROM t WHERE grp = 3
+----
+30704
+
+# The coverage bound of the lookup path (zero uncovered rows): every committed row of the column in a segment the published
+# dictionary was built from and no update, checked at plan time and again at the start of every execution; a refused
+# plan or execution takes the generic path. Every expected value is upstream DuckDB's on the same table; a refused execution
+# reads engaged=0 refusal=<reason> in EXPLAIN ANALYZE
+statement ok
+SET threads=8
+
+statement ok
+SET force_compression='dict_fsst'
+
+# only the test's own CHECKPOINTs run: an UPDATE's or INSERT's commit could otherwise checkpoint the table automatically
+# (it did for (h): the epoch moved and the execution read stale_dict instead of updates)
+statement ok
+SET checkpoint_threshold='100GB'
+
+# (j) the memory bound at execution: a plan attached at threads=8 runs at threads=512 under a memory limit whose quarter is below
+# 512 bitmaps (512 x 54040 words x 8 bytes = 221347840 > 768000000 / 4): the execution is refused (refusal=memory) and
+# the generic path answers - no error. The limit sits above the published dictionaries' reservations (t's and g's, 402653184 bytes,
+# never evicted), which a lower SET memory_limit cannot free
+statement ok
+CREATE TABLE g AS SELECT 'catalog entry ' || (hash(i) % 4000000)::VARCHAR AS p FROM range(8000000) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(DISTINCT p) FROM g
+----
+3458539
+
+statement ok
+PREPARE sj AS SELECT count(DISTINCT p) FROM g
+
+statement ok
+SET threads=512
+
+statement ok
+SET memory_limit='768MB'
+
+query I
+EXECUTE sj
+----
+3458539
+
+query II
+EXPLAIN ANALYZE EXECUTE sj
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+# a fixed limit, not RESET: RESET memory_limit restores the setting but leaves the buffer pool's limit at 768MB
+statement ok
+SET memory_limit='16GB'
+
+statement ok
+SET threads=8
+
+statement ok
+DEALLOCATE sj
+
+statement ok
+DROP TABLE g
+
+# (b) the forced bound: four rows committed without a checkpoint lie in no segment the dictionary was built from
+# (rows_covered 1100000 below GetTotalRows() 1100004): the class is not attached and the generic path counts the new string.
+# The checkpoint above moved t's epoch too, so one execution republishes t's dictionary first (the refusal is the bound's,
+# not a missing publication's)
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39997
+
+statement ok
+INSERT INTO t VALUES (1, 'a string the dictionary does not hold'), (1, 'catalog entry 7'), (1, NULL), (2, 'a string the dictionary does not hold')
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM t
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39998
+
+# (c) the checkpoint moves the epoch, the next scan rebuilds the dictionary over the new segments (one more code) and
+# the class attaches again (this check fails with kFusedDistinctBitmap off, as the one after the loop does)
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39998
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM t
+----
+physical_plan	<REGEX>:.*bitmap=1 codes=39999[^0-9].*
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39998
+
+# (d) an update committed without a checkpoint: the column carries an update, so the class is not attached and the generic
+# path counts the updated strings
+statement ok
+UPDATE t SET p = 'x' WHERE grp = 1
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM t
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+query I
+SELECT count(DISTINCT p) FROM t
+----
+39999
+
+# (e) mixed coverage: a second batch checkpointed under force_compression='uncompressed' is a persistent segment that
+# is not DICT_FSST, so rows_covered stays below GetTotalRows() and the class is not attached
+statement ok
+CREATE TABLE te AS SELECT (i % 13)::SMALLINT AS grp, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN '' ELSE 'catalog entry ' || (hash(i // 3) % 40000)::VARCHAR END AS p FROM range(1100000) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(DISTINCT p) FROM te
+----
+39997
+
+statement ok
+SET force_compression='uncompressed'
+
+statement ok
+INSERT INTO te SELECT 3, 'a second batch ' || (i % 100)::VARCHAR FROM range(200000) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+SET force_compression='dict_fsst'
+
+query I
+SELECT count(DISTINCT p) FROM te
+----
+40097
+
+query II
+EXPLAIN SELECT count(DISTINCT p) FROM te
+----
+physical_plan	<!REGEX>:.*bitmap=1.*
+
+query I
+SELECT count(DISTINCT p) FROM te
+----
+40097
+
+# the prepared-statement cases: a prepared plan runs again without re-planning, so each execution re-checks the bound
+# at its start; each PREPARE is made on a fully covered table whose dictionary is published (the plan attached)
+statement ok
+CREATE TABLE tp AS SELECT (i % 13)::SMALLINT AS grp, CASE WHEN i % 7 = 0 THEN NULL WHEN i % 5 = 0 THEN '' ELSE 'catalog entry ' || (hash(i // 3) % 40000)::VARCHAR END AS p FROM range(1100000) r(i)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(DISTINCT p) FROM tp
+----
+39997
+
+# (k) nothing changed: the execution takes the class
+statement ok
+PREPARE sk AS SELECT count(DISTINCT p) FROM tp
+
+query I
+EXECUTE sk
+----
+39997
+
+query I
+EXECUTE sk
+----
+39997
+
+query II
+EXPLAIN ANALYZE EXECUTE sk
+----
+analyzed_plan	<!REGEX>:.*engaged=0.*
+
+# (g) the transaction's local storage (refusal=local_storage), then rolled back
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tp VALUES (1, 'a string the dictionary does not hold'), (1, 'catalog entry 7'), (1, NULL), (2, 'a string the dictionary does not hold')
+
+query I
+EXECUTE sk
+----
+39998
+
+query II
+EXPLAIN ANALYZE EXECUTE sk
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+statement ok
+ROLLBACK
+
+query I
+EXECUTE sk
+----
+39997
+
+# (f) four rows committed without a checkpoint (refusal=coverage)
+statement ok
+INSERT INTO tp VALUES (1, 'a string the dictionary does not hold'), (1, 'catalog entry 7'), (1, NULL), (2, 'a string the dictionary does not hold')
+
+query I
+EXECUTE sk
+----
+39998
+
+query II
+EXPLAIN ANALYZE EXECUTE sk
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+# (i) the checkpoint moves the epoch: the plan's dictionary is no longer the published one (refusal=stale_dict)
+statement ok
+CHECKPOINT
+
+query I
+EXECUTE sk
+----
+39998
+
+query II
+EXPLAIN ANALYZE EXECUTE sk
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+statement ok
+DEALLOCATE sk
+
+# (h) an update committed without a checkpoint (refusal=updates), on a plan prepared over the republished dictionary
+query I
+SELECT count(DISTINCT p) FROM tp
+----
+39998
+
+statement ok
+PREPARE sh AS SELECT count(DISTINCT p) FROM tp
+
+query I
+EXECUTE sh
+----
+39998
+
+statement ok
+UPDATE tp SET p = 'x' WHERE grp = 1
+
+query I
+EXECUTE sh
+----
+39999
+
+query II
+EXPLAIN ANALYZE EXECUTE sh
+----
+analyzed_plan	<!REGEX>:.*engaged=1.*
+
+statement ok
+DEALLOCATE sh

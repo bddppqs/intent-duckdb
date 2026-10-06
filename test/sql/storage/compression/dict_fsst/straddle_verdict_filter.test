@@ -2,6 +2,11 @@
 # description: A vector that crosses DICT_FSST segment boundaries (two or more pieces) takes its codes' cached verdicts for a canonical contains / NOT contains / LIKE filter instead of evaluating each row, and a segment's slot is completed at its first sparse or straddling visit; whole vectors, sparse selections after a filter on another column, NULL and '' rows, the empty needle, a conjunction on one column (not canonical), deleted and updated rows, a LIKE / NOT LIKE / <> '' group by; each answer equals the same query with its filter written as strpos (never canonical, evaluated row by row), at threads 1 and 8, three runs each so later runs read the verdicts earlier runs published
 # group: [dict_fsst]
 
+# The straddling segments this test writes need the unaligned DICT_FSST writer, so it runs only in a build with
+# kVectorAlignedDictionarySegments off (the default writer ends every segment on a vector boundary). In the default
+# build, dict_fsst_straddled_segments_read.test reaches the same scan paths on a checked-in straddled file.
+require unaligned_dictionary_segments
+
 require vector_size 2048
 
 load {TEST_DIR}/straddle_verdict_filter.db readwrite v1.5.0
