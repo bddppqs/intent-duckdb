@@ -255,6 +255,9 @@ public:
 	//! Optional state for custom row group ordering
 	unique_ptr<RowGroupReorderer> reorderer;
 
+	//! Whether this scan's current hand-out holds a slot of the parallel scan's Top-N wave gate (TopNWaveGate)
+	bool holds_wave_slot = false;
+
 public:
 	void Initialize(const QueryContext &context, const vector<LogicalType> &types);
 	const vector<StorageIndex> &GetColumnIds();

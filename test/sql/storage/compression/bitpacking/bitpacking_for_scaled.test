@@ -1,5 +1,5 @@
 # name: test/sql/storage/compression/bitpacking/bitpacking_for_scaled.test
-# description: FOR_SCALED: in a block-compressed file at 0x40000002, a bit-packed group whose offsets from its minimum share a common divisor stores them divided by it
+# description: FOR_SCALED: in a block-compressed file at 0x40000003, a bit-packed group whose offsets from its minimum share a common divisor stores them divided by it
 # group: [bitpacking]
 
 require block_size 262144
@@ -166,12 +166,12 @@ DETACH vnew
 statement ok
 DETACH vold
 
-# a new block-compressed file is created at the version that admits FOR_SCALED (0x40000002, little-endian after the
+# a new block-compressed file is created at a version that admits FOR_SCALED (0x40000003, little-endian after the
 # magic "DUCK"); the v1.4.0 file keeps upstream's 67
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_new.db')
 ----
-4455434B	0200004000000000
+4455434B	0300004000000000
 
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_old.db')

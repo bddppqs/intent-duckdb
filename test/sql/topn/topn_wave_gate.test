@@ -1,0 +1,247 @@
+# name: test/sql/topn/topn_wave_gate.test
+# description: The ordered parallel scan's wave gate under a Top-N bound: 8 and 32 threads (above the window) on 40-plus row groups whose smallest non-empty value lies deep in the table, k above the small-heap threshold, a filter that rejects every row so the heap never fills, a first ordered row group pruned at its zonemap, a one-row-group table, one thread, verify_parallelism, and a Top-N over the probe side of a join, where the gate stays off; every answer equals the same rows taken by an ordered list aggregate, which pushes no bound, in an in-memory database and after a checkpoint and a restart
+# group: [topn]
+
+require skip_reload
+
+# pass a: an in-memory database
+
+statement ok
+SET threads = 8
+
+# g, more than 40 row groups: s is '' on every third row and 'm' with seven digits elsewhere, except its smallest
+# non-empty value 'aaa-small' at row 4,800,000, deep in the table; k is a permutation; r is 'hay' but for one row
+statement ok
+CREATE TABLE g AS SELECT i, CASE WHEN i = 4800000 THEN 'aaa-small' WHEN i < 5000000 AND i % 3 = 0 THEN '' WHEN i % 3 = 0 THEN '' ELSE 'm' || lpad(((i * 7919) % 900000)::VARCHAR, 7, '0') END AS s, (i * 104729) % 6000000 AS k, CASE WHEN i = 5999999 THEN 'needle' ELSE 'hay' END AS r FROM range(6000000) t(i)
+
+# j: a small table joined to g to make a Top-N on the probe side
+statement ok
+CREATE TABLE j AS SELECT i AS id, (i * 7)::VARCHAR AS tag FROM range(100) t(i)
+
+# one: a single row group
+statement ok
+CREATE TABLE one AS SELECT i, i % 97 AS k FROM range(1000) t(i)
+
+statement ok
+SET threads = 32
+
+# the smallest non-empty value lies deep in the table, at row 4,800,000
+query I nosort late_a
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+query I nosort late_a
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
+----
+
+# k above the small-heap threshold: the large-heap path under the gate
+query I nosort large_a
+SELECT k FROM g ORDER BY k LIMIT 300
+----
+
+query I nosort large_a
+SELECT unnest((list(k ORDER BY k))[1:300]) FROM g
+----
+
+statement ok
+SET threads = 8
+
+query I nosort late_a
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+query I nosort late_a
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
+----
+
+# k above the small-heap threshold: the large-heap path under the gate
+query I nosort large_a
+SELECT k FROM g ORDER BY k LIMIT 300
+----
+
+query I nosort large_a
+SELECT unnest((list(k ORDER BY k))[1:300]) FROM g
+----
+
+statement ok
+SET threads = 32
+
+# liveness: every row is filtered out, so the heap never fills
+query I nosort empty_a
+SELECT s FROM g WHERE r = 'no-such-tag' ORDER BY s LIMIT 10
+----
+
+query I nosort empty_a
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE r = 'no-such-tag'
+----
+
+# liveness: the first ordered row groups are pruned at their zonemap by the range on the order key
+query I nosort prune_first_a
+SELECT k FROM g WHERE k >= 5999000 ORDER BY k LIMIT 10
+----
+
+query I nosort prune_first_a
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM g WHERE k >= 5999000
+----
+
+# liveness: a single row group
+query I nosort one_rg_a
+SELECT k FROM one ORDER BY k LIMIT 10
+----
+
+query I nosort one_rg_a
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM one
+----
+
+statement ok
+SET threads = 1
+
+query I nosort late_a
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+statement ok
+SET threads = 8
+
+statement ok
+PRAGMA verify_parallelism
+
+query I nosort late_a
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+# a Top-N over the probe side of a join: the scan below the join is given no row-group order, so the gate stays off; the answer is checked against the oracle
+query I nosort join_probe_a
+SELECT g.s FROM g JOIN j ON (g.k % 100 = j.id) WHERE g.s <> '' ORDER BY g.s LIMIT 10
+----
+
+query I nosort join_probe_a
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM (SELECT g.s AS s FROM g JOIN j ON (g.k % 100 = j.id) WHERE g.s <> '')
+----
+
+# pass b: a database file, checkpointed, then a restart so that the tables are read in a new session
+load __TEST_DIR__/topn_wave_gate.db
+
+statement ok
+SET threads = 8
+
+# g, more than 40 row groups: s is '' on every third row and 'm' with seven digits elsewhere, except its smallest
+# non-empty value 'aaa-small' at row 4,800,000, deep in the table; k is a permutation; r is 'hay' but for one row
+statement ok
+CREATE TABLE g AS SELECT i, CASE WHEN i = 4800000 THEN 'aaa-small' WHEN i < 5000000 AND i % 3 = 0 THEN '' WHEN i % 3 = 0 THEN '' ELSE 'm' || lpad(((i * 7919) % 900000)::VARCHAR, 7, '0') END AS s, (i * 104729) % 6000000 AS k, CASE WHEN i = 5999999 THEN 'needle' ELSE 'hay' END AS r FROM range(6000000) t(i)
+
+# j: a small table joined to g to make a Top-N on the probe side
+statement ok
+CREATE TABLE j AS SELECT i AS id, (i * 7)::VARCHAR AS tag FROM range(100) t(i)
+
+# one: a single row group
+statement ok
+CREATE TABLE one AS SELECT i, i % 97 AS k FROM range(1000) t(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads = 32
+
+# the smallest non-empty value lies deep in the table, at row 4,800,000
+query I nosort late_b
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+query I nosort late_b
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
+----
+
+# k above the small-heap threshold: the large-heap path under the gate
+query I nosort large_b
+SELECT k FROM g ORDER BY k LIMIT 300
+----
+
+query I nosort large_b
+SELECT unnest((list(k ORDER BY k))[1:300]) FROM g
+----
+
+statement ok
+SET threads = 8
+
+query I nosort late_b
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+query I nosort late_b
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
+----
+
+# k above the small-heap threshold: the large-heap path under the gate
+query I nosort large_b
+SELECT k FROM g ORDER BY k LIMIT 300
+----
+
+query I nosort large_b
+SELECT unnest((list(k ORDER BY k))[1:300]) FROM g
+----
+
+statement ok
+SET threads = 32
+
+# liveness: every row is filtered out, so the heap never fills
+query I nosort empty_b
+SELECT s FROM g WHERE r = 'no-such-tag' ORDER BY s LIMIT 10
+----
+
+query I nosort empty_b
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE r = 'no-such-tag'
+----
+
+# liveness: the first ordered row groups are pruned at their zonemap by the range on the order key
+query I nosort prune_first_b
+SELECT k FROM g WHERE k >= 5999000 ORDER BY k LIMIT 10
+----
+
+query I nosort prune_first_b
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM g WHERE k >= 5999000
+----
+
+# liveness: a single row group
+query I nosort one_rg_b
+SELECT k FROM one ORDER BY k LIMIT 10
+----
+
+query I nosort one_rg_b
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM one
+----
+
+statement ok
+SET threads = 1
+
+query I nosort late_b
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+statement ok
+SET threads = 8
+
+statement ok
+PRAGMA verify_parallelism
+
+query I nosort late_b
+SELECT s FROM g WHERE s <> '' ORDER BY s LIMIT 10
+----
+
+statement ok
+PRAGMA disable_verify_parallelism
+
+# a Top-N over the probe side of a join: the scan below the join is given no row-group order, so the gate stays off; the answer is checked against the oracle
+query I nosort join_probe_b
+SELECT g.s FROM g JOIN j ON (g.k % 100 = j.id) WHERE g.s <> '' ORDER BY g.s LIMIT 10
+----
+
+query I nosort join_probe_b
+SELECT unnest((list(s ORDER BY s))[1:10]) FROM (SELECT g.s AS s FROM g JOIN j ON (g.k % 100 = j.id) WHERE g.s <> '')
+----

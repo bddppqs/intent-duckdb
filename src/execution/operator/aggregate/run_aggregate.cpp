@@ -90,6 +90,47 @@ bool RunPartialLocalEnabled() {
 	return kRunPartialLocalBuild;
 }
 
+//! The ungrouped attaches' child chain PROJECTION* -> TABLE_SCAN: the projections walked (appended to projections) and
+//! the scan, an unfiltered, unsampled seq_scan of a DuckDB table carrying no run descriptor yet; null otherwise
+optional_ptr<PhysicalTableScan> RunAttachScan(PhysicalOperator &first, vector<reference<PhysicalProjection>> &projections) {
+	reference<PhysicalOperator> child(first);
+	while (child.get().type == PhysicalOperatorType::PROJECTION) {
+		auto &projection = child.get().Cast<PhysicalProjection>();
+		projections.push_back(projection);
+		if (projection.children.empty()) {
+			return nullptr;
+		}
+		child = projection.children[0];
+	}
+	if (child.get().type != PhysicalOperatorType::TABLE_SCAN) {
+		return nullptr;
+	}
+	auto &scan = child.get().Cast<PhysicalTableScan>();
+	if (scan.function.name != "seq_scan" || !scan.function.function || !scan.bind_data || scan.run_aggregate) {
+		return nullptr;
+	}
+	auto &bind_data = scan.bind_data->Cast<TableScanBindData>();
+	if (bind_data.is_create_index || bind_data.is_index_scan || bind_data.order_options) {
+		return nullptr;
+	}
+	if (bind_data.table.type != CatalogType::TABLE_ENTRY || !bind_data.table.IsDuckTable()) {
+		return nullptr;
+	}
+	if (scan.table_filters && !scan.table_filters->filters.empty()) {
+		return nullptr;
+	}
+	if (scan.dynamic_filters || scan.extra_info.sample_options || scan.column_ids.empty()) {
+		return nullptr;
+	}
+	return &scan;
+}
+
+//! The set form's distinct table: the radix table of the operator's one (distinct) aggregate
+const RadixPartitionedHashTable &SetRadixTable(const PhysicalUngroupedAggregate &op) {
+	auto &info = *op.distinct_collection_info;
+	return *op.distinct_data->radix_tables[info.table_map.at(info.indices[0])];
+}
+
 } // namespace
 
 //===--------------------------------------------------------------------===//
@@ -108,6 +149,11 @@ RunAggregateData::RunAggregateData(const PhysicalHashAggregate &op_p, vector<Run
       grouped_run_updates(std::move(grouped_run_updates_p)), column_names(std::move(column_names_p)) {
 }
 
+RunAggregateData::RunAggregateData(const PhysicalUngroupedAggregate &op_p, vector<RunAggregateColumn> columns_p,
+                                   string column_names_p)
+    : ungrouped_op(&op_p), columns(std::move(columns_p)), column_names(std::move(column_names_p)), set_form(true) {
+}
+
 RunAggregateData::~RunAggregateData() {
 }
 
@@ -117,35 +163,11 @@ void RunAggregateData::TryAttach(ClientContext &context, PhysicalUngroupedAggreg
 	}
 	// the child chain must be PROJECTION* -> TABLE_SCAN
 	vector<reference<PhysicalProjection>> projections;
-	reference<PhysicalOperator> child(op.children[0]);
-	while (child.get().type == PhysicalOperatorType::PROJECTION) {
-		auto &projection = child.get().Cast<PhysicalProjection>();
-		projections.push_back(projection);
-		if (projection.children.empty()) {
-			return;
-		}
-		child = projection.children[0];
-	}
-	if (child.get().type != PhysicalOperatorType::TABLE_SCAN) {
+	auto scan_ptr = RunAttachScan(op.children[0], projections);
+	if (!scan_ptr) {
 		return;
 	}
-	auto &scan = child.get().Cast<PhysicalTableScan>();
-	if (scan.function.name != "seq_scan" || !scan.function.function || !scan.bind_data || scan.run_aggregate) {
-		return;
-	}
-	auto &bind_data = scan.bind_data->Cast<TableScanBindData>();
-	if (bind_data.is_create_index || bind_data.is_index_scan || bind_data.order_options) {
-		return;
-	}
-	if (bind_data.table.type != CatalogType::TABLE_ENTRY || !bind_data.table.IsDuckTable()) {
-		return;
-	}
-	if (scan.table_filters && !scan.table_filters->filters.empty()) {
-		return;
-	}
-	if (scan.dynamic_filters || scan.extra_info.sample_options || scan.column_ids.empty()) {
-		return;
-	}
+	auto &scan = *scan_ptr;
 	vector<RunAggregateColumn> columns;
 	vector<idx_t> nullary;
 	vector<aggregate_run_update_t> run_updates;
@@ -476,6 +498,137 @@ void RunAggregateData::CombineFusedPartials(ClientContext &context) {
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// RunAggregateData: the set form
+//===--------------------------------------------------------------------===//
+bool RunAggregateData::TryAttachDistinctSet(ClientContext &context, PhysicalUngroupedAggregate &op) {
+	if (!op.fused || !op.fused->distinct_set || op.run_aggregate || op.children.size() != 1 ||
+	    op.aggregates.size() != 1) {
+		return false;
+	}
+	// the child chain must be PROJECTION* -> TABLE_SCAN, exactly as the ungrouped attach requires
+	vector<reference<PhysicalProjection>> projections;
+	auto scan_ptr = RunAttachScan(op.children[0], projections);
+	if (!scan_ptr) {
+		return false;
+	}
+	auto &scan = *scan_ptr;
+	// the scan must project exactly x: the run branch requires every projected column to be run-eligible, and the runs
+	// of x alone are the set's rows
+	if (scan.column_ids.size() != 1) {
+		return false;
+	}
+	// the operator's one aggregate is the distinct one, without a FILTER or an ORDER BY, over one reference
+	auto &aggr = op.aggregates[0]->Cast<BoundAggregateExpression>();
+	if (!aggr.IsDistinct() || aggr.filter || aggr.order_bys || aggr.children.size() != 1 ||
+	    aggr.children[0]->GetExpressionType() != ExpressionType::BOUND_REF) {
+		return false;
+	}
+	// resolve the reference through the projections down to the scan's output: references only, no cast
+	idx_t index = aggr.children[0]->Cast<BoundReferenceExpression>().index;
+	for (auto &projection_ref : projections) {
+		auto &projection = projection_ref.get();
+		if (index >= projection.select_list.size()) {
+			return false;
+		}
+		auto &expr = *projection.select_list[index];
+		if (expr.GetExpressionType() != ExpressionType::BOUND_REF) {
+			return false;
+		}
+		index = expr.Cast<BoundReferenceExpression>().index;
+	}
+	idx_t scan_index = index;
+	if (!scan.projection_ids.empty()) {
+		if (index >= scan.projection_ids.size()) {
+			return false;
+		}
+		scan_index = scan.projection_ids[index];
+	}
+	if (scan_index != 0) {
+		return false;
+	}
+	auto &column_index = scan.column_ids[scan_index];
+	if (column_index.HasChildren() || !column_index.HasPrimaryIndex() || column_index.IsVirtualColumn()) {
+		return false;
+	}
+	auto column_id = column_index.GetPrimaryIndex();
+	if (column_id >= scan.returned_types.size() || column_id >= scan.names.size()) {
+		return false;
+	}
+	// a run-aware integer type, x's own type in the fused compact row: no cast may sit between the scan column and x
+	auto &fused = *op.fused;
+	auto &storage_type = scan.returned_types[column_id];
+	if (!IsRunAwareInputType(storage_type) || storage_type != aggr.children[0]->return_type ||
+	    fused.columns.size() != 1 || fused.columns[0].chunk_index >= fused.input_types.size() ||
+	    storage_type != fused.input_types[fused.columns[0].chunk_index]) {
+		return false;
+	}
+	// the admission's charge doubled, as the run kind's: each scan thread holds the operator's fused local state and the
+	// descriptor's (threads x 24.25 MiB x 2 + estimate x 32 B <= the budget); refused, the set member keeps its rows form
+	const idx_t estimate = op.children[0].get().estimated_cardinality;
+	const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+	const idx_t budget = fused.budget_bytes;
+	const idx_t thread_charge = threads * FusedIntegerAggregate::PER_THREAD_CHARGE_BYTES * 2;
+	if (thread_charge > budget || estimate > (budget - thread_charge) / FusedIntegerAggregate::ESTIMATE_ROW_BYTES) {
+		return false;
+	}
+	RunAggregateColumn column;
+	column.scan_column_index = scan_index;
+	column.storage_type = storage_type;
+	column.aggregates.push_back(0);
+	vector<RunAggregateColumn> columns;
+	columns.push_back(std::move(column));
+	auto data = make_shared_ptr<RunAggregateData>(op, std::move(columns), scan.names[column_id]);
+	op.run_aggregate = data;
+	scan.run_aggregate = data;
+	return true;
+}
+
+void RunAggregateData::ResetSet(GlobalSinkState &distinct_radix_global, FusedAggregateGlobalState &fused) {
+	lock_guard<mutex> guard(lock);
+	grouped_sink = &distinct_radix_global;
+	grouped_partials.clear();
+	fused_sink = &fused;
+	fused_partials.clear();
+}
+
+FusedAggregateLocalState &RunAggregateData::CreateSetLocal(ClientContext &context) {
+	// the thread's distinct-table sink state and its fused state (its 4096-entry arrays and line buffer) are built before
+	// the lock is taken, so the scan threads build theirs in parallel; the lock only registers them
+	auto radix_local = SetRadixTable(*ungrouped_op).GetLocalSinkState(context);
+	auto state = make_uniq<FusedAggregateLocalState>(*ungrouped_op->fused);
+	state->run_radix_local = radix_local.get();
+	lock_guard<mutex> guard(lock);
+	grouped_partials.push_back(std::move(radix_local));
+	fused_partials.push_back(std::move(state));
+	return *fused_partials.back();
+}
+
+bool RunAggregateData::SinkSetRuns(ClientContext &context, Vector &values, const uint16_t *counts, idx_t run_count,
+                                   FusedAggregateLocalState &lstate) {
+	if (!fused_sink || !grouped_sink) {
+		throw InternalException("run-aware distinct set: the sink states are not registered");
+	}
+	return ungrouped_op->fused->SinkSetRuns(context, values, counts, run_count, *ungrouped_op, *fused_sink, lstate);
+}
+
+void RunAggregateData::CombineSetPartials(ClientContext &context) {
+	vector<unique_ptr<FusedAggregateLocalState>> partials;
+	{
+		lock_guard<mutex> guard(lock);
+		partials = std::move(fused_partials);
+		fused_partials.clear();
+	}
+	for (auto &partial : partials) {
+		ungrouped_op->fused->CombineSetRuns(context, *ungrouped_op, *fused_sink, *partial);
+	}
+}
+
+vector<unique_ptr<LocalSinkState>> RunAggregateData::TakeSetRadixPartials() {
+	lock_guard<mutex> guard(lock);
+	return std::move(grouped_partials);
+}
+
 void RunAggregateData::Reset(Allocator &client_allocator) {
 	lock_guard<mutex> guard(lock);
 	allocator = make_uniq<ArenaAllocator>(client_allocator);
@@ -536,6 +689,11 @@ struct RunAggregatePartial::ColumnSink : public RunSink {
 			run_count = 0;
 			return;
 		}
+		if (partial.data.IsSet()) {
+			partial.ApplySetRuns(value_vector, count_buffer.get(), run_count);
+			run_count = 0;
+			return;
+		}
 		if (cast_executor) {
 			cast_input.data[0].Reference(value_vector);
 			cast_input.SetCardinality(run_count);
@@ -566,6 +724,14 @@ RunAggregatePartial::RunAggregatePartial(RunAggregateData &data_p, ClientContext
 		// one thread-local radix sink state, owned by the shared descriptor so it outlives this scan-local partial
 		grouped_local = &data.CreateGroupedLocal(context_p);
 		fused_local = data.CreateFusedLocal(*grouped_local);
+		vector<LogicalType> group_types;
+		group_types.push_back(data.columns[0].storage_type);
+		group_chunk.InitializeEmpty(group_types);
+	} else if (data.IsSet()) {
+		// the set form: no ungrouped partial state; this thread's fused state and the distinct-table sink state it
+		// drains into, both owned by the shared descriptor so they outlive this scan-local partial
+		fused_local = &data.CreateSetLocal(context_p);
+		grouped_local = fused_local->run_radix_local;
 		vector<LogicalType> group_types;
 		group_types.push_back(data.columns[0].storage_type);
 		group_chunk.InitializeEmpty(group_types);
@@ -612,9 +778,24 @@ void RunAggregatePartial::ApplyGroupedRuns(Vector &values, const uint16_t *count
 	data.SinkGroupedRuns(context, group_chunk, counts, run_count, *grouped_local);
 }
 
+void RunAggregatePartial::ApplySetRuns(Vector &values, const uint16_t *counts, idx_t run_count) {
+	if (data.SinkSetRuns(context, values, counts, run_count, *fused_local)) {
+		return;
+	}
+	// the kernel is abandoned (this state has drained): each run is one insert into this thread's distinct-table sink
+	// state, with run length 1 (the drain's all-ones lengths) and no update - the distinct table has no aggregate
+	D_ASSERT(fused_local->drain_counts && run_count <= STANDARD_VECTOR_SIZE);
+	group_chunk.data[0].Reference(values);
+	group_chunk.SetCardinality(run_count);
+	const vector<aggregate_grouped_run_update_t> no_updates;
+	SetRadixTable(*data.ungrouped_op)
+	    .SinkRuns(context, *data.grouped_sink, *grouped_local, group_chunk, fused_local->drain_counts.get(), run_count,
+	              no_updates);
+}
+
 void RunAggregatePartial::AddRows(idx_t count) {
 	rows += count;
-	if (data.IsGrouped() || data.nullary_aggregates.empty()) {
+	if (data.IsGrouped() || data.IsSet() || data.nullary_aggregates.empty()) {
 		return;
 	}
 	// a vector holds at most STANDARD_VECTOR_SIZE rows, which fits the run length type
@@ -631,8 +812,9 @@ void RunAggregatePartial::CombineIntoShared() {
 	for (auto &sink : sinks) {
 		sink->Flush();
 	}
-	if (data.IsGrouped()) {
-		// the grouped runs are already in this thread's hash table; it is combined at the aggregate's Finalize
+	if (data.IsGrouped() || data.IsSet()) {
+		// the grouped runs are already in this thread's hash table; it is combined at the aggregate's Finalize (the set
+		// form's runs are in this thread's fused state, handed over at FinishScan or the aggregate's Finalize)
 		return;
 	}
 	if (rows == 0) {
@@ -679,7 +861,12 @@ void RunAggregatePartial::FinishScan() {
 	fused_local = nullptr;
 	grouped_local = nullptr;
 	if (state) {
-		data.grouped_op->fused->CombineRuns(context, *data.grouped_op, *data.fused_sink, *state);
+		if (data.IsSet()) {
+			// the set form: the same hand-over (or drain into the thread's distinct-table sink state)
+			data.ungrouped_op->fused->CombineSetRuns(context, *data.ungrouped_op, *data.fused_sink, *state);
+		} else {
+			data.grouped_op->fused->CombineRuns(context, *data.grouped_op, *data.fused_sink, *state);
+		}
 	}
 }
 

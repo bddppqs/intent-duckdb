@@ -1,0 +1,311 @@
+# name: test/sql/storage/persisted_row_group_index/persisted_row_group_index.test
+# description: A file at the persisted-row-group-index version (0x40000003): its tables' row-group pointers are loaded in parallel from their persisted positions, and a row group's column statistics are read from the persisted index without loading the column. Every answer equals the same rows' answer in memory: Top-N orders, zonemap prunes, min/max, after a restart with 1 and 8 threads, after updates, deletes, appends, an unchanged table's checkpoint (whose index blocks stay in use), a partial rewrite, added and dropped columns, nested columns (no statistics stored) and a single row group
+# group: [persisted_row_group_index]
+
+require skip_reload
+
+statement ok
+SET debug_verify_blocks = true
+
+statement ok
+SET threads = 8
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p (STORAGE_VERSION 'latest', ROW_GROUP_SIZE 2048)
+
+# 160 row groups of 2048 rows: i ascending (one range per row group), g cycling, s one prefix per row group with '' rows,
+# n with NULLs, an all-NULL column, a constant, a list and a struct (nested: no statistics stored)
+statement ok
+CREATE TABLE p.t AS SELECT i, i % 1000 AS g, CASE WHEN i % 5 = 0 THEN '' ELSE 'v' || lpad((i // 2048)::VARCHAR, 4, '0') || '-' || (i % 13)::VARCHAR END AS s,
+    CASE WHEN i % 7 = 0 THEN NULL ELSE i * 3 END AS n, NULL::INTEGER AS z, 42 AS k, (i / 8)::DOUBLE AS d,
+    DATE '2020-01-01' + (i // 4096)::INTEGER AS dt, [i, i + 1] AS l, {'a': i, 'b': 'x' || (i % 100)::VARCHAR} AS st FROM range(327680) r(i)
+
+statement ok
+CREATE TABLE ref AS FROM p.t
+
+statement ok
+CHECKPOINT p
+
+statement ok
+DETACH p
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+# the main header (after the 8-byte block checksum): the magic "DUCK" and the little-endian file version 0x40000003
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/persisted_rg_index.db')
+----
+4455434B	0300004000000000
+
+query I
+SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('p.t')
+----
+160
+
+loop pass 0 2
+
+# a: as checkpointed (pass 0 with 8 threads, pass 1 after a restart with 1 thread: the pointers loaded one by one)
+
+query IIII nosort topn_desc_${pass}
+SELECT i, s, n, g FROM p.t ORDER BY i DESC LIMIT 7
+----
+
+query IIII nosort topn_desc_${pass}
+SELECT i, s, n, g FROM ref ORDER BY i DESC LIMIT 7
+----
+
+query IIII nosort topn_s_${pass}
+SELECT s, i, n, g FROM p.t WHERE s <> '' ORDER BY s DESC, i LIMIT 9
+----
+
+query IIII nosort topn_s_${pass}
+SELECT s, i, n, g FROM ref WHERE s <> '' ORDER BY s DESC, i LIMIT 9
+----
+
+query III nosort topn_n_${pass}
+SELECT n, i, s FROM p.t ORDER BY n NULLS FIRST, i LIMIT 11
+----
+
+query III nosort topn_n_${pass}
+SELECT n, i, s FROM ref ORDER BY n NULLS FIRST, i LIMIT 11
+----
+
+query IIII nosort prune_${pass}
+SELECT count(*), sum(n), min(s), max(dt) FROM p.t WHERE i BETWEEN 100000 AND 100100
+----
+
+query IIII nosort prune_${pass}
+SELECT count(*), sum(n), min(s), max(dt) FROM ref WHERE i BETWEEN 100000 AND 100100
+----
+
+query III nosort prune_s_${pass}
+SELECT count(*), min(i), max(i) FROM p.t WHERE s = 'v0042-3'
+----
+
+query III nosort prune_s_${pass}
+SELECT count(*), min(i), max(i) FROM ref WHERE s = 'v0042-3'
+----
+
+query III nosort prune_dt_${pass}
+SELECT count(*), sum(d), count(z) FROM p.t WHERE dt = DATE '2020-01-30' OR k <> 42
+----
+
+query III nosort prune_dt_${pass}
+SELECT count(*), sum(d), count(z) FROM ref WHERE dt = DATE '2020-01-30' OR k <> 42
+----
+
+query IIIIII nosort minmax_${pass}
+SELECT min(i), max(i), min(n), max(n), min(s), max(dt) FROM p.t
+----
+
+query IIIIII nosort minmax_${pass}
+SELECT min(i), max(i), min(n), max(n), min(s), max(dt) FROM ref
+----
+
+query III nosort nested_${pass}
+SELECT count(*), sum(l[2]), max(st.b) FROM p.t WHERE st.a BETWEEN 5000 AND 5100
+----
+
+query III nosort nested_${pass}
+SELECT count(*), sum(l[2]), max(st.b) FROM ref WHERE st.a BETWEEN 5000 AND 5100
+----
+
+statement ok
+DETACH p
+
+statement ok
+SET threads = 1
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+endloop
+
+statement ok
+SET threads = 8
+
+# b: an update widens a row group's statistics (its column then loaded: the live statistics), a delete and an append
+
+statement ok
+UPDATE p.t SET i = -5, s = 'zzz', n = 999999999 WHERE i = 200000
+
+statement ok
+UPDATE ref SET i = -5, s = 'zzz', n = 999999999 WHERE i = 200000
+
+statement ok
+DELETE FROM p.t WHERE i BETWEEN 4000 AND 9000
+
+statement ok
+DELETE FROM ref WHERE i BETWEEN 4000 AND 9000
+
+statement ok
+INSERT INTO p.t SELECT i, i % 1000, 'w' || i::VARCHAR, i, NULL, 42, 0.5, DATE '2030-01-01', [i], {'a': i, 'b': 'y'} FROM range(327680, 331776) r(i)
+
+statement ok
+INSERT INTO ref SELECT i, i % 1000, 'w' || i::VARCHAR, i, NULL, 42, 0.5, DATE '2030-01-01', [i], {'a': i, 'b': 'y'} FROM range(327680, 331776) r(i)
+
+loop pass 0 3
+
+# pass 0: before the checkpoint; pass 1: checkpointed and restarted; pass 2: after a checkpoint of another table only
+# (the table unchanged: its persisted index stays in use) and a new table's blocks written, restarted
+
+query IIII nosort b_low_${pass}
+SELECT i, s, n, g FROM p.t ORDER BY i LIMIT 3
+----
+
+query IIII nosort b_low_${pass}
+SELECT i, s, n, g FROM ref ORDER BY i LIMIT 3
+----
+
+query III nosort b_neg_${pass}
+SELECT count(*), max(s), max(n) FROM p.t WHERE i < 0
+----
+
+query III nosort b_neg_${pass}
+SELECT count(*), max(s), max(n) FROM ref WHERE i < 0
+----
+
+query III nosort b_high_${pass}
+SELECT i, s, dt FROM p.t ORDER BY s DESC, i LIMIT 5
+----
+
+query III nosort b_high_${pass}
+SELECT i, s, dt FROM ref ORDER BY s DESC, i LIMIT 5
+----
+
+query IIII nosort b_del_${pass}
+SELECT count(*), min(i), max(i), sum(n) FROM p.t WHERE i BETWEEN 3000 AND 10000
+----
+
+query IIII nosort b_del_${pass}
+SELECT count(*), min(i), max(i), sum(n) FROM ref WHERE i BETWEEN 3000 AND 10000
+----
+
+query IIIII nosort b_all_${pass}
+SELECT count(*), sum(i), max(dt), min(s), count(z) FROM p.t
+----
+
+query IIIII nosort b_all_${pass}
+SELECT count(*), sum(i), max(dt), min(s), count(z) FROM ref
+----
+
+statement ok
+CHECKPOINT p
+
+statement ok
+CREATE OR REPLACE TABLE p.other${pass} AS SELECT i, 'other-' || i::VARCHAR AS s FROM range(100000 * ${pass}) r(i)
+
+statement ok
+CHECKPOINT p
+
+statement ok
+DETACH p
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+endloop
+
+# c: a partial rewrite (one column updated in place; the other columns' metadata and statistics reused), then added and
+# dropped columns
+
+statement ok
+UPDATE p.t SET g = g + 1 WHERE i % 3 = 0
+
+statement ok
+UPDATE ref SET g = g + 1 WHERE i % 3 = 0
+
+statement ok
+CHECKPOINT p
+
+statement ok
+DETACH p
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+query IIII nosort c_g
+SELECT count(*), sum(g), min(i), max(s) FROM p.t WHERE g = 500 AND i > 50000
+----
+
+query IIII nosort c_g
+SELECT count(*), sum(g), min(i), max(s) FROM ref WHERE g = 500 AND i > 50000
+----
+
+query III nosort c_topn
+SELECT i, g, s FROM p.t ORDER BY i DESC LIMIT 4
+----
+
+query III nosort c_topn
+SELECT i, g, s FROM ref ORDER BY i DESC LIMIT 4
+----
+
+statement ok
+ALTER TABLE p.t ADD COLUMN e INTEGER DEFAULT 7
+
+statement ok
+ALTER TABLE ref ADD COLUMN e INTEGER DEFAULT 7
+
+statement ok
+ALTER TABLE p.t DROP COLUMN g
+
+statement ok
+ALTER TABLE ref DROP COLUMN g
+
+loop pass 0 2
+
+query IIII nosort c_alter_${pass}
+SELECT i, s, n, e FROM p.t WHERE i BETWEEN 300000 AND 300004 ORDER BY i
+----
+
+query IIII nosort c_alter_${pass}
+SELECT i, s, n, e FROM ref WHERE i BETWEEN 300000 AND 300004 ORDER BY i
+----
+
+query IIII nosort c_alter_topn_${pass}
+SELECT n, i, s, e FROM p.t ORDER BY n DESC NULLS LAST, i LIMIT 3
+----
+
+query IIII nosort c_alter_topn_${pass}
+SELECT n, i, s, e FROM ref ORDER BY n DESC NULLS LAST, i LIMIT 3
+----
+
+statement ok
+CHECKPOINT p
+
+statement ok
+DETACH p
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+endloop
+
+# d: a table of one row group (below the parallel load's minimum) and an empty table
+
+statement ok
+CREATE TABLE p.one AS SELECT i, 'o' || i::VARCHAR AS s FROM range(100) r(i)
+
+statement ok
+CREATE TABLE p.empty (i INTEGER, s VARCHAR)
+
+statement ok
+CHECKPOINT p
+
+statement ok
+DETACH p
+
+statement ok
+ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
+
+query III
+SELECT i, s, (SELECT count(*) FROM p.empty) FROM p.one ORDER BY i DESC LIMIT 2
+----
+99	o99	0
+98	o98	0
+
+query II
+SELECT count(*), max(s) FROM p.one WHERE i = 50
+----
+1	o50

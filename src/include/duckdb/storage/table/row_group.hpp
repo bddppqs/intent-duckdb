@@ -47,6 +47,7 @@ class TableFilterSet;
 struct ColumnFetchState;
 struct RowGroupAppendState;
 class MetadataManager;
+class PersistedRowGroupIndex;
 class RowVersionManager;
 class CommitDropState;
 class ScanFilterInfo;
@@ -249,6 +250,13 @@ public:
 	//! IsColumnLoaded read under the row group's lock: ordered against a LoadColumn of `c` in progress
 	bool IsColumnLoadedLocked(storage_t c) const;
 
+	//! Links the row group to the persisted row-group index it was loaded from (or written into), as its row group
+	//! `index`; nullptr unlinks it
+	void SetPersistedIndex(shared_ptr<PersistedRowGroupIndex> index, idx_t row_group_index);
+	//! The persisted statistics of column `c` while the column is not loaded (so it carries no change since the index
+	//! was written), or nullptr: a load of the column would compute the same statistics
+	unique_ptr<BaseStatistics> GetPersistedStatistics(storage_t c) const;
+
 private:
 	optional_ptr<RowVersionManager> GetVersionInfo();
 	optional_ptr<RowVersionManager> GetVersionInfoIfLoaded() const;
@@ -288,6 +296,9 @@ private:
 	//! Whether or not `row_id_column_data` is loaded (mutable because `const` can lazy load)
 	mutable atomic<bool> row_id_is_loaded;
 	atomic<bool> has_changes;
+	//! The persisted row-group index holding this row group's column statistics, and the row group's number in it
+	shared_ptr<PersistedRowGroupIndex> persisted_index;
+	idx_t persisted_index_row_group = 0;
 };
 
 } // namespace duckdb

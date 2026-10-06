@@ -1,0 +1,337 @@
+# name: test/sql/aggregate/distinct/distinct_set_runs.test
+# description: The set member's run form: an ungrouped count(DISTINCT x), the operator's one aggregate, over the only
+#              scanned column x of a run-eligible integer type takes the scan's runs, one row {x} per run (EXPLAIN text
+#              kind=set_runs, read from the JSON plan with its run counters); the vectors the run branch declines (a
+#              BitPacking segment, a deleted row, an updated row group) arrive as rows; a NULL-capable column, a small
+#              memory budget and a plan a NULL has outrun keep or reach the rows form and the distinct table; a prepared
+#              plan re-executes at changing thread counts. Every expected answer is stock DuckDB's on the same sequence.
+#              No require line.
+# group: [distinct]
+
+# a persistent database: the tables are checkpointed into their compressed segments, then the database restarts before
+# any query reads them (the scan reads the checkpointed segments, not the session that wrote them)
+load __TEST_DIR__/distinct_set_runs.db
+
+# r1: runs of 7 rows, 18 row groups; 314,286 distinct x
+statement ok
+CREATE TABLE r1(x BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO r1 SELECT i // 7 FROM range(2200000) t(i);
+
+# r2: equal adjacent runs across a boundary - a run at the 65,535-row cap of a stored run, then a 300,000-row run that
+# crosses three row-group boundaries (its two whole row groups store as Constant) and is split into stored entries
+# inside a row group, then runs of 5; 366,003 distinct x
+statement ok
+CREATE TABLE r2(x BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO r2 SELECT CASE WHEN i < 65535 THEN 0 WHEN i < 70000 THEN 1 WHEN i < 370000 THEN 2 ELSE 3 + (i - 370000) // 5 END FROM range(2200000) t(i);
+
+# r3: automatic compression over nine row groups - three Constant, three RLE (runs of 1,000), three BitPacking (no two
+# adjacent rows equal); 369,011 distinct x
+statement ok
+CREATE TABLE r3(x BIGINT);
+
+statement ok
+INSERT INTO r3 SELECT CASE WHEN i < 368640 THEN 42 WHEN i < 737280 THEN 1000000 + i // 1000 ELSE (i * 7919) % 1000003 END FROM range(1105920) t(i);
+
+# r4: a 4-byte x with negative values and zero, runs of 3; 733,334 distinct x
+statement ok
+CREATE TABLE r4(x INTEGER USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO r4 SELECT ((i // 3) - 500000)::INTEGER FROM range(2200000) t(i);
+
+# r5: r1's shape with one NULL x (the column's statistics can hold NULL); 314,286 distinct x
+statement ok
+CREATE TABLE r5(x BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO r5 SELECT CASE WHEN i = 1000 THEN NULL ELSE i // 7 END FROM range(2200000) t(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# a fixed memory limit: at 96 threads the run form's admission charges 96 x 24.25 MiB x 2 + 2,200,000 x 32 B, about
+# 4.95 GB, against a quarter of the limit
+statement ok
+SET memory_limit='32GB'
+
+# r3's segments: Constant, RLE and BitPacking, one class per three row groups
+query III
+SELECT compression, count(*), sum(count) FROM pragma_storage_info('r3') WHERE segment_type = 'BIGINT' GROUP BY compression ORDER BY compression
+----
+BitPacking	6	368640
+Constant	3	368640
+RLE	3	368640
+
+# (1) the run form at every thread count: the answers, and on the marker set=1, kind=set_runs and the run counters;
+# r1, r2 and r4 take every vector as runs (no input row), r3 its Constant and RLE row groups (737,280 rows) as runs and
+# its BitPacking row groups (368,640 rows) as rows
+foreach threads 1 2 8 16 64 96
+
+statement ok
+SET threads=${threads}
+
+query I
+SELECT count(DISTINCT x) FROM r1
+----
+314286
+
+query I
+SELECT count(DISTINCT x) FROM r2
+----
+366003
+
+query I
+SELECT count(DISTINCT x) FROM r3
+----
+369011
+
+query I
+SELECT count(DISTINCT x) FROM r4
+----
+733334
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r1
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=set_runs [^"]* input_rows=0 [^"]* run_rows=[1-9][0-9]* [^"]*run_length_sum=2200000 [^"]*".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r2
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=set_runs [^"]* input_rows=0 [^"]* run_rows=[1-9][0-9]* [^"]*run_length_sum=2200000 [^"]*".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r3
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=set_runs [^"]* input_rows=368640 [^"]* run_rows=[1-9][0-9]* [^"]*run_length_sum=737280 [^"]*".*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r4
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=set_runs [^"]* input_rows=0 [^"]* run_rows=[1-9][0-9]* [^"]*run_length_sum=2200000 [^"]*".*
+
+endloop
+
+# (2) the rows form on the same statements: at 8 threads under a 1500MB limit the admission's budget (a quarter of the
+# limit, 375,000,000 B) holds the rows form's charge (8 x 25,427,968 + 2,200,000 x 32 = 273,823,744 B) but not the run
+# form's doubled one (8 x 25,427,968 x 2 + 2,200,000 x 32 = 477,247,488 B): the set member keeps its rows form, with the
+# same answers
+statement ok
+SET threads=8
+
+statement ok
+SET memory_limit='1500MB'
+
+foreach t r1 r2 r3 r4
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM ${t}
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=rows [^"]*".*
+
+endloop
+
+query I
+SELECT count(DISTINCT x) FROM r1
+----
+314286
+
+query I
+SELECT count(DISTINCT x) FROM r2
+----
+366003
+
+query I
+SELECT count(DISTINCT x) FROM r3
+----
+369011
+
+query I
+SELECT count(DISTINCT x) FROM r4
+----
+733334
+
+# a fixed limit, not RESET: RESET memory_limit restores the setting but leaves the buffer pool's limit where it was
+statement ok
+SET memory_limit='32GB'
+
+# (5) a NULL-capable column: no set member, no fused path
+foreach threads 1 96
+
+statement ok
+SET threads=${threads}
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM r5
+----
+physical_plan	<!REGEX>:.*Fused Distinct Aggregate.*
+
+query I
+SELECT count(DISTINCT x) FROM r5
+----
+314286
+
+endloop
+
+# (6) the drain: a NULL in the transaction's local storage reaches a plan made while x held no NULL - a crossing that
+# drains every buffered row, the run-fed rows included, into the distinct table
+statement ok
+PREPARE p AS SELECT count(DISTINCT x) FROM r1
+
+query I
+EXECUTE p
+----
+314286
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO r1 VALUES (NULL)
+
+statement ok
+SET threads=1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE p
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* kind=set_runs [^"]* drained_rows=[1-9][0-9]* [^"]*run_drained=[1-9][0-9]* [^"]*".*
+
+# 314,287 is stock DuckDB's reading here, not the true count (314,286): a prepared count(DISTINCT x) whose plan was made
+# while x's statistics held no NULL counts the NULL that the transaction's local storage adds later (an upstream
+# behaviour of stock v1.5.5, on the rows form's drain as on the stock path); the run form is pinned to the same reading
+query I
+EXECUTE p
+----
+314287
+
+statement ok
+SET threads=8
+
+query I
+EXECUTE p
+----
+314287
+
+statement ok
+ROLLBACK
+
+query I
+EXECUTE p
+----
+314286
+
+statement ok
+DEALLOCATE p
+
+# (7) a small memory budget: the doubled charge is refused at the admission (the window of (2)), so r1's set member
+# keeps its rows form
+statement ok
+SET threads=8
+
+statement ok
+SET memory_limit='1500MB'
+
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM r1
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* set=1 [^"]* kind=rows [^"]*".*
+
+query I
+SELECT count(DISTINCT x) FROM r1
+----
+314286
+
+# a fixed limit, not RESET (as above)
+statement ok
+SET memory_limit='32GB'
+
+# (8) state turnover: one prepared plan executed twenty times at 8 and at 64 threads, then at 96, 8 and 96 threads -
+# each execution starts from fresh run partials
+statement ok
+PREPARE q AS SELECT count(DISTINCT x) FROM r1
+
+loop i 0 20
+
+query I
+EXECUTE q
+----
+314286
+
+endloop
+
+statement ok
+SET threads=64
+
+loop i 0 20
+
+query I
+EXECUTE q
+----
+314286
+
+endloop
+
+statement ok
+SET threads=96
+
+query I
+EXECUTE q
+----
+314286
+
+statement ok
+SET threads=8
+
+query I
+EXECUTE q
+----
+314286
+
+statement ok
+SET threads=96
+
+query I
+EXECUTE q
+----
+314286
+
+statement ok
+DEALLOCATE q
+
+# (3) a deleted row declines its vector: the vector's other 2,047 rows arrive as rows, the value keeps six rows
+statement ok
+SET threads=8
+
+statement ok
+DELETE FROM r1 WHERE rowid = 5000
+
+query I
+SELECT count(DISTINCT x) FROM r1
+----
+314286
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r1
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* kind=set_runs [^"]* input_rows=2047 [^"]*".*
+
+# (4) an update declines its whole row group (row group 0: 122,880 rows arrive as rows, the other 2,077,120 as runs)
+statement ok
+UPDATE r2 SET x = x WHERE rowid = 7
+
+query I
+SELECT count(DISTINCT x) FROM r2
+----
+366003
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(DISTINCT x) FROM r2
+----
+analyzed_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]* kind=set_runs [^"]* input_rows=122880 [^"]* run_rows=[1-9][0-9]* [^"]*run_length_sum=2077120 [^"]*".*

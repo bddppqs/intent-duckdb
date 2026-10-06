@@ -7,6 +7,7 @@
 #include "duckdb/common/serializer/binary_serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/typedefs.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/adaptive_filter.hpp"
@@ -17,6 +18,7 @@
 #include "duckdb/storage/metadata/metadata_reader.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
+#include "duckdb/storage/table/persisted_row_group_index.hpp"
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/column_data.hpp"
@@ -1172,7 +1174,37 @@ unique_ptr<BaseStatistics> RowGroup::GetStatistics(idx_t column_idx) const {
 	return GetStatistics(storage_index);
 }
 
+void RowGroup::SetPersistedIndex(shared_ptr<PersistedRowGroupIndex> index, idx_t row_group_index) {
+	lock_guard<mutex> l(row_group_lock);
+	persisted_index = std::move(index);
+	persisted_index_row_group = row_group_index;
+}
+
+unique_ptr<BaseStatistics> RowGroup::GetPersistedStatistics(storage_t c) const {
+	if (!is_loaded || c >= columns.size() || is_loaded[c] || !kPersistedRowGroupStatistics) {
+		return nullptr;
+	}
+	shared_ptr<PersistedRowGroupIndex> index;
+	idx_t index_row_group;
+	{
+		lock_guard<mutex> l(row_group_lock);
+		index = persisted_index;
+		index_row_group = persisted_index_row_group;
+	}
+	if (!index) {
+		return nullptr;
+	}
+	return index->GetStatistics(index_row_group, c, GetCollection().GetTypes()[c]);
+}
+
 unique_ptr<BaseStatistics> RowGroup::GetStatistics(const StorageIndex &column_idx) const {
+	if (!column_idx.IsPushdownExtract()) {
+		// a column not loaded: its persisted statistics, without reading its metadata
+		auto persisted = GetPersistedStatistics(column_idx.GetPrimaryIndex());
+		if (persisted) {
+			return persisted;
+		}
+	}
 	auto &col_data = GetColumn(column_idx);
 	auto column_stats = col_data.GetStatistics();
 	if (!column_idx.IsPushdownExtract()) {
@@ -1462,6 +1494,12 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 	result_row_group->deletes_is_loaded = deletes_is_loaded.load();
 	result_row_group->owned_version_info = owned_version_info;
 	result_row_group->version_info = version_info.load();
+	// a reused column not loaded keeps the persisted statistics it had (RowGroup::Checkpoint carries them)
+	{
+		lock_guard<mutex> l(row_group_lock);
+		result_row_group->persisted_index = persisted_index;
+		result_row_group->persisted_index_row_group = persisted_index_row_group;
+	}
 	if (is_loaded) {
 		result_row_group->is_loaded = unique_ptr<atomic<bool>[]>(new atomic<bool>[GetColumnCount()]);
 		for (idx_t c = 0; c < GetColumnCount(); c++) {
@@ -1543,7 +1581,34 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 	// construct the row group pointer and write the column meta data to disk
 	row_group_pointer.row_start = row_group_start;
 	row_group_pointer.tuple_count = count;
+	// the column statistics the table's persisted row-group index stores: a column whose metadata is reused keeps the
+	// statistics it was persisted with (unchanged since, as its metadata), a column written now takes them from its
+	// persistent data below. The row group then leaves the index it was loaded with: the checkpoint's own index links
+	// it again once written (RowGroupCollection::FinalizeCheckpoint)
+	shared_ptr<PersistedRowGroupIndex> carried_index;
+	{
+		lock_guard<mutex> l(row_group_lock);
+		carried_index = std::move(persisted_index);
+		persisted_index = nullptr;
+	}
+	auto &column_types = GetCollection().GetTypes();
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&GetBlockManager());
+	auto index_statistics = single_file && single_file->PersistedRowGroupIndex();
+	if (index_statistics) {
+		row_group_pointer.column_statistics.resize(GetColumnCount());
+	}
+	auto carry_statistics = [&](idx_t column_idx) {
+		if (index_statistics && carried_index) {
+			auto stats = carried_index->GetStatistics(persisted_index_row_group, column_idx, column_types[column_idx]);
+			if (stats) {
+				row_group_pointer.column_statistics[column_idx] = shared_ptr<BaseStatistics>(std::move(stats));
+			}
+		}
+	};
 	if (write_data.write_action == RowGroupWriteAction::REUSE_EXISTING_ROW_GROUP_METADATA) {
+		for (idx_t column_idx = 0; column_idx < GetColumnCount(); column_idx++) {
+			carry_statistics(column_idx);
+		}
 		// we are re-using the previous metadata
 		row_group_pointer.data_pointers = column_pointers;
 		row_group_pointer.has_metadata_blocks = has_metadata_blocks;
@@ -1615,6 +1680,7 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 			auto col_ptr = column_pointers[column_idx];
 			row_group_pointer.data_pointers.push_back(col_ptr);
 			reused_column_blocks.push_back(col_ptr);
+			carry_statistics(column_idx);
 			continue;
 		}
 		// write new metadata for this column
@@ -1636,6 +1702,10 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 		// Just as above, the state can refer to many other states, so this
 		// can cascade recursively into more pointer writes.
 		auto persistent_data = state->ToPersistentData();
+		if (index_statistics) {
+			row_group_pointer.column_statistics[column_idx] =
+			    PersistedRowGroupIndex::LoadedStatistics(column_types[column_idx], persistent_data);
+		}
 		// increment the "start" in all data pointers by the row group start
 		// FIXME: this is only necessary when targeting old serialization
 		IncrementSegmentStart(persistent_data, row_group_start);
@@ -1830,6 +1900,13 @@ struct DuckDBPartitionRowGroup : public PartitionRowGroup {
 	const bool is_exact;
 
 	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		if (storage_index.HasPrimaryIndex() && !storage_index.IsPushdownExtract()) {
+			// a column not loaded: its persisted statistics, without reading its metadata
+			auto persisted = row_group->GetPersistedStatistics(storage_index.GetPrimaryIndex());
+			if (persisted) {
+				return persisted;
+			}
+		}
 		if (storage_index.HasPrimaryIndex()) {
 			// the caller reads this column's statistics partition by partition: request its metadata at once
 			row_group->GetCollection().ReadAheadColumnMetadata({storage_index.GetPrimaryIndex()});

@@ -158,6 +158,9 @@ public:
 	//! Whether the file's VARCHAR statistics carry the minimum non-empty value (a file created at the release storage
 	//! version; an older block-compressed file is written without it, so an older reader keeps it)
 	bool WritesStringMinNonEmpty() const;
+	//! Whether the file's tables store a row-group pointer index and per-row-group column statistics after their
+	//! row-group pointers (the persisted-row-group-index version, which a reader without them refuses)
+	bool PersistedRowGroupIndex() const;
 
 private:
 	//! Loads the free list of the file.

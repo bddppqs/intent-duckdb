@@ -2,6 +2,8 @@
 
 #include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
 
@@ -230,6 +232,52 @@ void RowGroupReorderer::SetScanExcludesEmptyString(const TableFilterSet *filters
 		}
 		if (ConjunctionAndFilter::ExcludesEmptyString(*entry.second)) {
 			nonempty_min_key = true;
+			return;
+		}
+	}
+}
+
+//! The Top-N bound inside a scan filter: the optimizer pushes it wrapped in an optional filter, OR-ed with IS NULL for
+//! NULLS FIRST, and AND-ed with the other filters on the column
+static shared_ptr<DynamicFilterData> FindTopNBound(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::DYNAMIC_FILTER:
+		return filter.Cast<DynamicFilter>().filter_data;
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &child = filter.Cast<OptionalFilter>().child_filter;
+		return child ? FindTopNBound(*child) : nullptr;
+	}
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &children = filter.filter_type == TableFilterType::CONJUNCTION_AND
+		                     ? filter.Cast<ConjunctionAndFilter>().child_filters
+		                     : filter.Cast<ConjunctionOrFilter>().child_filters;
+		for (auto &child : children) {
+			auto bound = FindTopNBound(*child);
+			if (bound) {
+				return bound;
+			}
+		}
+		return nullptr;
+	}
+	default:
+		return nullptr;
+	}
+}
+
+void RowGroupReorderer::SetTopNBound(const TableFilterSet *filters, const vector<StorageIndex> &column_ids) {
+	if (!filters || initialized || !kTopNWaveGate || options.column_idx.HasChildren()) {
+		return;
+	}
+	for (auto &entry : filters->filters) {
+		if (entry.first >= column_ids.size() || column_ids[entry.first].HasChildren() ||
+		    column_ids[entry.first].GetPrimaryIndex() != options.column_idx.GetPrimaryIndex()) {
+			continue;
+		}
+		auto bound = FindTopNBound(*entry.second);
+		if (bound) {
+			wave_gate = make_uniq<TopNWaveGate>();
+			wave_gate->bound = std::move(bound);
 			return;
 		}
 	}

@@ -53,15 +53,24 @@ public:
 	//! Grouped form: one run-eligible group column, every aggregate carrying a grouped run update
 	RunAggregateData(const PhysicalHashAggregate &op, vector<RunAggregateColumn> columns,
 	                 vector<aggregate_grouped_run_update_t> grouped_run_updates, string column_names);
+	//! Set form: the one column x of an ungrouped count(DISTINCT x) whose fused set member takes the runs, no run update
+	RunAggregateData(const PhysicalUngroupedAggregate &op, vector<RunAggregateColumn> columns, string column_names);
 	~RunAggregateData();
 
 	//! Attach a descriptor to the aggregate and its scan when the plan shape is eligible (no-op otherwise)
 	static void TryAttach(ClientContext &context, PhysicalUngroupedAggregate &op);
 	//! The grouped counterpart: a GROUP BY over one run-eligible integer column with COUNT-family aggregates
 	static void TryAttachGrouped(ClientContext &context, PhysicalHashAggregate &op);
+	//! The set form, called by the fused kernel once its set member is decided: an ungrouped count(DISTINCT x), the
+	//! operator's one aggregate, whose x is the scan's only column, of a run-aware integer type, and whose run kind's
+	//! doubled admission charge fits the budget; true when the descriptor is attached
+	static bool TryAttachDistinctSet(ClientContext &context, PhysicalUngroupedAggregate &op);
 
 	bool IsGrouped() const {
 		return grouped_op != nullptr;
+	}
+	bool IsSet() const {
+		return set_form;
 	}
 
 	//! (Re)initialize the shared partial states for one execution
@@ -91,6 +100,22 @@ public:
 	//! drained into its radix local state when the kernel is abandoned), leaving none behind
 	void CombineFusedPartials(ClientContext &context);
 
+	//! Set form: remember the distinct table's global sink state and the fused kernel's global state of this execution
+	//! and drop the previous partials
+	void ResetSet(GlobalSinkState &distinct_radix_global, FusedAggregateGlobalState &fused);
+	//! Set form: one thread-local distinct-table sink state and one thread-local fused state paired with it (its drain's
+	//! target), both owned here so they outlive the scan's local state
+	FusedAggregateLocalState &CreateSetLocal(ClientContext &context);
+	//! Set form: one batch of runs into the fused set member; false when the kernel is abandoned (the caller sinks the
+	//! batch into the thread's distinct-table sink state)
+	bool SinkSetRuns(ClientContext &context, Vector &values, const uint16_t *counts, idx_t run_count,
+	                 FusedAggregateLocalState &lstate);
+	//! Set form: at the aggregate's Finalize, each thread-local fused state's lists go to the kernel (or are drained
+	//! into its distinct-table sink state when the kernel is abandoned), leaving none behind
+	void CombineSetPartials(ClientContext &context);
+	//! Set form: hand the thread-local distinct-table sink states to the aggregate's Finalize, leaving none behind
+	vector<unique_ptr<LocalSinkState>> TakeSetRadixPartials();
+
 	optional_ptr<const PhysicalUngroupedAggregate> ungrouped_op;
 	optional_ptr<const PhysicalHashAggregate> grouped_op;
 	const vector<RunAggregateColumn> columns;
@@ -100,6 +125,9 @@ public:
 	//! The grouped run-aware update of every aggregate, in the hash table's layout order (grouped form only)
 	const vector<aggregate_grouped_run_update_t> grouped_run_updates;
 	const string column_names;
+	//! The set form: the scan's runs of x feed the fused set member (grouped_sink and grouped_partials hold the distinct
+	//! table's states, fused_sink and fused_partials the kernel's)
+	const bool set_form = false;
 
 private:
 	friend class RunAggregatePartial;
@@ -124,13 +152,16 @@ public:
 
 	RunSink &GetSink(idx_t scan_column_index);
 	//! Account the rows of one run-eligible vector for the nullary aggregates (COUNT(*)); a no-op when grouped, where
-	//! every run carries its own length into its own group
+	//! every run carries its own length into its own group, and in the set form
 	void AddRows(idx_t count);
 	//! Apply a run batch of one column to its aggregates
 	void ApplyRuns(Vector &values, const uint16_t *counts, idx_t run_count, const vector<idx_t> &aggregates);
 	//! Grouped: probe the thread-local hash table once per run and apply the grouped run updates (run kind: the
 	//! batch goes to the fused kernel instead, unless the kernel is abandoned)
 	void ApplyGroupedRuns(Vector &values, const uint16_t *counts, idx_t run_count);
+	//! Set form: the batch goes to the fused set member, unless the kernel is abandoned: then each run is one insert
+	//! into this thread's distinct-table sink state
+	void ApplySetRuns(Vector &values, const uint16_t *counts, idx_t run_count);
 	//! Flush the batches and combine the partial states into the shared states, then reinitialize them
 	void CombineIntoShared();
 	//! The scan has sunk its last run: the run kind hands this thread's fused lists over (or drains them) on
@@ -146,11 +177,13 @@ private:
 	vector<RunSink *> by_scan_column;
 	Vector nullary_input;
 	idx_t rows = 0;
-	//! Grouped: this thread's radix sink state (owned by the shared descriptor) and the one-column group chunk
+	//! Grouped: this thread's radix sink state (owned by the shared descriptor) and the one-column group chunk (the set
+	//! form: the distinct table's sink state)
 	ClientContext &context;
 	optional_ptr<LocalSinkState> grouped_local;
 	DataChunk group_chunk;
-	//! The run kind: this thread's fused state (owned by the shared descriptor); null on the standard run path
+	//! The run kind and the set form: this thread's fused state (owned by the shared descriptor); null on the standard
+	//! run path
 	optional_ptr<FusedAggregateLocalState> fused_local;
 };
 

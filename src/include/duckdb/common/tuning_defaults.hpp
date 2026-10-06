@@ -60,6 +60,12 @@ static constexpr bool kFusedDistinctBitmap = true;
 //! An ungrouped count(DISTINCT x) over an integer column, the operator's one aggregate, counts each partition's distinct x
 //! in a set of x alone (the set member): no stored hash, no per-partition group fold, no table scan
 static constexpr bool kFusedDistinctSet = true;
+//! The set member frees the handed-over thread lists in its source, on the tasks that built the sets, once every
+//! partition's set is built and before the row is emitted; otherwise the sink state's destructor frees them after the row
+static constexpr bool kFusedSetSourceRelease = true;
+//! The set member takes the scan's runs when x is the scan's only column of a run-eligible integer type: one row {x}
+//! per run, the vectors the run branch declines through the rows form
+static constexpr bool kFusedRunFedDistinctSet = true;
 //! The DISTINCT class folds duplicate keys while sinking
 static constexpr bool kFusedDistinctFold = true;
 //! The grouped DISTINCT class merges its group tables as a tree as the tasks finish
@@ -164,6 +170,9 @@ static constexpr int64_t kCountFirstMaxRowsPerKeyValue = 2;
 static constexpr bool kTopNRowwiseBound = true;
 //! The Top-N bound publishes an immutable copy of every value it is set to, so the scans read it without its lock
 static constexpr bool kTopNBoundLockFree = true;
+//! An ordered parallel scan that carries a Top-N bound hands out a short prefix of its first row group, then admits a
+//! bounded number of hand-outs while the bound is set (the wave gate, row_group_collection.cpp)
+static constexpr bool kTopNWaveGate = true;
 //! A pipeline with one task runs it inline on the scheduling thread
 static constexpr bool kInlineSingleTaskPipelines = true;
 
@@ -189,6 +198,18 @@ static constexpr bool kBlockCompression = true;
 //! codes into a code block of its own, one per row group and column, so a scan that reads only codes never reads the
 //! dictionary bytes
 static constexpr bool kSplitDictionarySegments = true;
+//! In a block-compressed file at the release storage version 0x40000003 (which an older reader refuses), at each
+//! checkpoint a table writes, after its row-group pointers, the position of every row-group pointer and every row
+//! group's column statistics column by column, so a first scan loads the row-group pointers in parallel and reads a
+//! row group's column statistics without loading the column
+static constexpr bool kPersistedRowGroupIndex = true;
+//! A row group serves a column's statistics from the persisted row-group index while the column is not loaded
+//! (RowGroup::GetStatistics, the Top-N row-group order, the partition statistics), so they need not load its metadata
+static constexpr bool kPersistedRowGroupStatistics = true;
+//! The first load of a table's row groups loads the remaining row-group pointers in parallel on the task scheduler
+static constexpr bool kParallelRowGroupLoad = true;
+//! The first use of the persisted row-group index requests its metadata blocks at once
+static constexpr bool kPersistedIndexReadAhead = true;
 //! A DICT_FSST segment whose dictionary region reaches the split threshold (a quarter block) has its local codes split
 //! into the code block, so the append's room check counts its region against the block and its codes against a
 //! block of their own; off, the codes are counted against the segment's block, as if they stayed there

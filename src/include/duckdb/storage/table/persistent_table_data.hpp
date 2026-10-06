@@ -27,6 +27,8 @@ public:
 	//! Total_rows and table_stats are exact for the stored rows (written at checkpoint, property 105)
 	bool stats_exact = false;
 	MetaBlockPointer block_pointer;
+	//! The directory of the table's persisted row-group index (property 107; invalid: the table has none)
+	MetaBlockPointer row_group_index;
 };
 
 } // namespace duckdb

@@ -461,6 +461,7 @@ unique_ptr<GlobalTableFunctionState> DuckTableScanInitGlobal(ClientContext &cont
 		}
 		g_state->state.scan_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
 		g_state->state.local_state.reorderer->SetScanExcludesEmptyString(input.filters.get(), storage_ids);
+		g_state->state.scan_state.reorderer->SetTopNBound(input.filters.get(), storage_ids);
 	}
 
 	g_state->global_scan_publication = dict_global::ScanPublicationOf(input.bind_data.get());

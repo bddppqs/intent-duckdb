@@ -1,0 +1,427 @@
+# name: test/sql/topn/topn_merged_bound.test
+# description: A Top-N whose bound is merged from every thread's heap: ties across the k-th position spread over many row groups, OFFSET with ties at both ends, k = 1 at a minimum present in many row groups, two keys whose first ties at the boundary, DESC, NULLS FIRST and NULLS LAST, non-inlined sort keys (a VARCHAR and an INTEGER, VARCHAR pair) on a physical order that adds rows to the heap until it is reduced, 1, 8 and 32 threads, a late-materialized Top-N on a wide table and rows local to a transaction; every answer equals the same rows taken by an ordered list aggregate, which pushes no bound, in an in-memory database and after a checkpoint and a restart
+# group: [topn]
+
+require skip_reload
+
+# pass a: an in-memory database
+
+statement ok
+SET threads = 8
+
+# t, 33 row groups: k has four rows below 0, in four row groups, then 0 to 999 with 0 in every row group; k2 holds each
+# value six times, in six row groups; a and b order twelve rows tied at a = 0 by b; kn is k2 with eight NULLs
+statement ok
+CREATE TABLE t AS SELECT i, CASE WHEN i % 1000000 = 777 THEN -(i // 1000000) - 1 ELSE (i * 7) % 1000 END AS k, i % 666667 AS k2, (i % 666667) // 2 AS a, -i AS b, CASE WHEN i % 500009 = 3 THEN NULL ELSE i % 666667 END AS kn FROM range(4000000) r(i)
+
+# v, 33 row groups: the first row of each row group holds a small key, ascending with the group; the other keys descend
+# within the group and from one group to the next, so every chunk a single thread reads adds rows to its heap
+statement ok
+CREATE TABLE v AS SELECT i, CASE WHEN i % 122880 = 0 THEN 'a' || lpad((i // 122880)::VARCHAR, 4, '0') || '-first-of-group' ELSE 'b' || lpad((40 - i // 122880)::VARCHAR, 4, '0') || '-' || lpad((122880 - i % 122880)::VARCHAR, 6, '0') || '-rest' END AS s, CASE WHEN i % 122880 = 0 THEN (i // 122880)::INTEGER ELSE ((40 - i // 122880) * 1000000 + 122880 - i % 122880)::INTEGER END AS n, 'pair-' || lpad(i::VARCHAR, 10, '0') AS p FROM range(4000000) r(i)
+
+# w, 33 row groups: a wide table whose order key is a permutation of its rows
+statement ok
+CREATE TABLE w AS SELECT i, (i * 7919) % 4000000 AS k, CASE WHEN i % 3 = 0 THEN '' ELSE 'text-' || (i % 1000)::VARCHAR END AS s, 'payload-' || i::VARCHAR AS payload, i * 2 AS c1, i % 97 AS c2, 'col-' || (i % 13)::VARCHAR AS c3, i / 3 AS c4 FROM range(4000000) r(i)
+
+statement ok
+SET threads = 8
+
+# the merge cell: the tenth value (0) repeats in every row group
+query I nosort ties_a
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+query I nosort ties_a
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM t
+----
+
+# every row below the tenth value is returned, and every returned row is a row of t
+query II
+SELECT count(*) FILTER (WHERE r.k < 0), count(*) FILTER (WHERE r.k = t.k) FROM (SELECT i, k FROM t ORDER BY k LIMIT 10) r JOIN t USING (i)
+----
+4	10
+
+query I
+SELECT count(*) FROM t WHERE k < 0
+----
+4
+
+statement ok
+SET threads = 1
+
+query I nosort ties_a
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+statement ok
+SET threads = 32
+
+query I nosort ties_a
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+statement ok
+SET threads = 8
+
+# OFFSET: positions 25 and 26 tie, and so do 35 and 36
+query I nosort offset_a
+SELECT k2 FROM t ORDER BY k2 LIMIT 10 OFFSET 25
+----
+
+query I nosort offset_a
+SELECT unnest((list(k2 ORDER BY k2))[26:35]) FROM t
+----
+
+query I
+SELECT count(*) FROM (SELECT i, k2 FROM t ORDER BY k2 LIMIT 10 OFFSET 25) r JOIN t USING (i) WHERE r.k2 = t.k2
+----
+10
+
+# k = 1: the minimum is in six row groups
+query I nosort k1_a
+SELECT k2 FROM t ORDER BY k2 LIMIT 1
+----
+
+query I nosort k1_a
+SELECT unnest((list(k2 ORDER BY k2))[1:1]) FROM t
+----
+
+query I
+SELECT count(*) FROM (SELECT i, k2 FROM t ORDER BY k2 LIMIT 1) r JOIN t USING (i) WHERE r.k2 = t.k2 AND r.k2 = 0
+----
+1
+
+query I nosort k1_neg_a
+SELECT k FROM t ORDER BY k LIMIT 1
+----
+
+query I nosort k1_neg_a
+SELECT unnest((list(k ORDER BY k))[1:1]) FROM t
+----
+
+# two keys: the first ties twelve rows at the boundary, the second decides
+query II nosort two_keys_a
+SELECT a, b FROM t ORDER BY a, b LIMIT 10
+----
+
+query II nosort two_keys_a
+SELECT unnest((list(a ORDER BY a, b))[1:10]), unnest((list(b ORDER BY a, b))[1:10]) FROM t
+----
+
+query I nosort desc_a
+SELECT k2 FROM t ORDER BY k2 DESC LIMIT 10
+----
+
+query I nosort desc_a
+SELECT unnest((list(k2 ORDER BY k2 DESC))[1:10]) FROM t
+----
+
+query I nosort nulls_first_a
+SELECT kn FROM t ORDER BY kn NULLS FIRST LIMIT 10
+----
+
+query I nosort nulls_first_a
+SELECT unnest((list(kn ORDER BY kn NULLS FIRST))[1:10]) FROM t
+----
+
+query I nosort nulls_last_a
+SELECT kn FROM t ORDER BY kn NULLS LAST LIMIT 10
+----
+
+query I nosort nulls_last_a
+SELECT unnest((list(kn ORDER BY kn NULLS LAST))[1:10]) FROM t
+----
+
+query I nosort desc_nulls_first_a
+SELECT kn FROM t ORDER BY kn DESC NULLS FIRST LIMIT 10
+----
+
+query I nosort desc_nulls_first_a
+SELECT unnest((list(kn ORDER BY kn DESC NULLS FIRST))[1:10]) FROM t
+----
+
+# non-inlined sort keys: with one thread every chunk adds rows to the heap until it is reduced
+statement ok
+SET threads = 1
+
+query I nosort varchar_a
+SELECT s FROM v ORDER BY s LIMIT 100
+----
+
+query I nosort varchar_a
+SELECT unnest((list(s ORDER BY s))[1:100]) FROM v
+----
+
+query II nosort pair_a
+SELECT n, p FROM v ORDER BY n, p LIMIT 100
+----
+
+query II nosort pair_a
+SELECT unnest((list(n ORDER BY n, p))[1:100]), unnest((list(p ORDER BY n, p))[1:100]) FROM v
+----
+
+statement ok
+SET threads = 8
+
+query I nosort varchar_a
+SELECT s FROM v ORDER BY s LIMIT 100
+----
+
+query II nosort pair_a
+SELECT n, p FROM v ORDER BY n, p LIMIT 100
+----
+
+# a late-materialized Top-N on a wide table
+query I nosort late_a
+SELECT payload FROM w WHERE s <> '' ORDER BY k LIMIT 10
+----
+
+query I nosort late_a
+SELECT unnest((list(payload ORDER BY k))[1:10]) FROM w WHERE s <> ''
+----
+
+# rows local to a transaction (inserted, never deleted or updated) below every row of t
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t SELECT 4000000 + x, -10 - x, 0, 0, 0, 0 FROM range(5) r(x)
+
+query I nosort txn_a
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+-14
+-13
+-12
+-11
+-10
+-4
+-3
+-2
+-1
+0
+
+query I nosort txn_a
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM t
+----
+
+statement ok
+ROLLBACK
+
+query I nosort ties_a
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+# pass b: a database file, checkpointed, then a restart so that the tables are read in a new session
+load __TEST_DIR__/topn_merged_bound.db
+
+statement ok
+SET threads = 8
+
+# t, 33 row groups: k has four rows below 0, in four row groups, then 0 to 999 with 0 in every row group; k2 holds each
+# value six times, in six row groups; a and b order twelve rows tied at a = 0 by b; kn is k2 with eight NULLs
+statement ok
+CREATE TABLE t AS SELECT i, CASE WHEN i % 1000000 = 777 THEN -(i // 1000000) - 1 ELSE (i * 7) % 1000 END AS k, i % 666667 AS k2, (i % 666667) // 2 AS a, -i AS b, CASE WHEN i % 500009 = 3 THEN NULL ELSE i % 666667 END AS kn FROM range(4000000) r(i)
+
+# v, 33 row groups: the first row of each row group holds a small key, ascending with the group; the other keys descend
+# within the group and from one group to the next, so every chunk a single thread reads adds rows to its heap
+statement ok
+CREATE TABLE v AS SELECT i, CASE WHEN i % 122880 = 0 THEN 'a' || lpad((i // 122880)::VARCHAR, 4, '0') || '-first-of-group' ELSE 'b' || lpad((40 - i // 122880)::VARCHAR, 4, '0') || '-' || lpad((122880 - i % 122880)::VARCHAR, 6, '0') || '-rest' END AS s, CASE WHEN i % 122880 = 0 THEN (i // 122880)::INTEGER ELSE ((40 - i // 122880) * 1000000 + 122880 - i % 122880)::INTEGER END AS n, 'pair-' || lpad(i::VARCHAR, 10, '0') AS p FROM range(4000000) r(i)
+
+# w, 33 row groups: a wide table whose order key is a permutation of its rows
+statement ok
+CREATE TABLE w AS SELECT i, (i * 7919) % 4000000 AS k, CASE WHEN i % 3 = 0 THEN '' ELSE 'text-' || (i % 1000)::VARCHAR END AS s, 'payload-' || i::VARCHAR AS payload, i * 2 AS c1, i % 97 AS c2, 'col-' || (i % 13)::VARCHAR AS c3, i / 3 AS c4 FROM range(4000000) r(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+statement ok
+SET threads = 8
+
+# the merge cell: the tenth value (0) repeats in every row group
+query I nosort ties_b
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+query I nosort ties_b
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM t
+----
+
+# every row below the tenth value is returned, and every returned row is a row of t
+query II
+SELECT count(*) FILTER (WHERE r.k < 0), count(*) FILTER (WHERE r.k = t.k) FROM (SELECT i, k FROM t ORDER BY k LIMIT 10) r JOIN t USING (i)
+----
+4	10
+
+query I
+SELECT count(*) FROM t WHERE k < 0
+----
+4
+
+statement ok
+SET threads = 1
+
+query I nosort ties_b
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+statement ok
+SET threads = 32
+
+query I nosort ties_b
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+
+statement ok
+SET threads = 8
+
+# OFFSET: positions 25 and 26 tie, and so do 35 and 36
+query I nosort offset_b
+SELECT k2 FROM t ORDER BY k2 LIMIT 10 OFFSET 25
+----
+
+query I nosort offset_b
+SELECT unnest((list(k2 ORDER BY k2))[26:35]) FROM t
+----
+
+query I
+SELECT count(*) FROM (SELECT i, k2 FROM t ORDER BY k2 LIMIT 10 OFFSET 25) r JOIN t USING (i) WHERE r.k2 = t.k2
+----
+10
+
+# k = 1: the minimum is in six row groups
+query I nosort k1_b
+SELECT k2 FROM t ORDER BY k2 LIMIT 1
+----
+
+query I nosort k1_b
+SELECT unnest((list(k2 ORDER BY k2))[1:1]) FROM t
+----
+
+query I
+SELECT count(*) FROM (SELECT i, k2 FROM t ORDER BY k2 LIMIT 1) r JOIN t USING (i) WHERE r.k2 = t.k2 AND r.k2 = 0
+----
+1
+
+query I nosort k1_neg_b
+SELECT k FROM t ORDER BY k LIMIT 1
+----
+
+query I nosort k1_neg_b
+SELECT unnest((list(k ORDER BY k))[1:1]) FROM t
+----
+
+# two keys: the first ties twelve rows at the boundary, the second decides
+query II nosort two_keys_b
+SELECT a, b FROM t ORDER BY a, b LIMIT 10
+----
+
+query II nosort two_keys_b
+SELECT unnest((list(a ORDER BY a, b))[1:10]), unnest((list(b ORDER BY a, b))[1:10]) FROM t
+----
+
+query I nosort desc_b
+SELECT k2 FROM t ORDER BY k2 DESC LIMIT 10
+----
+
+query I nosort desc_b
+SELECT unnest((list(k2 ORDER BY k2 DESC))[1:10]) FROM t
+----
+
+query I nosort nulls_first_b
+SELECT kn FROM t ORDER BY kn NULLS FIRST LIMIT 10
+----
+
+query I nosort nulls_first_b
+SELECT unnest((list(kn ORDER BY kn NULLS FIRST))[1:10]) FROM t
+----
+
+query I nosort nulls_last_b
+SELECT kn FROM t ORDER BY kn NULLS LAST LIMIT 10
+----
+
+query I nosort nulls_last_b
+SELECT unnest((list(kn ORDER BY kn NULLS LAST))[1:10]) FROM t
+----
+
+query I nosort desc_nulls_first_b
+SELECT kn FROM t ORDER BY kn DESC NULLS FIRST LIMIT 10
+----
+
+query I nosort desc_nulls_first_b
+SELECT unnest((list(kn ORDER BY kn DESC NULLS FIRST))[1:10]) FROM t
+----
+
+# non-inlined sort keys: with one thread every chunk adds rows to the heap until it is reduced
+statement ok
+SET threads = 1
+
+query I nosort varchar_b
+SELECT s FROM v ORDER BY s LIMIT 100
+----
+
+query I nosort varchar_b
+SELECT unnest((list(s ORDER BY s))[1:100]) FROM v
+----
+
+query II nosort pair_b
+SELECT n, p FROM v ORDER BY n, p LIMIT 100
+----
+
+query II nosort pair_b
+SELECT unnest((list(n ORDER BY n, p))[1:100]), unnest((list(p ORDER BY n, p))[1:100]) FROM v
+----
+
+statement ok
+SET threads = 8
+
+query I nosort varchar_b
+SELECT s FROM v ORDER BY s LIMIT 100
+----
+
+query II nosort pair_b
+SELECT n, p FROM v ORDER BY n, p LIMIT 100
+----
+
+# a late-materialized Top-N on a wide table
+query I nosort late_b
+SELECT payload FROM w WHERE s <> '' ORDER BY k LIMIT 10
+----
+
+query I nosort late_b
+SELECT unnest((list(payload ORDER BY k))[1:10]) FROM w WHERE s <> ''
+----
+
+# rows local to a transaction (inserted, never deleted or updated) below every row of t
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t SELECT 4000000 + x, -10 - x, 0, 0, 0, 0 FROM range(5) r(x)
+
+query I nosort txn_b
+SELECT k FROM t ORDER BY k LIMIT 10
+----
+-14
+-13
+-12
+-11
+-10
+-4
+-3
+-2
+-1
+0
+
+query I nosort txn_b
+SELECT unnest((list(k ORDER BY k))[1:10]) FROM t
+----
+
+statement ok
+ROLLBACK
+
+query I nosort ties_b
+SELECT k FROM t ORDER BY k LIMIT 10
+----

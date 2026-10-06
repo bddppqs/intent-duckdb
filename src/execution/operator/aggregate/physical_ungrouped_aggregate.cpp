@@ -296,6 +296,14 @@ unique_ptr<GlobalSinkState> PhysicalUngroupedAggregate::GetGlobalSinkState(Clien
 	if (fused) {
 		auto state = make_uniq<UngroupedAggregateGlobalSinkState>(*this, context);
 		state->fused = fused->GetGlobalSinkState(context);
+		if (fused->set_runs) {
+			// the set member's run form is fed by the scan's run descriptor: the descriptor takes the fused state beside
+			// the distinct table's global state, which is the run-fed drain's target
+			auto &info = *distinct_collection_info;
+			auto &distinct_global = *state->distinct_state->radix_states[info.table_map.at(info.indices[0])];
+			state->fused->run_radix_global = &distinct_global;
+			run_aggregate->ResetSet(distinct_global, *state->fused);
+		}
 		return std::move(state);
 	}
 	if (run_aggregate) {
@@ -666,8 +674,25 @@ SinkFinalizeType PhysicalUngroupedAggregate::Finalize(Pipeline &pipeline, Event 
                                                       OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<UngroupedAggregateGlobalSinkState>();
 	if (fused) {
+		if (fused->set_runs) {
+			// every scan thread has finished: each run partial's lists go to the kernel (or are drained into its
+			// distinct-table sink state when the kernel is abandoned) before phase 2 is decided
+			run_aggregate->CombineSetPartials(context);
+		}
 		if (fused->Finalize(*gstate.fused)) {
 			return SinkFinalizeType::READY;
+		}
+		if (fused->set_runs) {
+			// abandoned: the run partials' distinct-table sink states join the distinct table's global state before it
+			// is finalized
+			auto &info = *distinct_collection_info;
+			const auto table_idx = info.table_map.at(info.indices[0]);
+			auto &radix_table = *distinct_data->radix_tables[table_idx];
+			auto &radix_global = *gstate.distinct_state->radix_states[table_idx];
+			auto partials = run_aggregate->TakeSetRadixPartials();
+			for (auto &partial : partials) {
+				radix_table.Combine(context, radix_global, *partial);
+			}
 		}
 	}
 

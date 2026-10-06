@@ -60,9 +60,20 @@ static constexpr uint64_t BLOCK_COMPRESSION_VERSION_NUMBER = 0x40000001;
 //! tables may store column translations, whose bit-packing groups may be FOR_SCALED and whose VARCHAR statistics carry
 //! the minimum non-empty value; a reader without them refuses it by its version, and this reader opens both
 static constexpr uint64_t RELEASE_STORAGE_VERSION_NUMBER = 0x40000002;
-//! Both block-compressed file versions share the layout
+//! The release successor of RELEASE_STORAGE_VERSION_NUMBER, written whenever a new file stores its blocks compressed:
+//! the release storage version whose tables may also store, after their row-group pointers, an index of those pointers
+//! and each row group's column statistics column by column (kPersistedRowGroupIndex); a reader without them refuses
+//! it by its version, and this reader opens all three block-compressed versions
+static constexpr uint64_t PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER = 0x40000003;
+//! Every block-compressed file version shares the layout
 static bool IsBlockCompressedVersion(uint64_t version_number) {
-	return version_number == BLOCK_COMPRESSION_VERSION_NUMBER || version_number == RELEASE_STORAGE_VERSION_NUMBER;
+	return version_number == BLOCK_COMPRESSION_VERSION_NUMBER || version_number == RELEASE_STORAGE_VERSION_NUMBER ||
+	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
+}
+//! The release storage version or its successor: the file properties of the release version hold at both
+static bool IsReleaseStorageVersion(uint64_t version_number) {
+	return version_number == RELEASE_STORAGE_VERSION_NUMBER ||
+	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
 }
 static constexpr idx_t BLOCK_EXTENT_ALIGNMENT = 4096;
 //! The automatic block level (zstd_block_compression_level = 0): the high level with at least this many threads
@@ -476,12 +487,17 @@ SingleFileBlockManager::SingleFileBlockManager(AttachedDatabase &db_p, const str
 
 bool SingleFileBlockManager::SplitDictionarySegments() const {
 	return block_compression && options.version_number.IsValid() &&
-	       options.version_number.GetIndex() == RELEASE_STORAGE_VERSION_NUMBER;
+	       IsReleaseStorageVersion(options.version_number.GetIndex());
 }
 
 bool SingleFileBlockManager::WritesStringMinNonEmpty() const {
 	return block_compression && options.version_number.IsValid() &&
-	       options.version_number.GetIndex() == RELEASE_STORAGE_VERSION_NUMBER;
+	       IsReleaseStorageVersion(options.version_number.GetIndex());
+}
+
+bool SingleFileBlockManager::PersistedRowGroupIndex() const {
+	return kPersistedRowGroupIndex && block_compression && options.version_number.IsValid() &&
+	       options.version_number.GetIndex() == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
 }
 
 SingleFileBlockManager::~SingleFileBlockManager() {
@@ -672,7 +688,7 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	if (kBlockCompression && options.version_number.GetIndex() >= 68 && !encryption_enabled && !options.use_direct_io) {
 		// a new file at the latest storage version stores its blocks compressed
 		block_compression = true;
-		options.version_number = RELEASE_STORAGE_VERSION_NUMBER;
+		options.version_number = PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
 		scaled_frame_of_reference = true;
 		next_extent_offset = BLOCK_START;
 	}
@@ -860,7 +876,7 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 
 	options.version_number = main_header.version_number;
 	block_compression = IsBlockCompressedVersion(main_header.version_number);
-	scaled_frame_of_reference = main_header.version_number == RELEASE_STORAGE_VERSION_NUMBER;
+	scaled_frame_of_reference = IsReleaseStorageVersion(main_header.version_number);
 	if (block_compression && (main_header.IsEncrypted() || options.use_direct_io)) {
 		throw IOException("Cannot open database \"%s\": compressed blocks (storage version %llu) are not supported "
 		                  "together with encryption or direct IO",

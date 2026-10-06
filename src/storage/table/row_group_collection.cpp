@@ -8,6 +8,7 @@
 #include "duckdb/main/profiling_utils.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/parallel/task_executor.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -15,6 +16,7 @@
 #include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/persistent_table_data.hpp"
+#include "duckdb/storage/table/persisted_row_group_index.hpp"
 #include "duckdb/storage/table/row_group_segment_tree.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -54,13 +56,19 @@ RowGroupSegmentTree::RowGroupSegmentTree(RowGroupCollection &collection, idx_t b
 RowGroupSegmentTree::~RowGroupSegmentTree() {
 }
 
-void RowGroupSegmentTree::Initialize(PersistentTableData &data, optional_ptr<vector<MetaBlockPointer>> read_pointers) {
+void RowGroupSegmentTree::Initialize(PersistentTableData &data,
+                                     optional_ptr<vector<MetaBlockPointer>> read_pointers_p) {
 	D_ASSERT(data.row_group_count > 0);
 	current_row_group = 0;
 	max_row_group = data.row_group_count;
 	finished_loading = false;
-	reader = make_uniq<MetadataReader>(collection.GetMetadataManager(), data.block_pointer, read_pointers);
+	reader = make_uniq<MetadataReader>(collection.GetMetadataManager(), data.block_pointer, read_pointers_p);
 	root_pointer = data.block_pointer;
+	read_pointers = read_pointers_p;
+	if (data.row_group_index.IsValid()) {
+		persisted_index =
+		    make_shared_ptr<PersistedRowGroupIndex>(collection.GetMetadataManager(), data.row_group_index);
+	}
 }
 
 shared_ptr<RowGroup> RowGroupSegmentTree::LoadSegment() const {
@@ -73,8 +81,114 @@ shared_ptr<RowGroup> RowGroupSegmentTree::LoadSegment() const {
 	deserializer.Begin();
 	auto row_group_pointer = RowGroup::Deserialize(deserializer);
 	deserializer.End();
+	auto result = make_shared_ptr<RowGroup>(collection, std::move(row_group_pointer));
+	if (persisted_index) {
+		result->SetPersistedIndex(persisted_index, current_row_group);
+	}
 	current_row_group++;
-	return make_shared_ptr<RowGroup>(collection, std::move(row_group_pointer));
+	return result;
+}
+
+namespace {
+
+//! Loads the row-group pointers [start, end) from their persisted positions
+class LoadRowGroupPointersTask : public BaseExecutorTask {
+public:
+	LoadRowGroupPointersTask(TaskExecutor &executor, RowGroupCollection &collection,
+	                         const shared_ptr<PersistedRowGroupIndex> &index, const vector<MetaBlockPointer> &positions,
+	                         idx_t first, idx_t start, idx_t end, vector<shared_ptr<RowGroup>> &result,
+	                         vector<MetaBlockPointer> &blocks)
+	    : BaseExecutorTask(executor), collection(collection), index(index), positions(positions), first(first),
+	      start(start), end(end), result(result), blocks(blocks) {
+	}
+
+	void ExecuteTask() override {
+		auto &manager = collection.GetMetadataManager();
+		for (idx_t k = start; k < end; k++) {
+			MetadataReader reader(manager, positions[k], &blocks);
+			BinaryDeserializer deserializer(reader);
+			deserializer.Begin();
+			auto row_group_pointer = RowGroup::Deserialize(deserializer);
+			deserializer.End();
+			auto row_group = make_shared_ptr<RowGroup>(collection, std::move(row_group_pointer));
+			row_group->SetPersistedIndex(index, k);
+			result[k - first] = std::move(row_group);
+		}
+	}
+
+	string TaskType() const override {
+		return "LoadRowGroupPointersTask";
+	}
+
+private:
+	RowGroupCollection &collection;
+	const shared_ptr<PersistedRowGroupIndex> &index;
+	const vector<MetaBlockPointer> &positions;
+	idx_t first;
+	idx_t start;
+	idx_t end;
+	vector<shared_ptr<RowGroup>> &result;
+	vector<MetaBlockPointer> &blocks;
+};
+
+//! Fewer remaining row groups than this are loaded one by one
+static constexpr idx_t PARALLEL_ROW_GROUP_LOAD_MIN = 64;
+//! A task loads at least this many consecutive row-group pointers (they share their metadata blocks)
+static constexpr idx_t MIN_ROW_GROUP_POINTERS_PER_TASK = 4;
+//! Tasks per thread: the scheduler balances them across the threads, so an uneven range or a slower thread does not
+//! hold the load back
+static constexpr idx_t ROW_GROUP_LOAD_TASKS_PER_THREAD = 4;
+
+} // namespace
+
+bool RowGroupSegmentTree::LoadRemainingSegments(vector<shared_ptr<RowGroup>> &result) const {
+	if (!persisted_index || current_row_group >= max_row_group || !kParallelRowGroupLoad) {
+		return false;
+	}
+	auto first = current_row_group;
+	auto count = max_row_group - first;
+	auto &scheduler = TaskScheduler::GetScheduler(collection.GetAttached().GetDatabase());
+	auto threads = NumericCast<idx_t>(scheduler.NumberOfThreads());
+	if (count < PARALLEL_ROW_GROUP_LOAD_MIN || threads <= 1) {
+		return false;
+	}
+	auto &positions = persisted_index->GetPositions();
+	if (positions.size() != max_row_group) {
+		throw IOException("Row-group index holds %llu positions for %llu row groups. Corrupt file?", positions.size(),
+		                  max_row_group);
+	}
+	// consecutive ranges of max(4, ceil(count / (4 * threads))) pointers: a range's pointers share their metadata
+	// blocks, the tasks read different blocks at once, and there are at least as many tasks as threads (about four
+	// each)
+	auto range = MaxValue<idx_t>(MIN_ROW_GROUP_POINTERS_PER_TASK,
+	                             (count + ROW_GROUP_LOAD_TASKS_PER_THREAD * threads - 1) /
+	                                 (ROW_GROUP_LOAD_TASKS_PER_THREAD * threads));
+	auto task_count = (count + range - 1) / range;
+	result.resize(count);
+	vector<vector<MetaBlockPointer>> task_blocks(task_count);
+	TaskExecutor executor(scheduler);
+	for (idx_t t = 0; t < task_count; t++) {
+		auto start = first + count * t / task_count;
+		auto end = first + count * (t + 1) / task_count;
+		executor.ScheduleTask(make_uniq<LoadRowGroupPointersTask>(executor, collection, persisted_index, positions,
+		                                                          first, start, end, result, task_blocks[t]));
+	}
+	executor.WorkOnTasks();
+	if (read_pointers) {
+		// the metadata blocks of the pointers, in stream order and each once, as the sequential reader records them
+		unordered_set<idx_t> seen;
+		for (auto &blocks : task_blocks) {
+			for (auto &block : blocks) {
+				if (seen.insert(block.block_pointer).second) {
+					read_pointers->push_back(block);
+				}
+			}
+		}
+	}
+	current_row_group = max_row_group;
+	reader.reset();
+	finished_loading = true;
+	return true;
 }
 
 //===--------------------------------------------------------------------===//
@@ -148,15 +262,35 @@ void RowGroupCollection::Initialize(PersistentTableData &data) {
 	metadata_pointer = data.base_table_pointer;
 	metadata_pointers = data.read_metadata_pointers;
 	owned_row_groups->Initialize(data, metadata_pointers);
+	persisted_index = owned_row_groups->GetPersistedIndex();
 	stats.Initialize(types, data);
 	stats_exact = data.stats_exact;
 	exact_since_load = data.stats_exact;
 }
 
-void RowGroupCollection::FinalizeCheckpoint(MetaBlockPointer pointer,
-                                            const vector<MetaBlockPointer> &existing_pointers) {
+void RowGroupCollection::FinalizeCheckpoint(MetaBlockPointer pointer, const vector<MetaBlockPointer> &existing_pointers,
+                                            MetaBlockPointer row_group_index, idx_t index_row_groups) {
 	metadata_pointer = pointer;
 	metadata_pointers = existing_pointers;
+	persisted_index = nullptr;
+	if (!row_group_index.IsValid()) {
+		return;
+	}
+	persisted_index = make_shared_ptr<PersistedRowGroupIndex>(GetMetadataManager(), row_group_index);
+	// the stored row groups are the collection's row groups, in order: each is linked to its statistics there (a row
+	// group count that differs links none)
+	auto row_groups = GetRowGroups();
+	if (row_groups->GetSegmentCount() != index_row_groups) {
+		return;
+	}
+	idx_t k = 0;
+	for (auto &row_group : row_groups->Segments()) {
+		row_group.SetPersistedIndex(persisted_index, k++);
+	}
+}
+
+MetaBlockPointer RowGroupCollection::GetPersistedIndexDirectory() const {
+	return persisted_index ? persisted_index->GetDirectory() : MetaBlockPointer();
 }
 
 void RowGroupCollection::Initialize(PersistentCollectionData &data) {
@@ -299,6 +433,28 @@ bool ParallelCollectionScanState::PiecesEnabled() {
 static constexpr idx_t ROW_GROUP_PIECE_ROWS = 15 * STANDARD_VECTOR_SIZE;
 static constexpr idx_t ROW_GROUP_MAX_PIECES = 4;
 
+//! The wave gate of an ordered parallel scan that carries a Top-N bound (TopNWaveGate): the first hand-out is the
+//! prefix, the first TOPN_WAVE_PREFIX_VECTORS vectors of the first ordered row group (the rest of it is queued as one
+//! piece), and the other callers wait until its taker calls again; then, while the bound is set, a hand-out is admitted
+//! only while fewer than TOPN_WAVE_WINDOW hand-outs hold a slot. A slot is held from a hand-out until its taker calls
+//! again (at once on a zonemap prune); a waiter wakes every TOPN_WAVE_WAKE to check for an interrupt and leaves the
+//! gate after TOPN_WAVE_MAX_WAIT.
+//! The window bounds the hand-outs in flight per scan: whatever the thread count, at most TOPN_WAVE_WINDOW - 1 row
+//! groups taken before the bound converges are still read after it, with the blocks they pin. The prefix is a few
+//! vectors, short so the other threads wait little, and for a small LIMIT usually enough to publish a first bound
+//! before they start. Both only pace a scan that already carries a bound; neither decides which statements use the gate
+static constexpr idx_t TOPN_WAVE_WINDOW = 16;
+static constexpr idx_t TOPN_WAVE_PREFIX_VECTORS = 4;
+static constexpr auto TOPN_WAVE_WAKE = std::chrono::milliseconds(1);
+static constexpr auto TOPN_WAVE_MAX_WAIT = std::chrono::milliseconds(100);
+
+#if defined(__GNUC__) || defined(__clang__)
+// The gate's two waits are kept out of line
+#define TOPN_WAVE_NOINLINE __attribute__((noinline))
+#else
+#define TOPN_WAVE_NOINLINE
+#endif
+
 void ParallelCollectionScanState::DecidePieces(ClientContext &context, bool allowed) {
 	if (!PiecesEnabled()) {
 		return;
@@ -353,18 +509,63 @@ void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &sta
 	state.pieces.clear();
 }
 
+//! Release the slot of the scan's previous hand-out: the prefix ends, or passes to the next row group when its
+//! hand-out was pruned
+static void ReleaseWaveSlot(TopNWaveGate &gate, CollectionScanState &scan_state, bool scanned) {
+	if (!scan_state.holds_wave_slot) {
+		return;
+	}
+	scan_state.holds_wave_slot = false;
+	gate.in_flight--;
+	if (gate.prefix_holder.get() == &scan_state) {
+		gate.prefix_holder = nullptr;
+		gate.prefix_done = scanned;
+		gate.prefix_end.notify_all();
+	}
+	gate.slot_released.notify_one();
+}
+
+static TOPN_WAVE_NOINLINE void WaitForPrefixEnd(TopNWaveGate &gate, unique_lock<mutex> &l) {
+	gate.prefix_end.wait_for(l, TOPN_WAVE_WAKE);
+}
+
+static TOPN_WAVE_NOINLINE void WaitForSlot(TopNWaveGate &gate, unique_lock<mutex> &l) {
+	gate.slot_released.wait_for(l, TOPN_WAVE_WAKE);
+}
+
+//! Wait while another scan holds the prefix, or while the bound is set and the window is full
+static void WaitForWave(ClientContext &context, TopNWaveGate &gate, unique_lock<mutex> &l) {
+	auto deadline = std::chrono::steady_clock::now() + TOPN_WAVE_MAX_WAIT;
+	while (!context.interrupted && std::chrono::steady_clock::now() < deadline) {
+		if (gate.prefix_holder) {
+			WaitForPrefixEnd(gate, l);
+		} else if (gate.prefix_done && gate.in_flight >= TOPN_WAVE_WINDOW && gate.bound->initialized) {
+			WaitForSlot(gate, l);
+		} else {
+			return;
+		}
+	}
+}
+
 bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollectionScanState &state,
                                           CollectionScanState &scan_state) {
 	AssignSharedPointer(scan_state.row_groups, state.row_groups);
+	auto wave_gate = state.reorderer ? state.reorderer->GetTopNWaveGate() : nullptr;
 	while (true) {
 		idx_t vector_index;
 		idx_t max_row;
 		optional_ptr<RowGroupCollection> collection;
 		optional_ptr<SegmentNode<RowGroup>> row_group;
 		bool may_donate = false;
+		// the end of the prefix's row group, queued as one piece once the prefix is not pruned
+		idx_t prefix_rest_max_row = 0;
 		{
 			// select the next row group to scan from the parallel state
-			lock_guard<mutex> l(state.lock);
+			unique_lock<mutex> l(state.lock);
+			if (wave_gate) {
+				ReleaseWaveSlot(*wave_gate, scan_state, true);
+				WaitForWave(context, *wave_gate, l);
+			}
 			if (!state.pieces.empty()) {
 				auto &next = state.pieces.back();
 				collection = next.collection;
@@ -403,6 +604,17 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 				}
 				max_row = MinValue<idx_t>(max_row, state.max_row);
 				may_donate = may_donate && max_row - row_start > ROW_GROUP_PIECE_ROWS;
+				if (wave_gate && !wave_gate->prefix_done && !wave_gate->prefix_holder) {
+					// the prefix: this scan takes the first vectors of the row group alone
+					wave_gate->prefix_holder = &scan_state;
+					prefix_rest_max_row = max_row;
+					max_row = MinValue<idx_t>(
+					    max_row, row_start + (vector_index + TOPN_WAVE_PREFIX_VECTORS) * STANDARD_VECTOR_SIZE);
+				}
+			}
+			if (wave_gate) {
+				wave_gate->in_flight++;
+				scan_state.holds_wave_slot = true;
 			}
 			scan_state.batch_index = ++state.batch_index;
 		}
@@ -412,6 +624,15 @@ bool RowGroupCollection::NextParallelScan(ClientContext &context, ParallelCollec
 		// initialize the scan for this row group
 		bool need_to_scan =
 		    InitializeScanInRowGroup(context, scan_state, *collection, *row_group, vector_index, max_row);
+		if (wave_gate && (!need_to_scan || prefix_rest_max_row > max_row)) {
+			lock_guard<mutex> l(state.lock);
+			if (!need_to_scan) {
+				ReleaseWaveSlot(*wave_gate, scan_state, false);
+			} else {
+				state.pieces.push_back(ParallelScanPiece {collection, row_group,
+				                                          vector_index + TOPN_WAVE_PREFIX_VECTORS, prefix_rest_max_row});
+			}
+		}
 		if (!need_to_scan) {
 			// skip this row group
 			continue;
@@ -1744,7 +1965,14 @@ void RowGroupCollection::Checkpoint(TableDataWriter &writer, TableStatistics &gl
 				auto row_group_writer = checkpoint_state.writer.GetRowGroupWriter(row_group);
 				row_group.CheckpointDeletes(*row_group_writer);
 			}
-			writer.WriteUnchangedTable(metadata_pointer, metadata_pointers, total_rows.load());
+			if (persisted_index) {
+				// the table's persisted row-group index stays the table's: its blocks stay in use
+				auto existing_pointers = metadata_pointers;
+				persisted_index->AppendBlocks(existing_pointers);
+				writer.WriteUnchangedTable(metadata_pointer, existing_pointers, total_rows.load());
+			} else {
+				writer.WriteUnchangedTable(metadata_pointer, metadata_pointers, total_rows.load());
+			}
 			// copy over existing stats into the global stats
 			CopyStats(global_stats);
 			return;

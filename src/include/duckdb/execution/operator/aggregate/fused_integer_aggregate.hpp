@@ -152,6 +152,16 @@ public:
 	//! lists were handed over. False: the operator is abandoned and the lists were drained into the radix state
 	bool CombineRuns(ClientContext &context, const PhysicalHashAggregate &op, FusedAggregateGlobalState &gstate,
 	                 FusedAggregateLocalState &lstate) const;
+	//! the set member's run form: one batch of (x, run length) pairs from the run descriptor's set form, one row {x}
+	//! per run. True: the batch is in the fused buffers. False: the operator is abandoned and this state has drained its
+	//! buffered rows into the distinct table, so the caller sinks the batch there
+	bool SinkSetRuns(ClientContext &context, Vector &values, const uint16_t *counts, idx_t run_count,
+	                 const PhysicalUngroupedAggregate &op, FusedAggregateGlobalState &gstate,
+	                 FusedAggregateLocalState &lstate) const;
+	//! the set member's run form: a run partial's Combine (at its scan's end or the operator's Finalize). True: the
+	//! lists were handed over. False: the operator is abandoned and the lists were drained into the distinct table
+	bool CombineSetRuns(ClientContext &context, const PhysicalUngroupedAggregate &op, FusedAggregateGlobalState &gstate,
+	                    FusedAggregateLocalState &lstate) const;
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context, FusedAggregateGlobalState &gstate) const;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context) const;
@@ -228,6 +238,11 @@ public:
 	//! distinct x by inserting it into a set of the key word alone, a new key counted at its insert - no (g, x) entry
 	//! count, no group table, no scan of the set; the task that finishes last emits the sum
 	bool distinct_set = false;
+	//! the set member's run form (kFusedRunFedDistinctSet): the run descriptor's set form feeds the scan's runs of x
+	//! through SinkSetRuns as the set member's compact row x alone, one row per run; the vectors the run branch declines
+	//! arrive through Sink, and a run-fed state's drain re-sinks its rows into the distinct table through the radix path's
+	//! SinkRuns
+	bool set_runs = false;
 	shared_ptr<dict_global::ColumnDictionary> bitmap_dict;
 	idx_t bitmap_words;
 	//! the coverage bound: the scanned table's storage, re-read at every execution (GetGlobalSinkState): the
@@ -301,7 +316,9 @@ public:
 	//! run kind: the run rows appended through SinkRuns and the sum of their run lengths (EXPLAIN ANALYZE counters)
 	atomic<idx_t> run_rows;
 	atomic<idx_t> run_length_sum;
-	//! run kind: the radix global sink state, the drain's target
+	//! the set member's run form: the rows the run-fed states' drains re-sank (EXPLAIN ANALYZE counter)
+	atomic<idx_t> run_drained;
+	//! run kind: the radix global sink state, the drain's target (the set member's run form: the distinct table's)
 	optional_ptr<GlobalSinkState> run_radix_global;
 
 	//! Phase 2 (set by Finalize): rows per partition over every handed-over list
@@ -381,7 +398,8 @@ public:
 	DataChunk drain_chunk;
 	//! per compact-row column (used for the gid columns alone)
 	vector<FusedGidCache> gid_caches;
-	//! run kind: the radix local sink state this state drains into, and one drain batch's run lengths
+	//! run kind: the radix local sink state this state drains into (the set member's run form: the distinct table's), and
+	//! one drain batch's run lengths
 	optional_ptr<LocalSinkState> run_radix_local;
 	unsafe_unique_array<uint16_t> drain_counts;
 	//! The bitmap class: the thread's bitmap (allocated at its first chunk), its overflow strings, its input rows and the rows it

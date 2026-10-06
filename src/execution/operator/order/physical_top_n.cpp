@@ -9,6 +9,13 @@
 
 namespace duckdb {
 
+#if defined(__GNUC__) || defined(__clang__)
+// The push into the merged boundary heap is kept out of line
+#define TOPN_MERGE_NOINLINE __attribute__((noinline))
+#else
+#define TOPN_MERGE_NOINLINE
+#endif
+
 PhysicalTopN::PhysicalTopN(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<BoundOrderByNode> orders,
                            idx_t limit, idx_t offset, shared_ptr<DynamicFilterData> dynamic_filter_p,
                            idx_t estimated_cardinality)
@@ -45,7 +52,7 @@ struct TopNScanState {
 struct TopNBoundaryValue {
 	explicit TopNBoundaryValue(const PhysicalTopN &op)
 	    : op(op), boundary_vector(op.orders[0].expression->return_type),
-	      boundary_modifiers(op.orders[0].type, op.orders[0].null_order) {
+	      boundary_modifiers(op.orders[0].type, op.orders[0].null_order), merged_size(op.limit + op.offset) {
 	}
 
 	const PhysicalTopN &op;
@@ -54,14 +61,54 @@ struct TopNBoundaryValue {
 	bool is_set = false;
 	Vector boundary_vector;
 	OrderModifiers boundary_modifiers;
+	//! With a dynamic filter the boundary is merged from every thread's heap: a max-heap of the sort keys of at most
+	//! limit + offset rows, each pushed once (by the Sink that added its row to a local heap) as an owned copy
+	vector<string> merged_keys;
+	idx_t merged_size;
+
+	static bool MergedKeyLess(const string_t &a, const string_t &b) {
+		return a < b;
+	}
+
+	TOPN_MERGE_NOINLINE void PushMergedKey(const string_t &key) {
+		merged_keys.emplace_back(key.GetData(), key.GetSize());
+		std::push_heap(merged_keys.begin(), merged_keys.end(), MergedKeyLess);
+	}
 
 	string GetBoundaryValue() {
 		lock_guard<mutex> l(lock);
 		return boundary_value;
 	}
 
+	//! Merge the entries a local heap added in one Sink (those at or above base_index) and publish the k-th key
+	void MergeValues(const unsafe_arena_vector<TopNEntry> &heap, idx_t base_index) {
+		unique_lock<mutex> l(lock);
+		bool merged = false;
+		for (auto &entry : heap) {
+			if (entry.index < base_index) {
+				continue;
+			}
+			if (merged_keys.size() >= merged_size) {
+				if (!(entry.sort_key < string_t(merged_keys.front()))) {
+					continue;
+				}
+				std::pop_heap(merged_keys.begin(), merged_keys.end(), MergedKeyLess);
+				merged_keys.pop_back();
+			}
+			PushMergedKey(entry.sort_key);
+			merged = true;
+		}
+		if (merged && merged_keys.size() >= merged_size) {
+			UpdateValue(l, string_t(merged_keys.front()));
+		}
+	}
+
 	void UpdateValue(string_t boundary_val) {
 		unique_lock<mutex> l(lock);
+		UpdateValue(l, boundary_val);
+	}
+
+	void UpdateValue(unique_lock<mutex> &l, string_t boundary_val) {
 		if (!is_set || boundary_val < string_t(boundary_value)) {
 			boundary_value = boundary_val.GetString();
 			is_set = true;
@@ -366,12 +413,21 @@ void TopNHeap::Sink(DataChunk &input, optional_ptr<TopNBoundaryValue> global_bou
 	auto &sort_keys_vec = sort_keys.data[0];
 	CreateSortKeyHelpers::CreateSortKey(sort_chunk, modifiers, sort_keys_vec);
 
+	// the rows this call adds are appended to the payload after the existing ones
+	auto base_index = heap_data.size();
 	if (heap_size <= SMALL_HEAP_THRESHOLD) {
 		AddSmallHeap(input, sort_keys_vec);
 	} else {
 		AddLargeHeap(input, sort_keys_vec);
 	}
 
+	if (global_boundary && global_boundary->op.dynamic_filter) {
+		// the boundary is merged from every thread's heap: push the rows this call added that the heap kept
+		if (heap_data.size() > base_index) {
+			global_boundary->MergeValues(heap, base_index);
+		}
+		return;
+	}
 	// if we modified the heap we might be able to update the global boundary
 	// note that the global boundary only applies to FULL heaps
 	if (heap.size() >= heap_size && global_boundary) {

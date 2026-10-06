@@ -14,8 +14,12 @@
 #include "duckdb/storage/table/segment_tree.hpp"
 #include "duckdb/common/enums/order_type.hpp"
 
+#include <condition_variable>
+
 namespace duckdb {
 class TableFilterSet;
+class CollectionScanState;
+struct DynamicFilterData;
 
 enum class OrderByStatistics : uint8_t { MIN, MAX };
 enum class OrderByColumnType : uint8_t { NUMERIC, STRING };
@@ -49,6 +53,21 @@ struct OffsetPruningResult {
 	idx_t leading_null_group_offset;
 };
 
+//! The wave gate of an ordered parallel scan that carries a Top-N bound (RowGroupReorderer::SetTopNBound), kept by
+//! RowGroupCollection::NextParallelScan under the parallel scan state's lock
+struct TopNWaveGate {
+	//! The Top-N bound on the order column
+	shared_ptr<DynamicFilterData> bound;
+	//! The scan holding the prefix (the first vectors of the first ordered row group), and whether the prefix is done
+	optional_ptr<CollectionScanState> prefix_holder;
+	bool prefix_done = false;
+	//! The hand-outs whose scans hold a slot
+	idx_t in_flight = 0;
+	//! Notified when the prefix ends or passes on, and when a slot is released
+	std::condition_variable prefix_end;
+	std::condition_variable slot_released;
+};
+
 class RowGroupReorderer {
 public:
 	RowGroupReorderer(const RowGroupOrderOptions &options_p, TransactionData transaction_p);
@@ -58,6 +77,14 @@ public:
 	//! (no limit or offset pruning) keys a VARCHAR row group on its minimum non-empty value, so the row groups holding
 	//! the smallest non-empty values are scanned first and a Top-N bound tightens early (kNonEmptyMinRowGroupOrder)
 	void SetScanExcludesEmptyString(const TableFilterSet *filters, const vector<StorageIndex> &column_ids);
+	//! The scan carries the bound of a Top-N on the order column (a dynamic filter): enable the wave gate of the parallel
+	//! scan, which holds the first hand-outs to a short prefix and then bounds the hand-outs in flight while the bound is
+	//! set (kTopNWaveGate)
+	void SetTopNBound(const TableFilterSet *filters, const vector<StorageIndex> &column_ids);
+	//! The armed wave gate, or nullptr
+	optional_ptr<TopNWaveGate> GetTopNWaveGate() {
+		return wave_gate.get();
+	}
 
 	static Value RetrieveStat(const BaseStatistics &stats, OrderByStatistics order_by, OrderByColumnType column_type);
 	static OffsetPruningResult GetOffsetAfterPruning(OrderByStatistics order_by, OrderByColumnType column_type,
@@ -73,6 +100,7 @@ private:
 	bool initialized;
 	bool nonempty_min_key = false;
 	vector<reference<SegmentNode<RowGroup>>> ordered_row_groups;
+	unique_ptr<TopNWaveGate> wave_gate;
 };
 
 } // namespace duckdb

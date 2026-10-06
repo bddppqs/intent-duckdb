@@ -643,6 +643,9 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	auto stats_exact = deserializer.ReadPropertyWithExplicitDefault<bool>(105, "stats_exact", false);
 	auto translations = deserializer.ReadPropertyWithExplicitDefault<vector<dict_global::PersistedColumn>>(
 	    106, "dict_global_translations", {});
+	// Absent (invalid) in every file but the persisted-row-group-index one (SingleFileTableDataWriter::FinalizeTable)
+	auto row_group_index =
+	    deserializer.ReadPropertyWithExplicitDefault<MetaBlockPointer>(107, "row_group_index", MetaBlockPointer());
 
 	if (!index_storage_infos.empty()) {
 		bound_info.indexes = std::move(index_storage_infos);
@@ -669,6 +672,7 @@ void CheckpointReader::ReadTableData(CatalogTransaction transaction, Deserialize
 	bound_info.data->total_rows = total_rows;
 	bound_info.data->stats_exact = stats_exact;
 	bound_info.data->read_metadata_pointers = read_pointers;
+	bound_info.data->row_group_index = row_group_index;
 	if (!translations.empty()) {
 		dict_global::StashPersisted(*bound_info.data, std::move(translations));
 	}

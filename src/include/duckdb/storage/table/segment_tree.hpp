@@ -328,6 +328,11 @@ protected:
 	virtual shared_ptr<T> LoadSegment() const {
 		return nullptr;
 	}
+	//! Load every segment not loaded yet at once, in order, into `result` - only used when lazily loading; false: the
+	//! next segment is loaded alone (LoadSegment)
+	virtual bool LoadRemainingSegments(vector<shared_ptr<T>> &result) const {
+		return false;
+	}
 
 	optional_ptr<SegmentNode<T>> GetRootSegmentInternal() const {
 		return nodes.empty() ? nullptr : nodes[0].get();
@@ -440,6 +445,13 @@ private:
 		}
 		if (finished_loading) {
 			return false;
+		}
+		vector<shared_ptr<T>> remaining;
+		if (LoadRemainingSegments(remaining)) {
+			for (auto &segment : remaining) {
+				AppendSegmentInternal(l, std::move(segment));
+			}
+			return !remaining.empty();
 		}
 		auto result = LoadSegment();
 		if (result) {

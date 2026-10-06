@@ -1,5 +1,5 @@
 # name: test/sql/storage/block_compression/block_zstd.test
-# description: Blocks of a file created at the latest storage version are stored zstd-compressed (file version 0x40000002)
+# description: Blocks of a file created at the latest storage version are stored zstd-compressed (file version 0x40000003)
 # group: [block_compression]
 
 require skip_reload
@@ -111,12 +111,12 @@ statement ok
 DETACH cnew
 
 # the main header (after the 8-byte block checksum) holds the magic "DUCK" and the little-endian file version
-# 0x40000002 (the release storage version), outside upstream's sequential storage-version range; the
+# 0x40000003 (the persisted-row-group-index version), outside upstream's sequential storage-version range; the
 # v1.4.0 file keeps upstream's 67
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/block_zstd_new.db')
 ----
-4455434B	0200004000000000
+4455434B	0300004000000000
 
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/block_zstd_old.db')

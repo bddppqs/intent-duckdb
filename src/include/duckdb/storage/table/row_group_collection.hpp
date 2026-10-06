@@ -17,6 +17,7 @@
 #include "duckdb/common/enums/row_group_append_mode.hpp"
 
 namespace duckdb {
+class PersistedRowGroupIndex;
 
 struct ParallelTableScanState;
 struct ParallelCollectionScanState;
@@ -58,7 +59,12 @@ public:
 	void Initialize(PersistentCollectionData &data);
 	void Initialize(PersistentTableData &data);
 	void InitializeEmpty();
-	void FinalizeCheckpoint(MetaBlockPointer pointer, const vector<MetaBlockPointer> &existing_pointers);
+	//! `row_group_index`: the directory of the persisted row-group index the checkpoint wrote for its
+	//! `index_row_groups` row groups (invalid: none)
+	void FinalizeCheckpoint(MetaBlockPointer pointer, const vector<MetaBlockPointer> &existing_pointers,
+	                        MetaBlockPointer row_group_index = MetaBlockPointer(), idx_t index_row_groups = 0);
+	//! The directory of the persisted row-group index of the table's stored row groups (invalid: none)
+	MetaBlockPointer GetPersistedIndexDirectory() const;
 
 	bool IsEmpty() const;
 
@@ -219,6 +225,8 @@ private:
 	MetaBlockPointer metadata_pointer;
 	//! Other metadata pointers
 	vector<MetaBlockPointer> metadata_pointers;
+	//! The persisted row-group index of the stored row groups (nullptr: none), see PersistedRowGroupIndex
+	shared_ptr<PersistedRowGroupIndex> persisted_index;
 	//! Controls whether the next append creates a new row group or reuses the existing one
 	RowGroupAppendMode row_group_append_mode;
 	//! Whether or not we can append to a checkpointed row group

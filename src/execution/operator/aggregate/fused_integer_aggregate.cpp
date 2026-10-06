@@ -118,6 +118,18 @@ static bool FusedDistinctSetEnabled() {
 	return kFusedDistinctSet;
 }
 
+//! The set member's source frees the handed-over thread lists once every non-empty partition's set is built, before the
+//! row is emitted (FusedReleaseSetLists); otherwise the sink state's destructor frees them after the row
+static bool FusedSetSourceReleaseEnabled() {
+	return kFusedSetSourceRelease;
+}
+
+//! The set member over the scan's only column of a run-eligible integer type takes the scan's runs (one row {x} per
+//! run, the run descriptor's set form); otherwise every row arrives through Sink
+static bool FusedRunFedDistinctSetEnabled() {
+	return kFusedRunFedDistinctSet;
+}
+
 //===--------------------------------------------------------------------===//
 // The row hash and the key words
 //===--------------------------------------------------------------------===//
@@ -1032,6 +1044,13 @@ void FusedIntegerAggregate::TryAttachUngrouped(ClientContext &context, PhysicalU
 			FusedArmMembers(*fused);
 		}
 		op.fused = std::move(fused);
+		// the set member's run form: the run descriptor's set form attaches only once the set member is decided (a
+		// distinct descriptor on an operator the set member refuses would take the regular run path, whose count counts
+		// rows, not values); refused, the set member keeps its rows form
+		if (FusedRunFedDistinctSetEnabled() && op.fused->distinct_set &&
+		    RunAggregateData::TryAttachDistinctSet(context, op)) {
+			op.fused->set_runs = true;
+		}
 	}
 }
 
@@ -1065,7 +1084,7 @@ FusedAggregateGlobalState::FusedAggregateGlobalState(BufferManager &buffer_manag
     : buffer_manager(buffer_manager_p), abandoned(false), drain_threshold(0), input_rows(0), folded_rows(0),
       companion_rows(0), crossing(uint8_t(FusedCrossing::NONE)), drained_rows(0), combines_taken(0), reserved_bytes(0),
       slabs_allocated(0), partitions_nonempty(0), hash_stored_rows(0), chain_rows(0), chain_new(0), table_probes(0),
-      partitions_built(0), run_rows(0), run_length_sum(0), finalized(false),
+      partitions_built(0), run_rows(0), run_length_sum(0), run_drained(0), finalized(false),
       gid_arena(buffer_manager_p.GetBufferAllocator()), gid_count(0), gid_maps(0), gid_rows_flat(0) {
 }
 
@@ -2154,6 +2173,100 @@ static void FusedDrainRuns(const FusedIntegerAggregate &fused, ClientContext &co
 	}
 }
 
+//! The set member's run-fed drain: re-sinks every row this run-fed state buffered (its taken-over lists, its own lists,
+//! its partial lines) - each the set member's compact row x alone, run-fed or not - as a one-column chunk of x through
+//! the radix path's SinkRuns on the distinct table's states, with run length 1 and no update (the distinct table has no
+//! aggregate: one insert per row), in batches of at most STANDARD_VECTOR_SIZE rows, then frees them. From here on every
+//! batch of this state goes to the distinct table.
+static void FusedDrainSetRuns(const FusedIntegerAggregate &fused, ClientContext &context,
+                              const PhysicalUngroupedAggregate &op, FusedAggregateGlobalState &gstate,
+                              FusedAggregateLocalState &lstate) {
+	FusedM2Flush(gstate, lstate);
+	lstate.drained = true;
+	auto &info = *op.distinct_collection_info;
+	auto &radix = *op.distinct_data->radix_tables[info.table_map.at(info.indices[0])];
+	auto &out = lstate.drain_chunk;
+	if (out.ColumnCount() == 0) {
+		vector<LogicalType> types;
+		types.push_back(radix.group_types[0]);
+		out.Initialize(Allocator::Get(context), types);
+	}
+	if (!lstate.drain_counts) {
+		lstate.drain_counts = make_unsafe_uniq_array_uninitialized<uint16_t>(STANDARD_VECTOR_SIZE);
+		for (idx_t i = 0; i < STANDARD_VECTOR_SIZE; i++) {
+			lstate.drain_counts[i] = 1;
+		}
+	}
+	out.Reset();
+	const vector<aggregate_grouped_run_update_t> no_updates;
+	auto &key = fused.columns[0];
+	idx_t drained = 0;
+	auto flush = [&]() {
+		if (out.size() == 0) {
+			return;
+		}
+		drained += out.size();
+		radix.SinkRuns(context, *gstate.run_radix_global, *lstate.run_radix_local, out, lstate.drain_counts.get(),
+		               out.size(), no_updates);
+		out.Reset();
+	};
+	auto append = [&](const_data_ptr_t rows, idx_t count) {
+		while (count > 0) {
+			const auto start = out.size();
+			const auto take = MinValue<idx_t>(count, STANDARD_VECTOR_SIZE - start);
+			switch (key.width) {
+			case 1:
+				FusedScatterColumn<uint8_t>(out.data[0], start, rows, take, fused.row_width, key.offset);
+				break;
+			case 2:
+				FusedScatterColumn<uint16_t>(out.data[0], start, rows, take, fused.row_width, key.offset);
+				break;
+			case 4:
+				FusedScatterColumn<uint32_t>(out.data[0], start, rows, take, fused.row_width, key.offset);
+				break;
+			default:
+				FusedScatterColumn<uint64_t>(out.data[0], start, rows, take, fused.row_width, key.offset);
+				break;
+			}
+			out.SetCardinality(start + take);
+			rows += take * fused.row_width;
+			count -= take;
+			if (out.size() == STANDARD_VECTOR_SIZE) {
+				flush();
+			}
+		}
+	};
+	auto append_list = [&](data_ptr_t chunk) {
+		for (; chunk; chunk = FusedChunkNext(chunk)) {
+			append(chunk + FusedIntegerAggregate::CHUNK_HEADER_BYTES, FusedChunkRows(chunk));
+		}
+	};
+	for (auto &lists : lstate.taken) {
+		for (idx_t p = 0; p < FusedIntegerAggregate::PARTITION_COUNT; p++) {
+			append_list(lists->heads[p]);
+		}
+	}
+	FusedSealTails(lstate, fused.row_width, nullptr);
+	for (idx_t p = 0; p < FusedIntegerAggregate::PARTITION_COUNT; p++) {
+		append_list(lstate.head[p]);
+		append(lstate.lines.get() + p * FusedIntegerAggregate::LINE_BYTES, lstate.fill[p]);
+	}
+	flush();
+	gstate.drained_rows += drained;
+	gstate.run_drained += drained;
+	// free every buffered row
+	lstate.taken.clear();
+	lstate.pool.clear();
+	lstate.slabs.clear();
+	for (idx_t p = 0; p < FusedIntegerAggregate::PARTITION_COUNT; p++) {
+		lstate.fill[p] = 0;
+		lstate.cursor[p] = nullptr;
+		lstate.room[p] = 0;
+		lstate.tail[p] = nullptr;
+		lstate.head[p] = nullptr;
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // The stored hash
 //===--------------------------------------------------------------------===//
@@ -2532,6 +2645,100 @@ bool FusedIntegerAggregate::SinkRuns(ClientContext &context, Vector &values, con
 	return true;
 }
 
+bool FusedIntegerAggregate::SinkSetRuns(ClientContext &context, Vector &values, const uint16_t *counts,
+                                        idx_t run_count, const PhysicalUngroupedAggregate &op,
+                                        FusedAggregateGlobalState &gstate, FusedAggregateLocalState &lstate) const {
+	D_ASSERT(set_runs && run_count <= STANDARD_VECTOR_SIZE);
+	idx_t length_sum = 0;
+	for (idx_t i = 0; i < run_count; i++) {
+		length_sum += counts[i];
+	}
+	FusedM2Count(gstate.run_rows, lstate, FUSED_M2_RUN_ROWS, run_count);
+	FusedM2Count(gstate.run_length_sum, lstate, FUSED_M2_RUN_LENGTH_SUM, length_sum);
+	if (lstate.drained) {
+		return false;
+	}
+	if (gstate.abandoned) {
+		FusedDrainSetRuns(*this, context, op, gstate, lstate);
+		return false;
+	}
+	if (run_count == 0) {
+		return true;
+	}
+	// the batch is the unit of atomicity, as Sink's input chunk: the checks and the pool top-up precede any append
+	// (i) a NULL x is a crossing (the run branch never delivers one: its columns cannot hold NULL)
+	auto &format = lstate.formats[0];
+	values.ToUnifiedFormat(run_count, format);
+	bool crossing = FusedHasNull(format, run_count);
+	// (ii) the batch's rows' bytes are reserved against the drain threshold
+	const idx_t bytes = run_count * row_width;
+	bool reserved = false;
+	if (!crossing) {
+		if (fused_local_allowance) {
+			idx_t current = 0;
+			reserved = FusedM2Reserve(gstate, lstate, bytes, current);
+		} else if (fused_atomic_reserve) {
+			const idx_t previous = gstate.reserved_bytes.fetch_add(bytes);
+			if (previous + bytes <= gstate.drain_threshold) {
+				reserved = true;
+			} else {
+				gstate.reserved_bytes.fetch_sub(bytes);
+				reserved = false;
+			}
+		} else {
+			auto current = gstate.reserved_bytes.load();
+			while (current + bytes <= gstate.drain_threshold) {
+				if (gstate.reserved_bytes.compare_exchange_weak(current, current + bytes)) {
+					reserved = true;
+					break;
+				}
+			}
+		}
+		crossing = !reserved;
+	}
+	// (iii) the pool: one free chunk per row an append can take; a failed allocation is a crossing
+	if (!crossing) {
+		try {
+			FusedTopUpPool(gstate, lstate);
+		} catch (OutOfMemoryException &) {
+			gstate.reserved_bytes -= bytes;
+			crossing = true;
+		}
+	}
+	if (crossing) {
+		FusedAbandon(gstate, lstate);
+		FusedDrainSetRuns(*this, context, op, gstate, lstate);
+		return false;
+	}
+	// the set member's compact rows x alone, one per run (the run length is not stored: the set reads x alone), their
+	// hashes, then the append
+	auto rows = lstate.row_buffer.get();
+	auto &key = columns[0];
+	switch (key.width) {
+	case 1:
+		FusedGatherColumn<uint8_t>(format, run_count, rows, row_width, key.offset);
+		break;
+	case 2:
+		FusedGatherColumn<uint16_t>(format, run_count, rows, row_width, key.offset);
+		break;
+	case 4:
+		FusedGatherColumn<uint32_t>(format, run_count, rows, row_width, key.offset);
+		break;
+	default:
+		FusedGatherColumn<uint64_t>(format, run_count, rows, row_width, key.offset);
+		break;
+	}
+	const auto shape = FusedGetKeyShape(key_bytes);
+	auto hashes = lstate.hashes.get();
+	for (idx_t i = 0; i < run_count; i++) {
+		uint64_t key0, key1;
+		FusedLoadKey(rows + i * row_width, shape, key0, key1);
+		hashes[i] = FusedHashKey(key0, key1, shape.two_words);
+	}
+	FusedAppend(lstate, row_width, run_count);
+	return true;
+}
+
 //! Combine's hand-over: the partial lines go into their partitions' current chunks (allocation-free), the lists are
 //! sealed and, under the fused lock, handed over with their slabs; false when the operator is abandoned (the caller
 //! drains the lists outside the lock)
@@ -2603,6 +2810,21 @@ bool FusedIntegerAggregate::CombineRuns(ClientContext &context, const PhysicalHa
 	return true;
 }
 
+bool FusedIntegerAggregate::CombineSetRuns(ClientContext &context, const PhysicalUngroupedAggregate &op,
+                                           FusedAggregateGlobalState &gstate, FusedAggregateLocalState &lstate) const {
+	D_ASSERT(set_runs);
+	// the state is done sinking: its unused allowance and counters go to the global state before every path below
+	FusedM2Flush(gstate, lstate);
+	if (lstate.drained) {
+		return false;
+	}
+	if (!FusedHandOver(*this, gstate, lstate)) {
+		FusedDrainSetRuns(*this, context, op, gstate, lstate);
+		return false;
+	}
+	return true;
+}
+
 bool FusedIntegerAggregate::Finalize(FusedAggregateGlobalState &gstate) const {
 	if (bitmap) {
 		if (gstate.abandoned) {
@@ -2645,7 +2867,7 @@ public:
 	FusedAggregateGlobalSourceState(ClientContext &context, FusedAggregateGlobalState &sink_p)
 	    : sink(sink_p), next_partition(0), claimed(0), arrived(false), tasks_started(0), tasks_done(0), merged(false),
 	      merge_done(false), distinct_entries(0), groups(0), tasks_merged(0), companion_groups(0), next_companion(0),
-	      parked(false) {
+	      parked(false), built(0), build_failed(false), next_release(0), released(0) {
 		const auto threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
 		max_threads = MaxValue<idx_t>(1, MinValue<idx_t>(threads, sink.partitions_nonempty.load()));
 	}
@@ -2683,6 +2905,13 @@ public:
 	bool parked;
 	unique_ptr<FusedGroupTable> parked_groups;
 	unique_ptr<FusedGroupTable> parked_companion;
+
+	//! The set member's release (FusedReleaseSetLists): the non-empty partitions whose set build returned, a build that
+	//! threw, the next handed-over list a task frees, and the lists freed
+	atomic<idx_t> built;
+	atomic<bool> build_failed;
+	atomic<idx_t> next_release;
+	atomic<idx_t> released;
 };
 
 class FusedAggregateLocalSourceState : public LocalSourceState {
@@ -3954,9 +4183,26 @@ static FUSED_NOINLINE idx_t FusedBuildSet(const FusedIntegerAggregate &fused, Fu
 	return occupancy + (zero ? 1 : 0);
 }
 
+//! Frees the handed-over thread lists (their slabs, heads, rows and companions), each list claimed by one task. Called
+//! once every non-empty partition's set is built: no list is read again (FusedBuildSet is their one reader here)
+static FUSED_NOINLINE void FusedReleaseSetLists(FusedAggregateGlobalState &gstate,
+                                                FusedAggregateGlobalSourceState &source) {
+	while (true) {
+		const idx_t i = source.next_release++;
+		if (i >= gstate.handed_over.size()) {
+			return;
+		}
+		auto lists = std::move(gstate.handed_over[i]);
+		lists.reset();
+		source.released++;
+	}
+}
+
 //! The set member's source: each task counts itself before its first claim, then counts the distinct x of every
 //! partition it claims (FusedBuildSet); the task that brings tasks_done up to tasks_started emits the one row, the sum
-//! (the merge rule of the bitmap class: every claimed partition is counted by a task that is done by then)
+//! (the merge rule of the bitmap class: every claimed partition is counted by a task that is done by then). With the
+//! release, a task whose claims are over frees its set table, waits until every non-empty partition's set is built and
+//! frees the handed-over lists with the other tasks before it counts itself done, so the row follows the frees
 static SourceResultType FusedSetGetData(const FusedIntegerAggregate &fused, DataChunk &chunk,
                                         FusedAggregateGlobalState &gstate, OperatorSourceInput &input) {
 	auto &source = input.global_state.Cast<FusedAggregateGlobalSourceState>();
@@ -3979,7 +4225,31 @@ static SourceResultType FusedSetGetData(const FusedIntegerAggregate &fused, Data
 			break;
 		}
 		source.claimed++;
-		distinct += FusedBuildSet(fused, gstate, lstate, p);
+		if (!FusedSetSourceReleaseEnabled()) {
+			distinct += FusedBuildSet(fused, gstate, lstate, p);
+			continue;
+		}
+		try {
+			distinct += FusedBuildSet(fused, gstate, lstate, p);
+		} catch (...) {
+			source.build_failed.store(true, std::memory_order_release);
+			throw;
+		}
+		source.built.fetch_add(1, std::memory_order_release);
+	}
+	if (FusedSetSourceReleaseEnabled()) {
+		lstate.handle.Destroy();
+		lstate.table = nullptr;
+		lstate.buffer_entries = 0;
+		// every partition is claimed by now and each claimed one is being built by a running task, so the wait ends;
+		// after a build that threw the lists are left to the sink state's destructor
+		while (source.built.load(std::memory_order_acquire) < gstate.partitions_nonempty.load() &&
+		       !source.build_failed.load(std::memory_order_acquire)) {
+			TaskScheduler::YieldThread();
+		}
+		if (!source.build_failed.load(std::memory_order_acquire)) {
+			FusedReleaseSetLists(gstate, source);
+		}
 	}
 	idx_t total;
 	{
@@ -4114,7 +4384,7 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 			result += " gid_keys=" + to_string(gid_keys);
 		}
 	}
-	result += run_kind ? " kind=run" : " kind=rows";
+	result += run_kind ? " kind=run" : (set_runs ? " kind=set_runs" : " kind=rows");
 	if (last_key_fold) {
 		// phase 1 folds a row into its partition's last row
 		result += " fold=last_key";
@@ -4129,6 +4399,13 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 			result += " companion_rows=" + to_string(gstate->companion_rows.load());
 		}
 		result += " drained_rows=" + to_string(gstate->drained_rows.load());
+		if (set_runs) {
+			// the set member's run form: the run rows appended through SinkSetRuns, their run lengths' sum and the rows
+			// the run-fed states' drains re-sank
+			result += " run_rows=" + to_string(gstate->run_rows.load());
+			result += " run_length_sum=" + to_string(gstate->run_length_sum.load());
+			result += " run_drained=" + to_string(gstate->run_drained.load());
+		}
 		result += " combines_taken=" + to_string(gstate->combines_taken.load());
 		result += " reserved_bytes=" + to_string(gstate->reserved_bytes.load());
 		result += " slabs_allocated=" + to_string(gstate->slabs_allocated.load());
@@ -4165,7 +4442,11 @@ InsertionOrderPreservingMap<string> FusedIntegerAggregate::ExtraSourceParams(Glo
 	                                   " groups=" + to_string(source.groups) +
 	                                   (mixed ? " companion_groups=" + to_string(source.companion_groups) : string()) +
 	                                   " tasks_started=" + to_string(source.tasks_started) +
-	                                   " tasks_merged=" + to_string(source.tasks_merged);
+	                                   " tasks_merged=" + to_string(source.tasks_merged) +
+	                                   (distinct_set && FusedSetSourceReleaseEnabled()
+	                                        ? " released=" + to_string(source.released.load()) + "/" +
+	                                              to_string(source.sink.handed_over.size())
+	                                        : string());
 	return result;
 }
 

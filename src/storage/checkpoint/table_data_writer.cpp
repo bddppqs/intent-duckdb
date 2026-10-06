@@ -12,6 +12,7 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/checkpoint/table_data_reader.hpp"
 #include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/table/persisted_row_group_index.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/storage/table/table_statistics.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
@@ -97,6 +98,11 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 	MetaBlockPointer pointer;
 	idx_t total_rows;
 	auto debug_verify_blocks = Settings::Get<DebugVerifyBlocksSetting>(GetDatabase());
+	auto block_manager = dynamic_cast<SingleFileBlockManager *>(&checkpoint_manager.GetBlockManager());
+	// the persisted row-group index (a file at the persisted-row-group-index version): written after the row-group
+	// pointers, its directory is property 107
+	auto write_row_group_index = block_manager && block_manager->PersistedRowGroupIndex();
+	MetaBlockPointer row_group_index;
 	if (!existing_pointer.IsValid()) {
 		auto supports_per_column_writes = collection.SupportsPerColumnWrites();
 		// write the metadata
@@ -115,10 +121,14 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 		// now start writing the row group pointers to disk
 		table_data_writer.Write<uint64_t>(row_group_pointers.size());
 		total_rows = 0;
+		vector<MetaBlockPointer> row_group_positions;
 		for (auto &row_group_pointer : row_group_pointers) {
 			auto row_group_count = row_group_pointer.row_start + row_group_pointer.tuple_count;
 			if (row_group_count > total_rows) {
 				total_rows = row_group_count;
+			}
+			if (write_row_group_index) {
+				row_group_positions.push_back(table_data_writer.GetMetaBlockPointer());
 			}
 
 			// Each RowGroup is its own unit
@@ -127,12 +137,22 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 			RowGroup::Serialize(row_group_pointer, row_group_serializer, supports_per_column_writes);
 			row_group_serializer.End();
 		}
+		if (write_row_group_index && !row_group_pointers.empty()) {
+			row_group_index =
+			    PersistedRowGroupIndex::Write(table_data_writer, row_group_positions, row_group_pointers,
+			                                  collection.GetTypes(), serializer.GetOptions(), written_pointers,
+			                                  written_pointers.size());
+		}
 		table_data_writer.SetWrittenPointers(nullptr);
-		collection.FinalizeCheckpoint(pointer, written_pointers);
+		collection.FinalizeCheckpoint(pointer, written_pointers, row_group_index, row_group_pointers.size());
 	} else {
 		// we have existing metadata and the table is unchanged - write a pointer to the existing metadata
 		pointer = existing_pointer;
 		total_rows = existing_rows.GetIndex();
+		if (write_row_group_index) {
+			// the existing persisted row-group index, whose blocks the existing pointers hold
+			row_group_index = collection.GetPersistedIndexDirectory();
+		}
 
 		// label the blocks as used again to prevent them from being freed
 		auto &metadata_manager = checkpoint_manager.GetMetadataManager();
@@ -150,6 +170,9 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 				deserializer.Begin();
 				auto row_group_pointer = RowGroup::Deserialize(deserializer);
 				deserializer.End();
+			}
+			if (row_group_index.IsValid()) {
+				PersistedRowGroupIndex(metadata_manager, row_group_index).AppendBlocks(read_pointers);
 			}
 			set<idx_t> existing_block_ids;
 			for (auto &ptr : existing_pointers) {
@@ -211,7 +234,6 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 	// any other file, upstream's included, never meets an unknown property. The flag only goes from true to false,
 	// and every delete, update or reverted append clears it before it changes the rows
 	// (RowGroupCollection::StatsExact).
-	auto block_manager = dynamic_cast<SingleFileBlockManager *>(&checkpoint_manager.GetBlockManager());
 	if (block_manager && block_manager->BlockCompression()) {
 		serializer.WritePropertyWithDefault<bool>(105, "stats_exact", collection.StatsExact(), false);
 	}
@@ -230,6 +252,9 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 		}
 		serializer.WritePropertyWithDefault<vector<dict_global::PersistedColumn>>(106, "dict_global_translations",
 		                                                                         translations);
+	}
+	if (row_group_index.IsValid()) {
+		serializer.WriteProperty<MetaBlockPointer>(107, "row_group_index", row_group_index);
 	}
 }
 

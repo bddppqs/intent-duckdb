@@ -83,6 +83,9 @@ struct RowGroupPointer {
 	//! Per-column metadata blocks beyond the start block
 	//! Each column entry contains the additional block IDs that the column's metadata spans (excluding the start block)
 	PerColumnMetadataBlocks per_column_metadata_blocks;
+	//! Each column's statistics as a load of the column computes them, or nullptr where they are not known: set by a
+	//! checkpoint, written into the table's persisted row-group index (never part of the row-group pointer itself)
+	vector<shared_ptr<BaseStatistics>> column_statistics;
 };
 
 } // namespace duckdb

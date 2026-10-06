@@ -15,6 +15,7 @@ add_library_unity(
   update_segment.cpp
   per_column_metadata_blocks.cpp
   persistent_table_data.cpp
+  persisted_row_group_index.cpp
   row_id_column_data.cpp
   row_group.cpp
   row_group_collection.cpp
