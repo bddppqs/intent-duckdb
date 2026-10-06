@@ -2,8 +2,8 @@
 
 DuckDB v1.5.5 plus a series of engine changes, published so that the ClickBench entry `intent-gizmosql` can
 be built from source. Every change sits after upstream's release commit (`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa`) and is summarised
-in its commit message. Tags never move: `v1.5.5-clickbench.1`, `v1.5.5-intent.2` and `v1.5.5-intent.3` are the
-earlier releases, `v1.5.5-intent.4` the tree the entry runs.
+in its commit message. Tags never move: `v1.5.5-clickbench.1`, `v1.5.5-intent.2`, `v1.5.5-intent.3` and
+`v1.5.5-intent.4` are the earlier releases, `v1.5.5-intent.5` the tree the entry runs.
 
 ## What changed
 
@@ -23,8 +23,8 @@ earlier releases, `v1.5.5-intent.4` the tree the entry runs.
   parallel, and reads the statistics of a column it has not loaded from the index. Nested, geometry and variant columns
   store none.
 - Top-N: with a dynamic filter, the threads' rows feed one boundary heap, whose front becomes the bound once it holds
-  limit + offset rows; an ordered parallel scan that carries the bound hands out a short prefix of its first row group
-  and then a bounded number of row groups at a time while the bound is set.
+  limit + offset rows. An ordered parallel scan that carries the bound can also hand out a short prefix of its first
+  row group and then a bounded number of row groups at a time while the bound is set (the wave gate, off by default).
 - Aggregation: an ungrouped `count(DISTINCT x)` over an integer column stored in runs takes one row per run into its
   set, and the source's tasks free the per-thread set lists once every set is built.
 
@@ -46,17 +46,18 @@ aggregate state. A checkpoint stores translations for an uncollated VARCHAR colu
 (2^16) and at most half its rows, building them within half the memory limit (a quarter below 8 GiB); a scan keys on
 them when the planner estimates it at `kStoredCodeKeysMinScanRows` rows (10^6) or more. A table's first scan loads its
 remaining row-group pointers in parallel when at least `PARALLEL_ROW_GROUP_LOAD_MIN` (64) remain, in ranges of
-max(4, ceil(N / 4T)) pointers for N pointers and T threads; an ordered parallel scan under a Top-N bound hands out a
-prefix of `TOPN_WAVE_PREFIX_VECTORS` (4) vectors and then admits at most `TOPN_WAVE_WINDOW` (16) hand-outs in flight
-while the bound is set (both in `src/storage/table/row_group_collection.cpp`). The other bounds, the build-time flags
+max(4, ceil(N / 4T)) pointers for N pointers and T threads; with `kTopNWaveGate` enabled (it is off by default), an
+ordered parallel scan under a Top-N bound hands out a prefix of `TOPN_WAVE_PREFIX_VECTORS` (4) vectors and then admits
+at most `TOPN_WAVE_WINDOW` (16) hand-outs in flight while the bound is set (both in
+`src/storage/table/row_group_collection.cpp`). The other bounds, the build-time flags
 (among them `kPersistedRowGroupIndex`,
-`kPersistedRowGroupStatistics`, `kParallelRowGroupLoad`, `kPersistedIndexReadAhead`, `kTopNWaveGate`,
-`kFusedRunFedDistinctSet` and `kFusedSetSourceRelease`, enabled on both architectures) and the per-architecture defaults
-are in `src/include/duckdb/common/tuning_defaults.hpp`:
+`kPersistedRowGroupStatistics`, `kParallelRowGroupLoad`, `kPersistedIndexReadAhead`, `kFusedRunFedDistinctSet` and
+`kFusedSetSourceRelease`, enabled on both architectures, and `kTopNWaveGate`, disabled) and the per-architecture
+defaults are in `src/include/duckdb/common/tuning_defaults.hpp`:
 `kGlobalDictionaryFusedDistinct`, `kFusedIntegerAggregateVarcharKeys` and `kBorrowedStringGroupKeys` are enabled on x86-64 and
 disabled on arm64 (aarch64). The bundled jemalloc is built with `JEMALLOC_HAVE_MADVISE_HUGE`. Developed and evaluated
 against the 43 ClickBench queries; the version string stays `v1.5.5` so that extensions resolve as for
-upstream. GizmoSQL (https://github.com/bddppqs/intent-gizmosql, tag `v1.38.0-intent.4`) embeds this tree.
+upstream. GizmoSQL (https://github.com/bddppqs/intent-gizmosql, tag `v1.38.0-intent.5`) embeds this tree.
 
 ## License
 
