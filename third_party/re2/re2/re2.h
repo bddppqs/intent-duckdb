@@ -676,7 +676,8 @@ class RE2 {
       perl_classes_(false),
       word_boundary_(false),
       one_line_(false),
-      tagged_dfa_(false) {
+      tagged_dfa_(false),
+      tdfa_vector_scan_(true) {
     }
 
     /*implicit*/ Options(CannedOptions);
@@ -727,6 +728,12 @@ class RE2 {
     bool tagged_dfa() const { return tagged_dfa_; }
     void set_tagged_dfa(bool b) { tagged_dfa_ = b; }
 
+    // The tagged DFA scans a run of bytes on which a state steps to itself 16
+    // bytes at a time (SSE2 or NEON) when every ASCII byte but at most three
+    // continues the run; results are the same either way.
+    bool tdfa_vector_scan() const { return tdfa_vector_scan_; }
+    void set_tdfa_vector_scan(bool b) { tdfa_vector_scan_ = b; }
+
     void Copy(const Options& src) {
       *this = src;
     }
@@ -748,6 +755,7 @@ class RE2 {
     bool word_boundary_;
     bool one_line_;
     bool tagged_dfa_;
+    bool tdfa_vector_scan_;
   };
 
   // Returns the options set in the constructor.

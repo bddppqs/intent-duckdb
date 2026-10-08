@@ -65,15 +65,22 @@ static constexpr uint64_t RELEASE_STORAGE_VERSION_NUMBER = 0x40000002;
 //! and each row group's column statistics column by column (kPersistedRowGroupIndex); a reader without them refuses
 //! it by its version, and this reader opens all three block-compressed versions
 static constexpr uint64_t PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER = 0x40000003;
+//! The release successor of PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER, written whenever a new file stores its blocks
+//! compressed: the release storage version whose stored translations may also carry the decoded byte length of every
+//! code (kDictionaryEntryLengths); a reader without them refuses it by its version, and this reader opens all four
+//! block-compressed versions
+static constexpr uint64_t DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER = 0x40000004;
 //! Every block-compressed file version shares the layout
 static bool IsBlockCompressedVersion(uint64_t version_number) {
 	return version_number == BLOCK_COMPRESSION_VERSION_NUMBER || version_number == RELEASE_STORAGE_VERSION_NUMBER ||
-	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
+	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
+	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
 }
-//! The release storage version or its successor: the file properties of the release version hold at both
+//! The release storage version or a successor: the file properties of the release version hold at each
 static bool IsReleaseStorageVersion(uint64_t version_number) {
 	return version_number == RELEASE_STORAGE_VERSION_NUMBER ||
-	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
+	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
+	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
 }
 static constexpr idx_t BLOCK_EXTENT_ALIGNMENT = 4096;
 //! The automatic block level (zstd_block_compression_level = 0): the high level with at least this many threads
@@ -497,7 +504,13 @@ bool SingleFileBlockManager::WritesStringMinNonEmpty() const {
 
 bool SingleFileBlockManager::PersistedRowGroupIndex() const {
 	return kPersistedRowGroupIndex && block_compression && options.version_number.IsValid() &&
-	       options.version_number.GetIndex() == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
+	       (options.version_number.GetIndex() == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
+	        options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER);
+}
+
+bool SingleFileBlockManager::DictionaryEntryLengths() const {
+	return kDictionaryEntryLengths && block_compression && options.version_number.IsValid() &&
+	       options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
 }
 
 SingleFileBlockManager::~SingleFileBlockManager() {
@@ -688,7 +701,7 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	if (kBlockCompression && options.version_number.GetIndex() >= 68 && !encryption_enabled && !options.use_direct_io) {
 		// a new file at the latest storage version stores its blocks compressed
 		block_compression = true;
-		options.version_number = PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER;
+		options.version_number = DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
 		scaled_frame_of_reference = true;
 		next_extent_offset = BLOCK_START;
 	}

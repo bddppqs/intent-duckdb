@@ -265,6 +265,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalAggregate &op) {
 	// the scan below publishes only the admitted columns a group item or a
 	// DISTINCT argument resolves to, each under the memory gate
 	dict_global::MarkKeyConsumers(context, plan.get(), op.groups, op.expressions);
+	// a column the projection reads only through strlen or bit_length is read as codes and their stored byte lengths
+	dict_global::MarkByteLengthConsumers(context, plan.get());
 
 	bool can_use_simple_aggregation = true;
 	for (auto &expression : op.expressions) {

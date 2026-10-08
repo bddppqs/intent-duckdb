@@ -45,7 +45,7 @@ static constexpr bool kFusedIntegerAggregate = true;
 //! and 12 bytes); the global dictionary's wide-key guard follows the same width
 static constexpr bool kFusedSixteenByteKeys = true;
 //! The kernel admits a group key computed from one column by a deterministic scalar function whose statistics bound
-//! its range (for example minute(ts) or x * 2), compressed like a column key
+//! its range (for example hour(ts) or x * 2), compressed like a column key
 static constexpr bool kFusedComputedGroupKeys = true;
 //! The fused kernel's phase 1 folds a COUNT-only row whose key equals its partition's last row into that row's count
 static constexpr bool kFusedLastKeyFold = true;
@@ -82,6 +82,9 @@ static constexpr bool kFusedStoredHashChain = true;
 static constexpr bool kFusedAggregateAtomicReserve = true;
 //! Each local state reserves from its own allowance, refilled from the shared budget
 static constexpr bool kFusedAggregateLocalAllowance = true;
+//! A Top-N ordered by one COUNT output of the kernel's grouped class hands the kernel its direction and limit + offset:
+//! each phase-2 task keeps that many of the groups it builds and emits only them
+static constexpr bool kFusedSourceTopK = true;
 //! A run partial hands its state over at its seal
 static constexpr bool kRunPartialSeal = true;
 //! A run partial builds its state outside the shared lock
@@ -250,14 +253,24 @@ static constexpr bool kFirstKeysCodeKeys = true;
 //! from the segment's translation - NULL, the empty string, any other - and the codes of the surviving rows only are
 //! translated: the rows the filter drops are never translated, and no per-row filter runs over the translated codes
 static constexpr bool kCodesOnlyKeyFilterPerSegment = true;
+//! At a table's checkpoint in a file at the dictionary-entry-lengths storage version, each admitted VARCHAR column stores
+//! beside its translations one 16-bit byte length per column-wide code; a scan whose only consumers of the column are
+//! strlen or bit_length over it and a pushed filter decided on codes reads its codes and the lengths, never its
+//! dictionary
+static constexpr bool kDictionaryEntryLengths = true;
 //===--------------------------------------------------------------------===//
 // Regular expressions, bit-packing and the Top-N row-group order
 //===--------------------------------------------------------------------===//
 //! A regular-expression function's constant pattern, compiled once per thread, finds submatches with RE2's tagged DFA
 //! (third_party/re2/re2/tdfa.cc) where RE2 admits the pattern; RE2's other engines run otherwise, with the same results
 static constexpr bool kRegexpTaggedDFA = true;
+//! The tagged DFA scans a run of bytes on which a state steps to itself 16 bytes at a time (SSE2 or NEON)
+static constexpr bool kRegexpTDFAVectorScan = true;
 //! regexp_replace without the 'g' option matches the input in place and writes the result string once
 static constexpr bool kRegexpReplaceInPlace = true;
+//! regexp_replace's one-group rewrite of a match spanning the input, and regexp_extract's one group, return the group's
+//! bytes of the input, which the result references; a VARCHAR result over a storage dictionary is kept by reference
+static constexpr bool kRegexpReplaceSliceOutput = true;
 //! In the block-compressed file, a bit-packed group whose offsets from its minimum share a common divisor greater than
 //! one stores the offsets divided by it, at the narrower width (FOR_SCALED); a scan multiplies them back
 static constexpr bool kScaledFrameOfReference = true;

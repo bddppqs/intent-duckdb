@@ -31,6 +31,7 @@ class ExecutionContext;
 class PhysicalHashAggregate;
 class PhysicalOperator;
 class PhysicalUngroupedAggregate;
+struct BoundOrderByNode;
 namespace dict_global {
 class ColumnDictionary;
 }
@@ -129,6 +130,11 @@ public:
 	static void TryAttach(ClientContext &context, PhysicalHashAggregate &op, TupleDataValidityType group_validity);
 	//! the DISTINCT class's checks on the ungrouped aggregate (no keys)
 	static void TryAttachUngrouped(ClientContext &context, PhysicalUngroupedAggregate &op);
+	//! the source top-k (kFusedSourceTopK): a Top-N over `child` ordered by one key that resolves, through projections
+	//! of plain references, to a COUNT output of the grouped class's fused operator hands it the direction and
+	//! limit + offset (at most STANDARD_VECTOR_SIZE)
+	static void TryAttachTopK(PhysicalOperator &child, const vector<BoundOrderByNode> &orders, idx_t limit,
+	                          idx_t offset);
 
 	unique_ptr<FusedAggregateGlobalState> GetGlobalSinkState(ClientContext &context) const;
 	unique_ptr<FusedAggregateLocalState> GetLocalSinkState(ExecutionContext &context) const;
@@ -254,6 +260,15 @@ public:
 	//! a column read through stored translations: whether this execution's scan reads its codes only (set by
 	//! GetGlobalSinkState to the execution's admission; the scan reads it at its initialisation), else null
 	shared_ptr<atomic<bool>> bitmap_codes_only;
+	//! the source top-k (set by TryAttachTopK; the grouped class, chained or not): each phase-2 task keeps the topk_n
+	//! groups it builds with the highest (topk_desc) or lowest count of output topk_output, copied out of its table, and
+	//! emits only them after its last partition, so the Top-N above receives at most tasks x topk_n rows. A partition
+	//! holds every row of its keys, so each count is final at its build, and the task keeps all of its groups that
+	//! beat the global limit + offset-th count (ties at that count: any of them, which is the Top-N's own reading)
+	bool topk = false;
+	bool topk_desc = false;
+	idx_t topk_output = 0;
+	idx_t topk_n = 0;
 };
 
 //! A group table of the DISTINCT class, keyed by the key words of g alone: entries {g words, distinct, count, one
@@ -346,6 +361,11 @@ public:
 	bool bitmap_engaged = false;
 	uint8_t bitmap_refusal = 0;
 	atomic<idx_t> bitmap_padding_bits {0};
+	//! the source top-k's EXPLAIN ANALYZE counters (reported by ExtraSourceParams): the tasks that built a partition,
+	//! the groups they built and the rows they emitted
+	atomic<idx_t> topk_tasks {0};
+	atomic<idx_t> topk_groups {0};
+	atomic<idx_t> topk_rows {0};
 };
 
 //! One thread's gids of one VARCHAR key column - the dictionary whose code -> gid table it caches (by

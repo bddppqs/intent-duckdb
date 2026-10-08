@@ -66,7 +66,9 @@ RE2::Options::Options(RE2::CannedOptions opt)
     case_sensitive_(true),
     perl_classes_(false),
     word_boundary_(false),
-    one_line_(false) {
+    one_line_(false),
+    tagged_dfa_(false),
+    tdfa_vector_scan_(true) {
 }
 
 // Empty objects for use as const references.
@@ -276,7 +278,7 @@ void RE2::Init(const StringPiece& pattern, const Options& options) {
   is_one_pass_ = prog_->IsOnePass();
 
   if (options_.tagged_dfa())
-    prog_->EnableTDFA();
+    prog_->EnableTDFA(options_.tdfa_vector_scan());
 }
 
 // Returns rprog_, computing it if needed.

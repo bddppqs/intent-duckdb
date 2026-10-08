@@ -17,6 +17,7 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -28,6 +29,7 @@
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/common/tuning_defaults.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 
@@ -128,6 +130,12 @@ static bool FusedSetSourceReleaseEnabled() {
 //! run, the run descriptor's set form); otherwise every row arrives through Sink
 static bool FusedRunFedDistinctSetEnabled() {
 	return kFusedRunFedDistinctSet;
+}
+
+//! A Top-N ordered by one COUNT output of the grouped class hands the kernel its direction and limit + offset
+//! (TryAttachTopK); otherwise every phase-2 task emits every group it builds
+static bool FusedSourceTopKEnabled() {
+	return kFusedSourceTopK;
 }
 
 //===--------------------------------------------------------------------===//
@@ -1052,6 +1060,51 @@ void FusedIntegerAggregate::TryAttachUngrouped(ClientContext &context, PhysicalU
 			op.fused->set_runs = true;
 		}
 	}
+}
+
+void FusedIntegerAggregate::TryAttachTopK(PhysicalOperator &child, const vector<BoundOrderByNode> &orders, idx_t limit,
+                                          idx_t offset) {
+	// one order key (with more, a tie at the boundary is broken by the next key, which the per-task heap does not read),
+	// and limit + offset rows in one output chunk
+	if (!FusedSourceTopKEnabled() || orders.size() != 1 || limit == 0 || limit > STANDARD_VECTOR_SIZE ||
+	    offset > STANDARD_VECTOR_SIZE - limit) {
+		return;
+	}
+	auto &key = *orders[0].expression;
+	if (key.GetExpressionType() != ExpressionType::BOUND_REF) {
+		return;
+	}
+	// the key's column through projections of plain references (a projection keeps every row) down to the aggregate
+	auto column = key.Cast<BoundReferenceExpression>().index;
+	reference<PhysicalOperator> current(child);
+	while (current.get().type == PhysicalOperatorType::PROJECTION) {
+		auto &projection = current.get().Cast<PhysicalProjection>();
+		if (column >= projection.select_list.size() || current.get().children.size() != 1) {
+			return;
+		}
+		auto &select = *projection.select_list[column];
+		if (select.GetExpressionType() != ExpressionType::BOUND_REF) {
+			return;
+		}
+		column = select.Cast<BoundReferenceExpression>().index;
+		current = current.get().children[0];
+	}
+	if (current.get().type != PhysicalOperatorType::HASH_GROUP_BY) {
+		return;
+	}
+	auto &fused = current.get().Cast<PhysicalHashAggregate>().fused;
+	// the grouped class alone (its output: the keys, then the aggregates)
+	if (!fused || fused->distinct || fused->bitmap || fused->distinct_set || column < fused->key_count) {
+		return;
+	}
+	const auto output = column - fused->key_count;
+	if (output >= fused->outputs.size() || fused->outputs[output].kind != FusedAggregateKind::COUNT) {
+		return;
+	}
+	fused->topk = true;
+	fused->topk_desc = orders[0].type == OrderType::DESCENDING;
+	fused->topk_output = output;
+	fused->topk_n = limit + offset;
 }
 
 //===--------------------------------------------------------------------===//
@@ -2912,6 +2965,10 @@ public:
 	atomic<bool> build_failed;
 	atomic<idx_t> next_release;
 	atomic<idx_t> released;
+
+	//! the source top-k: the tasks inside FusedTopKGetData (a task adds its counters before it leaves), so the counters
+	//! are complete once every partition is claimed and none is inside
+	atomic<idx_t> topk_active {0};
 };
 
 class FusedAggregateLocalSourceState : public LocalSourceState {
@@ -2957,6 +3014,15 @@ public:
 	idx_t chain_group_entries;
 	idx_t chain_group_count;
 	const_data_ptr_t emit_rows[STANDARD_VECTOR_SIZE];
+
+	//! the source top-k: the kept groups' entries (topk_n slots of the table's or the group array's entry words), their
+	//! counts, the heap of their slots (its front the kept group the next better one replaces), the groups this task
+	//! built and whether it has emitted
+	vector<uint64_t> topk_entries;
+	vector<uint64_t> topk_counts;
+	vector<uint32_t> topk_heap;
+	idx_t topk_groups = 0;
+	bool topk_emitted = false;
 };
 
 unique_ptr<GlobalSourceState> FusedIntegerAggregate::GetGlobalSourceState(ClientContext &context,
@@ -4270,6 +4336,110 @@ static SourceResultType FusedSetGetData(const FusedIntegerAggregate &fused, Data
 	return SourceResultType::FINISHED;
 }
 
+//===--------------------------------------------------------------------===//
+// The source top-k (TryAttachTopK): the grouped class's phase 2 with a per-task top-k before the emit
+//===--------------------------------------------------------------------===//
+//! The task claims and builds partitions as FusedChainScan and the open-addressing path do, but offers every group of
+//! each built partition (a partition holds every row of its keys, so its counts are final) to a heap of topk_n copied
+//! entries; the open-addressing path clears each occupied entry as it passes (the buffer is all-zero again for the next
+//! build). After its last partition the task emits its kept groups as one chunk, through FusedChainEmit or FusedEmit (so
+//! AVG and SUM are finalised for the kept groups alone); the entries' group rows (the chained build's) stay in the
+//! handed-over lists for the sink state's life
+static SourceResultType FusedTopKGetData(const FusedIntegerAggregate &fused, DataChunk &chunk,
+                                         FusedAggregateGlobalState &gstate, OperatorSourceInput &input) {
+	auto &source = input.global_state.Cast<FusedAggregateGlobalSourceState>();
+	auto &lstate = input.local_state.Cast<FusedAggregateLocalSourceState>();
+	if (lstate.topk_emitted) {
+		return SourceResultType::FINISHED;
+	}
+	source.topk_active++;
+	const auto n = fused.topk_n;
+	const auto words = fused.chain ? FusedChainGroupWords(fused) : FusedEntryWords(fused);
+	// the chained build's group: {group row, tag << 32 | next, count, sums}; the table's entry: {keys, count, sums}
+	const auto count_word = fused.chain ? idx_t(2) : FusedKeyWords(fused);
+	const bool desc = fused.topk_desc;
+	lstate.topk_entries.resize(n * words);
+	lstate.topk_counts.resize(n);
+	lstate.topk_heap.clear();
+	auto &counts = lstate.topk_counts;
+	auto &heap = lstate.topk_heap;
+	// the heap's front is the kept group a better one replaces: the lowest count when descending, the highest ascending
+	auto front_last = [&](uint32_t a, uint32_t b) {
+		return desc ? counts[a] > counts[b] : counts[a] < counts[b];
+	};
+	auto offer = [&](const uint64_t *entry) {
+		const auto count = entry[count_word];
+		uint32_t slot;
+		if (heap.size() < n) {
+			slot = uint32_t(heap.size());
+			heap.push_back(slot);
+		} else {
+			const auto front = counts[heap.front()];
+			if (desc ? count <= front : count >= front) {
+				return;
+			}
+			std::pop_heap(heap.begin(), heap.end(), front_last);
+			slot = heap.back();
+		}
+		memcpy(lstate.topk_entries.data() + slot * words, entry, words * sizeof(uint64_t));
+		counts[slot] = count;
+		std::push_heap(heap.begin(), heap.end(), front_last);
+	};
+	idx_t groups = 0;
+	while (true) {
+		idx_t p;
+		do {
+			p = source.next_partition++;
+		} while (p < FusedIntegerAggregate::PARTITION_COUNT && gstate.partition_rows[p] == 0);
+		if (p >= FusedIntegerAggregate::PARTITION_COUNT) {
+			break;
+		}
+		source.claimed++;
+		if (fused.chain) {
+			FusedChainBuild(fused, gstate, lstate, p);
+			for (idx_t g = 0; g < lstate.chain_group_count; g++) {
+				offer(lstate.chain_groups + g * words);
+			}
+			groups += lstate.chain_group_count;
+			continue;
+		}
+		if (fused.hash_stored) {
+			FusedBuildTableStored(fused, gstate, lstate, p);
+		} else {
+			FusedBuildTable(fused, gstate, lstate, p);
+		}
+		for (idx_t slot = 0; slot < lstate.capacity; slot++) {
+			auto entry = lstate.table + slot * words;
+			if (entry[count_word] != 0) {
+				offer(entry);
+				entry[count_word] = 0;
+				groups++;
+			}
+		}
+	}
+	lstate.topk_emitted = true;
+	const idx_t count = heap.size();
+	for (idx_t i = 0; i < count; i++) {
+		lstate.emit[i] = lstate.topk_entries.data() + heap[i] * words;
+	}
+	if (fused.chain) {
+		for (idx_t i = 0; i < count; i++) {
+			lstate.emit_rows[i] = FusedChainGroupRow(lstate.emit[i]);
+		}
+		FusedChainEmit(fused, chunk, lstate.emit_rows, lstate.emit, count);
+	} else {
+		FusedEmit(fused, chunk, lstate.emit, count);
+	}
+	// a task that built no partition adds nothing, so every complete reading of the counters is the same
+	if (groups > 0) {
+		gstate.topk_tasks++;
+	}
+	gstate.topk_groups += groups;
+	gstate.topk_rows += count;
+	source.topk_active--;
+	return count == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+}
+
 SourceResultType FusedIntegerAggregate::GetData(ExecutionContext &context, DataChunk &chunk,
                                                 FusedAggregateGlobalState &gstate, OperatorSourceInput &input) const {
 	if (bitmap) {
@@ -4280,6 +4450,9 @@ SourceResultType FusedIntegerAggregate::GetData(ExecutionContext &context, DataC
 	}
 	if (distinct) {
 		return FusedDistinctGetData(*this, chunk, gstate, input);
+	}
+	if (topk) {
+		return FusedTopKGetData(*this, chunk, gstate, input);
 	}
 	if (chain) {
 		return FusedChainScan(*this, chunk, gstate, input);
@@ -4389,6 +4562,10 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 		// phase 1 folds a row into its partition's last row
 		result += " fold=last_key";
 	}
+	if (topk) {
+		// the source top-k: the rows each phase-2 task keeps, and the order
+		result += " topk=" + to_string(topk_n) + (topk_desc ? " topk_order=desc" : " topk_order=asc");
+	}
 	result += fused_atomic_reserve ? " reserve=ldadd" : " reserve=cas";
 	if (gstate) {
 		result += " input_rows=" + to_string(gstate->input_rows.load());
@@ -4430,6 +4607,17 @@ InsertionOrderPreservingMap<string> FusedIntegerAggregate::ExtraSourceParams(Glo
 		return result;
 	}
 	auto &source = source_state.Cast<FusedAggregateGlobalSourceState>();
+	if (topk) {
+		// the source top-k's counters (the operator's own text is read at a thread's first source call, before any):
+		// the tasks that built a partition, the groups they built and the rows they emitted (at most tasks x topk), once
+		// every partition is claimed and no task is inside; an earlier flush leaves the profiler's entry untouched
+		if (source.next_partition.load() >= PARTITION_COUNT && source.topk_active.load() == 0) {
+			result["Fused Source TopK"] = "topk_tasks=" + to_string(source.sink.topk_tasks.load()) +
+			                              " topk_groups=" + to_string(source.sink.topk_groups.load()) +
+			                              " topk_rows=" + to_string(source.sink.topk_rows.load());
+		}
+		return result;
+	}
 	if (!distinct) {
 		return result;
 	}

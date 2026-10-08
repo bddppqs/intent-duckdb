@@ -32,11 +32,11 @@ DETACH p
 statement ok
 ATTACH '__TEST_DIR__/persisted_rg_index.db' AS p
 
-# the main header (after the 8-byte block checksum): the magic "DUCK" and the little-endian file version 0x40000003
+# the main header (after the 8-byte block checksum): the magic "DUCK" and the little-endian file version 0x40000004
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/persisted_rg_index.db')
 ----
-4455434B	0300004000000000
+4455434B	0400004000000000
 
 query I
 SELECT count(DISTINCT row_group_id) FROM pragma_storage_info('p.t')

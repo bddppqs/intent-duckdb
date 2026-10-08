@@ -1,0 +1,541 @@
+# name: test/sql/storage/compression/dict_global/stored_translations_byte_length.test
+# description: a column read only through strlen or bit_length over it (and a pushed filter decided on codes) is read as
+# codes and the byte lengths its stored translations carry, never its dictionary; every answer agrees with the same data
+# stored in memory, and the shapes that read the strings stay unmarked
+# group: [dict_global]
+
+load __TEST_DIR__/stored_translations_byte_length.db readwrite latest
+
+statement ok
+SET threads=4
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# c: 200003 values (each in runs of three; one in seven in Cyrillic with a 4-byte emoji), '' and NULL; d: 150001 values,
+# '' and NULL; 5 * 2^20 rows, so a scan with one filter is estimated at 2^20 rows (at least kStoredCodeKeysMinScanRows)
+statement ok
+CREATE TABLE t AS SELECT i, i % 10 AS k,
+CASE WHEN i % 997 = 0 THEN NULL WHEN i % 11 = 0 THEN '' WHEN ((i // 3) % 200003) % 7 = 0 THEN 'знач-' || ((i // 3) % 200003) || '-😀' ELSE 'wval-' || ((i // 3) % 200003) || '-0123456789' END AS c,
+CASE WHEN i % 13 = 0 THEN NULL WHEN i % 17 = 0 THEN '' ELSE 'dv-' || ((i // 5) % 150001) END AS d
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+# R1: a NULL value's byte length is NULL (code 0): counted, and row by row, against the in-memory copy
+query II
+EXPLAIN SELECT count(strlen(c)), count(*) FROM t
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT count(strlen(c)), count(*) FROM t) EXCEPT ALL (SELECT count(strlen(c)), count(*) FROM r))
+----
+0
+
+query II
+EXPLAIN SELECT i, strlen(c) FROM t
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t) EXCEPT ALL (SELECT i, strlen(c) FROM r))
+----
+0
+
+query I
+SELECT count(*) - count(strlen(c)) FROM t
+----
+5259
+
+# R2: the empty string's byte length is 0, on every row holding it
+query II
+EXPLAIN SELECT min(strlen(c)) FROM t
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT min(strlen(c)) FROM t
+----
+0
+
+query II
+EXPLAIN SELECT count(*) FROM ((SELECT i, strlen(c) FROM t) INTERSECT ALL (SELECT i, 0 FROM r WHERE c = ''))
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t) INTERSECT ALL (SELECT i, 0 FROM r WHERE c = ''))
+----
+476147
+
+# R3: multi-byte UTF-8 values: strlen counts bytes and length code points, the two differ, and length reads the strings
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query II
+EXPLAIN SELECT sum(length(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT (SELECT sum(strlen(c)) FROM t WHERE c <> '') = (SELECT sum(strlen(c)) FROM r WHERE c <> '')
+----
+true
+
+query I
+SELECT (SELECT sum(length(c)) FROM t WHERE c <> '') = (SELECT sum(length(c)) FROM r WHERE c <> '')
+----
+true
+
+query I
+SELECT (SELECT sum(strlen(c)) FROM t WHERE c <> '') > (SELECT sum(length(c)) FROM t WHERE c <> '')
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT i, strlen(c) FROM r WHERE c <> ''))
+----
+0
+
+# long strings in the first ten vectors (a vector does not fit an empty segment, so segments end inside vectors and
+# vectors straddle them): a straddling vector is read through the translations of both segments, every code's length
+# read from the same table
+statement ok
+CREATE TABLE s AS SELECT i, CASE WHEN i % 11 = 0 THEN '' WHEN i < 20480 THEN concat_ws('', md5(((i // 2) % 100003)::VARCHAR || '0'), md5(((i // 2) % 100003)::VARCHAR || '1'), md5(((i // 2) % 100003)::VARCHAR || '2'), md5(((i // 2) % 100003)::VARCHAR || '3'), md5(((i // 2) % 100003)::VARCHAR || '4'), md5(((i // 2) % 100003)::VARCHAR || '5'), md5(((i // 2) % 100003)::VARCHAR || '6'), md5(((i // 2) % 100003)::VARCHAR || '7'), md5(((i // 2) % 100003)::VARCHAR || '8'), md5(((i // 2) % 100003)::VARCHAR || '9'), md5(((i // 2) % 100003)::VARCHAR || '10'), md5(((i // 2) % 100003)::VARCHAR || '11'), md5(((i // 2) % 100003)::VARCHAR || '12'), md5(((i // 2) % 100003)::VARCHAR || '13'), md5(((i // 2) % 100003)::VARCHAR || '14'), md5(((i // 2) % 100003)::VARCHAR || '15')) ELSE 'sv-' || ((i // 3) % 100003) || '-0123456789' END AS e
+FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE sr AS SELECT * FROM s
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('s') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND start % 2048 <> 0
+----
+true
+
+query II
+EXPLAIN SELECT i, strlen(e) FROM s WHERE e <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*e \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(e) FROM s WHERE e <> '') EXCEPT ALL (SELECT i, strlen(e) FROM sr WHERE e <> ''))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT i, bit_length(e) FROM s WHERE i < 30000) EXCEPT ALL (SELECT i, bit_length(e) FROM sr WHERE i < 30000))
+----
+0
+
+# R4: a column holding a value of 70000 bytes is refused by DICT_FSST in that row group, so it stores no translations and
+# no byte lengths and is read as strings; its neighbour column is read through its byte lengths
+statement ok
+CREATE TABLE u AS SELECT i, CASE WHEN i = 777777 THEN repeat('x', 70000) WHEN i % 11 = 0 THEN '' ELSE 'uval-' || ((i // 3) % 200003) END AS e, 'fval-' || ((i // 3) % 200003) AS f
+FROM range(2097152) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE ur AS SELECT * FROM u
+
+query I
+SELECT count(*) > 0 FROM pragma_storage_info('u') WHERE column_name = 'e' AND segment_type = 'VARCHAR' AND compression <> 'DICT_FSST'
+----
+true
+
+query II
+EXPLAIN SELECT sum(strlen(e)) FROM u
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query II
+EXPLAIN SELECT sum(strlen(f)) FROM u
+----
+physical_plan	<REGEX>:.*Codes Only.*f \(byte length\).*
+
+query I
+SELECT (SELECT sum(strlen(e)) FROM u) = (SELECT sum(strlen(e)) FROM ur)
+----
+true
+
+query I
+SELECT (SELECT max(strlen(e)) FROM u) = (SELECT max(strlen(e)) FROM ur)
+----
+true
+
+query I
+SELECT (SELECT sum(strlen(f)) FROM u) = (SELECT sum(strlen(f)) FROM ur)
+----
+true
+
+# R5: bit_length is 8 times strlen, alone and beside strlen in one statement, both read through the byte lengths
+query II
+EXPLAIN SELECT sum(bit_length(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query II
+EXPLAIN SELECT sum(strlen(c)), sum(bit_length(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT (SELECT sum(bit_length(c)) FROM t WHERE c <> '') = 8 * (SELECT sum(strlen(c)) FROM t WHERE c <> '')
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT sum(strlen(c)), sum(bit_length(c)) FROM t WHERE c <> '') EXCEPT ALL (SELECT sum(strlen(c)), sum(bit_length(c)) FROM r WHERE c <> ''))
+----
+0
+
+# grouped: the byte lengths summed per group of another column, the projection under the aggregate holding the group and
+# the function
+query II
+EXPLAIN SELECT k, sum(strlen(c)), count(*) FROM t WHERE c <> '' GROUP BY k
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT k, sum(strlen(c)), count(*) FROM t WHERE c <> '' GROUP BY k) EXCEPT ALL (SELECT k, sum(strlen(c)), count(*) FROM r WHERE c <> '' GROUP BY k))
+----
+0
+
+# R6: the column read beside the function (projected, ordered, grouped, its minimum), a self-join, the function in a
+# pushed filter, and length: the strings are read, no mark; the answers agree
+query II
+EXPLAIN SELECT c, strlen(c) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT c, strlen(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT c, strlen(c) FROM r WHERE c <> ''))
+----
+0
+
+query II
+EXPLAIN SELECT i, strlen(c) FROM t WHERE c <> '' ORDER BY c, i LIMIT 7
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t WHERE c <> '' ORDER BY c, i LIMIT 7) EXCEPT ALL (SELECT i, strlen(c) FROM r WHERE c <> '' ORDER BY c, i LIMIT 7))
+----
+0
+
+query II
+EXPLAIN SELECT c, sum(strlen(c)) FROM t WHERE c <> '' GROUP BY c
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT c, sum(strlen(c)) FROM t WHERE c <> '' GROUP BY c) EXCEPT ALL (SELECT c, sum(strlen(c)) FROM r WHERE c <> '' GROUP BY c))
+----
+0
+
+query II
+EXPLAIN SELECT sum(strlen(c)), min(c) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT sum(strlen(c)), min(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT sum(strlen(c)), min(c) FROM r WHERE c <> ''))
+----
+0
+
+query II
+EXPLAIN SELECT sum(strlen(t1.c)), count(*) FROM t t1 JOIN t t2 ON t1.i = t2.i WHERE t1.c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT (SELECT sum(strlen(t1.c)) || '/' || count(*) FROM t t1 JOIN t t2 ON t1.i = t2.i WHERE t1.c <> '') = (SELECT sum(strlen(c)) || '/' || count(*) FROM r WHERE c <> '')
+----
+true
+
+query II
+EXPLAIN SELECT count(*), sum(strlen(c)) FROM t WHERE strlen(c) > 20
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT count(*), sum(strlen(c)) FROM t WHERE strlen(c) > 20) EXCEPT ALL (SELECT count(*), sum(strlen(c)) FROM r WHERE strlen(c) > 20))
+----
+0
+
+query II
+EXPLAIN SELECT sum(length(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+# R11: two columns in one projection, both read through their byte lengths
+query II
+EXPLAIN SELECT sum(strlen(c)), sum(bit_length(d)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*(c \(byte length\).*d \(byte length\)|d \(byte length\).*c \(byte length\)).*
+
+query I
+SELECT count(*) FROM ((SELECT sum(strlen(c)), sum(bit_length(d)) FROM t WHERE c <> '') EXCEPT ALL (SELECT sum(strlen(c)), sum(bit_length(d)) FROM r WHERE c <> ''))
+----
+0
+
+# R12: a scan estimated below kStoredCodeKeysMinScanRows (a selective filter on another column) reads the strings
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> '' AND k = 3
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT (SELECT sum(strlen(c)) FROM t WHERE c <> '' AND k = 3) = (SELECT sum(strlen(c)) FROM r WHERE c <> '' AND k = 3)
+----
+true
+
+# R14: the function over the column in a projection of its own, no aggregate
+query II
+EXPLAIN SELECT strlen(c) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT strlen(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT strlen(c) FROM r WHERE c <> ''))
+----
+0
+
+# R15: one function repeated under the aggregate: the common projection below it holds only the function, and is read
+# through the byte lengths
+query II
+EXPLAIN SELECT min(strlen(c)), max(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+SELECT count(*) FROM ((SELECT min(strlen(c)), max(strlen(c)) FROM t WHERE c <> '') EXCEPT ALL (SELECT min(strlen(c)), max(strlen(c)) FROM r WHERE c <> ''))
+----
+0
+
+# R16: a repeated function beside another function of the column: the common projection below the aggregate passes the
+# column itself, so the strings are read, no mark
+query II
+EXPLAIN SELECT sum(strlen(c)), sum(bit_length(c)), min(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT count(*) FROM ((SELECT sum(strlen(c)), sum(bit_length(c)), min(strlen(c)) FROM t WHERE c <> '') EXCEPT ALL (SELECT sum(strlen(c)), sum(bit_length(c)), min(strlen(c)) FROM r WHERE c <> ''))
+----
+0
+
+# R9: a prepared statement planned on the byte lengths; it re-binds after the update and after the checkpoint below
+statement ok
+PREPARE q AS SELECT (SELECT sum(strlen(c)) || '/' || count(*) FROM t WHERE c <> '') = (SELECT sum(strlen(c)) || '/' || count(*) FROM r WHERE c <> '')
+
+query II
+EXPLAIN EXECUTE q
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+EXECUTE q
+----
+true
+
+# R7: an update: the column carries it, so a new plan reads the strings and the prepared plan re-binds (R9); the
+# checkpoint rebuilds the column's translations and byte lengths, and the mark returns
+statement ok
+UPDATE t SET c = 'дельта-😀😀' WHERE i = 1
+
+statement ok
+UPDATE r SET c = 'дельта-😀😀' WHERE i = 1
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+EXECUTE q
+----
+true
+
+query I
+SELECT (SELECT sum(strlen(c)) FROM t WHERE c <> '') = (SELECT sum(strlen(c)) FROM r WHERE c <> '')
+----
+true
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+EXECUTE q
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c), bit_length(d) FROM t) EXCEPT ALL (SELECT i, strlen(c), bit_length(d) FROM r))
+----
+0
+
+# R7: an append outside the translations: a new plan reads the strings until the checkpoint stores the new rows
+statement ok
+INSERT INTO t VALUES (5242880, 0, 'дельта-5242880-😀', 'dv-appended'), (5242881, 1, '', NULL)
+
+statement ok
+INSERT INTO r VALUES (5242880, 0, 'дельта-5242880-😀', 'dv-appended'), (5242881, 1, '', NULL)
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+EXECUTE q
+----
+true
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+EXECUTE q
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c), bit_length(d) FROM t) EXCEPT ALL (SELECT i, strlen(c), bit_length(d) FROM r))
+----
+0
+
+# R7: a delete: the deleted rows leave the scan's selection, and the translations still cover every stored row, so the
+# column keeps its byte lengths before and after the checkpoint
+statement ok
+DELETE FROM t WHERE i % 13 = 5
+
+statement ok
+DELETE FROM r WHERE i % 13 = 5
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+EXECUTE q
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT i, strlen(c) FROM r WHERE c <> ''))
+----
+0
+
+statement ok
+CHECKPOINT
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*c \(byte length\).*
+
+query I
+EXECUTE q
+----
+true
+
+# R8: rows of this transaction's local storage hold strings: a new plan reads the strings, the prepared plan re-binds
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t VALUES (5242882, 2, 'local-row-😀', 'dv-local')
+
+statement ok
+INSERT INTO r VALUES (5242882, 2, 'local-row-😀', 'dv-local')
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+EXECUTE q
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t WHERE c <> '') EXCEPT ALL (SELECT i, strlen(c) FROM r WHERE c <> ''))
+----
+0
+
+statement ok
+ROLLBACK
+
+query I
+EXECUTE q
+----
+true
+
+# R10: across a restart the byte lengths are read again from the file (their header checked against the table's entry)
+restart
+
+statement ok
+SET threads=4
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+query II
+EXPLAIN SELECT sum(strlen(c)), sum(bit_length(d)) FROM t WHERE c <> ''
+----
+physical_plan	<REGEX>:.*Codes Only.*(c \(byte length\).*d \(byte length\)|d \(byte length\).*c \(byte length\)).*
+
+query I
+SELECT count(*) FROM ((SELECT sum(strlen(c)), sum(bit_length(d)) FROM t WHERE c <> '') EXCEPT ALL (SELECT sum(strlen(c)), sum(bit_length(d)) FROM r WHERE c <> ''))
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT i, strlen(c) FROM t) EXCEPT ALL (SELECT i, strlen(c) FROM r))
+----
+0
+
+# R13: a file whose stored columns carry no byte lengths (here one at an older storage version, which stores no
+# translations) is read as strings, no mark; the answers agree
+statement ok
+ATTACH '__TEST_DIR__/stored_translations_byte_length_old.db' AS old (STORAGE_VERSION 'v1.4.0')
+
+statement ok
+CREATE TABLE old.t AS SELECT * FROM t
+
+statement ok
+CHECKPOINT old
+
+query II
+EXPLAIN SELECT sum(strlen(c)) FROM old.t WHERE c <> ''
+----
+physical_plan	<!REGEX>:.*byte length.*
+
+query I
+SELECT (SELECT sum(strlen(c)) || '/' || count(*) FROM old.t WHERE c <> '') = (SELECT sum(strlen(c)) || '/' || count(*) FROM r WHERE c <> '')
+----
+true

@@ -1,3 +1,4 @@
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/type_visitor.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -106,7 +107,25 @@ bool ExecuteFunctionState::TryExecuteDictionaryExpression(const BoundFunctionExp
 			// Execute, storing the result in an intermediate vector, and copying it to the output dictionary
 			Vector output_intermediate(result.GetType());
 			expr.function.GetFunctionCallback()(input_chunk, state, output_intermediate);
-			VectorOperations::Copy(output_intermediate, output_dictionary->data, count, 0, offset);
+			if (kRegexpReplaceSliceOutput && output_intermediate.GetVectorType() == VectorType::FLAT_VECTOR &&
+			    output_intermediate.GetType().id() == LogicalTypeId::VARCHAR) {
+				// the strings stay where the function left them: the dictionary references the intermediate's string
+				// buffer, which holds the buffers the function referenced
+				auto source = FlatVector::GetData<string_t>(output_intermediate);
+				auto &source_validity = FlatVector::Validity(output_intermediate);
+				auto target = FlatVector::GetData<string_t>(output_dictionary->data);
+				auto &target_validity = FlatVector::Validity(output_dictionary->data);
+				for (idx_t i = 0; i < count; i++) {
+					if (source_validity.RowIsValid(i)) {
+						target[offset + i] = source[i];
+					} else {
+						target_validity.SetInvalid(offset + i);
+					}
+				}
+				StringVector::AddHeapReference(output_dictionary->data, output_intermediate);
+			} else {
+				VectorOperations::Copy(output_intermediate, output_dictionary->data, count, 0, offset);
+			}
 		}
 	}
 

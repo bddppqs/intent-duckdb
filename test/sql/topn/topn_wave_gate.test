@@ -1,5 +1,5 @@
 # name: test/sql/topn/topn_wave_gate.test
-# description: The ordered parallel scan's wave gate under a Top-N bound: 8 and 32 threads (above the window) on 40-plus row groups whose smallest non-empty value lies deep in the table, k above the small-heap threshold, a filter that rejects every row so the heap never fills, a first ordered row group pruned at its zonemap, a one-row-group table, one thread, verify_parallelism, and a Top-N over the probe side of a join, where the gate stays off; every answer equals the same rows taken by an ordered list aggregate, which pushes no bound, in an in-memory database and after a checkpoint and a restart
+# description: The ordered parallel scan under a Top-N bound, with or without the wave gate (kTopNWaveGate, off by default): 8 and 32 threads (above the window) on 40-plus row groups whose smallest non-empty value lies deep in the table, k above the small-heap threshold, a filter that rejects every row so the heap never fills, a first ordered row group pruned at its zonemap, a one-row-group table, one thread, verify_parallelism, and a Top-N over the probe side of a join, where the gate stays off; every answer equals the same rows taken by an ordered list aggregate, which pushes no bound, in an in-memory database and after a checkpoint and a restart
 # group: [topn]
 
 require skip_reload
@@ -34,7 +34,7 @@ query I nosort late_a
 SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
 ----
 
-# k above the small-heap threshold: the large-heap path under the gate
+# k above the small-heap threshold: the large-heap path (under the gate when it is enabled)
 query I nosort large_a
 SELECT k FROM g ORDER BY k LIMIT 300
 ----
@@ -54,7 +54,7 @@ query I nosort late_a
 SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
 ----
 
-# k above the small-heap threshold: the large-heap path under the gate
+# k above the small-heap threshold: the large-heap path (under the gate when it is enabled)
 query I nosort large_a
 SELECT k FROM g ORDER BY k LIMIT 300
 ----
@@ -158,7 +158,7 @@ query I nosort late_b
 SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
 ----
 
-# k above the small-heap threshold: the large-heap path under the gate
+# k above the small-heap threshold: the large-heap path (under the gate when it is enabled)
 query I nosort large_b
 SELECT k FROM g ORDER BY k LIMIT 300
 ----
@@ -178,7 +178,7 @@ query I nosort late_b
 SELECT unnest((list(s ORDER BY s))[1:10]) FROM g WHERE s <> ''
 ----
 
-# k above the small-heap threshold: the large-heap path under the gate
+# k above the small-heap threshold: the large-heap path (under the gate when it is enabled)
 query I nosort large_b
 SELECT k FROM g ORDER BY k LIMIT 300
 ----

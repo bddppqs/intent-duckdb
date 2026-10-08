@@ -93,6 +93,75 @@ duckdb::vector<string> Inputs() {
 	return inputs;
 }
 
+//! Patterns whose captures run over a character class the tagged DFA scans as a run of one state: [^/]+, [^\n]*,
+//! \w+, [^,;]+ (two bytes end the run) and [^abcd]+ (four do: no vector step); and a class repeated inside its group,
+//! whose every byte moves the group (stepped, not scanned)
+struct ClassRunCase {
+	PatternCase pattern;
+	//! bytes that continue the run, and the ASCII bytes that end it
+	string filler;
+	string stops;
+};
+
+const duckdb::vector<ClassRunCase> &ClassRunPatterns() {
+	static const duckdb::vector<ClassRunCase> cases {
+	    {{"([^/]+)/(.*)", "\\2|\\1", ""}, "ab.c-d:e?f=g&h_0 9\tZ", "/"},
+	    {{"^([^/]+)", "\\1", ""}, "xy.z-w:v?u=t&s_1 8\tY", "/"},
+	    {{"([^/])+/?", "<\\1>", ""}, "ab.c-d:e?f=g&h_0 9\tZ", "/"},
+	    {{"([^\\n]*)\\n(.*)", "\\2|\\1", "s"}, "ab/c,d;e f.g:h-0_9", "\n"},
+	    {{"^([^\\n]*)", "[\\1]", ""}, "xy/z,w;v u.t:s-1_8", "\n"},
+	    {{"(\\w+)", "<\\1>", ""}, "abcXYZ019_qrs", " ./-,;:\n"},
+	    {{"([^,;]+)[,;]([^,;]*)", "\\2=\\1", ""}, "ab/c d.e:f-g_0 9", ",;"},
+	    {{"([^abcd]+)(.?)", "\\2\\1", ""}, "xyz/.:-_09 EFG", "abcd"},
+	};
+	return cases;
+}
+
+//! A string of length bytes cycling through filler
+string Cycle(const string &filler, idx_t length) {
+	string s;
+	for (idx_t i = 0; i < length; i++) {
+		s += filler[i % filler.size()];
+	}
+	return s;
+}
+
+//! Inputs for one class: every byte that ends the run (and the bytes 0x80 and 0xFF) at offsets 0 to 31, runs of 15 to
+//! 33 bytes, two-, three- and four-byte UTF-8 sequences across offsets 14 to 17, the empty string, 4 KiB strings, and
+//! texts that end inside a block of 16 bytes
+duckdb::vector<string> ClassRunInputs(const ClassRunCase &c) {
+	duckdb::vector<string> inputs {""};
+	string stops = c.stops + "\x80\xFF";
+	for (auto stop : stops) {
+		for (idx_t offset = 0; offset < 32; offset++) {
+			string s = Cycle(c.filler, 48);
+			s[offset] = stop;
+			inputs.push_back(s);
+		}
+	}
+	for (idx_t length : {15, 16, 17, 31, 32, 33}) {
+		inputs.push_back(Cycle(c.filler, length));
+		inputs.push_back(Cycle(c.filler, length) + c.stops[0] + Cycle(c.filler, 5));
+		inputs.push_back(string(1, c.stops[0]) + Cycle(c.filler, length));
+	}
+	for (string sequence : {"é", "中", "\xF0\x9F\x98\x80"}) {
+		for (idx_t offset = 12; offset <= 17; offset++) {
+			inputs.push_back(Cycle(c.filler, offset) + sequence + Cycle(c.filler, 20));
+		}
+	}
+	for (idx_t length : {18, 20, 25, 40, 47, 63}) {
+		inputs.push_back(Cycle(c.filler, length));
+	}
+	inputs.push_back(Cycle(c.filler, 4096));
+	string long_stop = Cycle(c.filler, 4096);
+	long_stop[4000] = c.stops[0];
+	inputs.push_back(long_stop);
+	string long_newline = Cycle(c.filler, 4096);
+	long_newline[2048] = '\n';
+	inputs.push_back(long_newline);
+	return inputs;
+}
+
 RE2::Options PatternOptions(const string &letters, bool tagged_dfa, int64_t max_mem = 0) {
 	RE2::Options options;
 	options.set_log_errors(false);
@@ -177,6 +246,33 @@ TEST_CASE("RE2 gives the same results with and without its tagged DFA", "[regexp
 	}
 }
 
+TEST_CASE("RE2's tagged DFA scans class runs with and without its vector step as RE2's other engines do", "[regexp]") {
+	// the default memory budget, and budgets small enough that building a state's byte classes for the vector step
+	// runs past the tagged DFA's budget
+	for (bool vector_scan : {true, false}) {
+		for (int64_t max_mem : {int64_t(0), int64_t(1) << 17, int64_t(1) << 16, int64_t(1) << 15}) {
+			for (auto &c : ClassRunPatterns()) {
+				RE2 reference(c.pattern.pattern, PatternOptions(c.pattern.options, false, max_mem));
+				auto options = PatternOptions(c.pattern.options, true, max_mem);
+				options.set_tdfa_vector_scan(vector_scan);
+				RE2 tagged(c.pattern.pattern, options);
+				REQUIRE(reference.ok() == tagged.ok());
+				if (!reference.ok()) {
+					continue;
+				}
+				idx_t mismatches = 0;
+				for (auto &input : ClassRunInputs(c)) {
+					if (Results(reference, c.pattern, input) != Results(tagged, c.pattern, input)) {
+						mismatches++;
+					}
+				}
+				INFO("pattern " << c.pattern.pattern << " vector_scan " << vector_scan << " max_mem " << max_mem);
+				REQUIRE(mismatches == 0);
+			}
+		}
+	}
+}
+
 TEST_CASE("Regular-expression functions agree with RE2 without its tagged DFA", "[regexp]") {
 	DuckDB db(nullptr);
 	Connection con(db);
@@ -239,7 +335,7 @@ TEST_CASE("RE2's tagged DFA is shared safely by concurrent searches", "[regexp]"
 		duckdb::vector<std::thread> threads;
 		for (idx_t t = 0; t < thread_count; t++) {
 			threads.emplace_back([&, t]() {
-				for (idx_t round = 0; round < 2; round++) {
+				for (idx_t repeat = 0; repeat < 2; repeat++) {
 					for (idx_t i = 0; i < inputs.size(); i++) {
 						// each thread walks the inputs from its own offset
 						const idx_t k = (i + t * 61) % inputs.size();

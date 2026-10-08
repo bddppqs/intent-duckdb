@@ -161,6 +161,9 @@ public:
 	//! Whether the file's tables store a row-group pointer index and per-row-group column statistics after their
 	//! row-group pointers (the persisted-row-group-index version, which a reader without them refuses)
 	bool PersistedRowGroupIndex() const;
+	//! Whether the file's stored column translations carry the decoded byte length of every code (the
+	//! dictionary-entry-lengths version, which a reader without them refuses)
+	bool DictionaryEntryLengths() const;
 
 private:
 	//! Loads the free list of the file.

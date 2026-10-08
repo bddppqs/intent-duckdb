@@ -224,6 +224,9 @@ struct ScanPublication {
 		bool filter_only = false;
 		//! the scan reads the column for a first-keys code group (MarkCodeGroupKey): its consumers read its codes only
 		bool group_key_codes = false;
+		//! the scan reads the column for its byte lengths only (MarkByteLengthConsumers): its consumers read each code's
+		//! stored byte length
+		bool byte_length = false;
 
 		//! the scan reads the column's codes only in this execution
 		bool ReadsCodesOnly() const {
@@ -351,8 +354,17 @@ void MarkCodesOnly(PhysicalOperator &child, idx_t chunk_index, const shared_ptr<
 //! stored translations (PublishPersisted's conditions; the scan estimated at kStoredCodeKeysMinScanRows rows or more and
 //! this transaction holding no local storage of the table; kFilterOnlyCodesOnly)
 void MarkFilterOnlyCodes(ClientContext &context, PhysicalTableScan &scan);
+//! Plan time, a projection over PROJECTION* (no FILTER) over one seq_scan of a DuckDB table: each uncollated VARCHAR column
+//! the projection reads only as the sole argument of strlen or bit_length over a bare reference, carried below it by
+//! bare references only and emitted once by the scan, whose pushed filter (if any) is decided on codes, is read codes only
+//! through its stored translations, and each such strlen or bit_length is replaced by __dict_global_byte_length, which
+//! reads the code's stored byte length (PublishPersisted's conditions, translations that store byte lengths; the scan
+//! without dynamic filters, estimated at kStoredCodeKeysMinScanRows rows or more, and this transaction holding no local
+//! storage of the table; kDictionaryEntryLengths; off under query verification)
+void MarkByteLengthConsumers(ClientContext &context, PhysicalOperator &plan);
 //! The columns a seq_scan's bind data reads codes only through stored translations, one per line, "(filter only)" after a
-//! column read for its filter alone, "(group key)" after a first-keys code group, or empty (EXPLAIN)
+//! column read for its filter alone, "(group key)" after a first-keys code group, "(byte length)" after a column read for
+//! its byte lengths, or empty (EXPLAIN)
 string CodesOnlyColumnNames(const FunctionData *bind_data);
 //! Optimizer time, a first-keys code group (FirstKeysAggregate, kFirstKeysCodeKeys): marks column `column_index` (an
 //! index into the get's column ids) of a seq_scan's logical get gated and read codes only at every execution through

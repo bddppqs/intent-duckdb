@@ -1,0 +1,257 @@
+# name: test/sql/aggregate/group/fused_source_topk.test
+# description: The fused kernel's source top-k (kFusedSourceTopK): a Top-N ordered by one COUNT output of the grouped
+#              class hands the kernel its direction and limit + offset (the EXPLAIN fields topk= and topk_order=), and each
+#              phase-2 task emits only the groups it keeps. Covers the chained build, the open-addressing build (a 32-byte
+#              row without the stored hash) and the run kind; DESC and ASC; OFFSET; ties at the boundary (any tied group,
+#              each one a real group with its count); SUM and AVG on the kept groups; a limit past the group count; a
+#              filter below the aggregate; limit + offset at 2048; the shapes that must not engage; and the EXPLAIN ANALYZE
+#              marker (topk_rows at most threads x (limit + offset)); with the count-first rewrite, its count-only inner
+#              aggregate engages
+# group: [group]
+
+# the count-first rewrite off, so each shape keeps its own aggregate (its own section below turns it back on)
+statement ok
+SET disabled_optimizers = 'count_first_topk'
+
+# a: 1,099,900 keys of two rows, five heavy keys of 60, 50, 40, 30 and 20 rows (x = j % 3, w = 13h + j % 2) and three
+# light keys of one row
+statement ok
+CREATE TABLE a AS SELECT (1000000007 * (i % 1099900))::BIGINT AS k, (i % 7)::INTEGER AS x, (i % 1000)::SMALLINT AS w FROM range(2199800) t(i) UNION ALL SELECT (5000000000000 + h)::BIGINT, (j % 3)::INTEGER, (13 * h + j % 2)::SMALLINT FROM range(5) r(h), range(60) s(j) WHERE j < 60 - 10 * h UNION ALL SELECT (7000000000000 + l)::BIGINT, l::INTEGER, l::SMALLINT FROM range(3) u(l)
+
+# the chained build engages, descending
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c, sum(x) AS sx, avg(w) AS aw FROM a GROUP BY k ORDER BY c DESC LIMIT 3
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]*chain=on[^"]* topk=3 topk_order=desc[^"]*".*
+
+# SUM and AVG on the kept groups
+query IIII
+SELECT k, count(*) AS c, sum(x) AS sx, avg(w) AS aw FROM a GROUP BY k ORDER BY c DESC LIMIT 3
+----
+5000000000000	60	60	0.5
+5000000000001	50	49	13.5
+5000000000002	40	39	26.5
+
+# OFFSET: limit + offset = 4 kept per task
+query IIII
+SELECT k, count(*) AS c, sum(x) AS sx, avg(w) AS aw FROM a GROUP BY k ORDER BY c DESC LIMIT 2 OFFSET 2
+----
+5000000000002	40	39	26.5
+5000000000003	30	30	39.5
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2 OFFSET 2
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=4 topk_order=desc[^"]*".*
+
+# ascending: the three keys of one row
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c ASC LIMIT 3
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=3 topk_order=asc[^"]*".*
+
+query II rowsort
+SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c ASC LIMIT 3
+----
+7000000000000	1
+7000000000001	1
+7000000000002	1
+
+# ascending with a tie at the boundary: two of the three one-row keys
+query III
+SELECT count(*), min(c), max(c) FROM (SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c ASC LIMIT 2)
+----
+2	1	1
+
+# a filter below the aggregate (x <> 0 drops j % 3 = 0)
+query II
+SELECT k, count(*) AS c FROM a WHERE x <> 0 GROUP BY k ORDER BY c DESC LIMIT 3
+----
+5000000000000	40
+5000000000001	33
+5000000000002	26
+
+# limit + offset at 2048 engages: the five heavy keys and 2,043 of the two-row keys
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2048
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=2048 topk_order=desc[^"]*".*
+
+query III
+SELECT count(*), sum(c), count(*) FILTER (WHERE c = 2) FROM (SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2048)
+----
+2048	4286	2043
+
+# every returned group is a real group with its count
+query I
+SELECT count(*) FROM (SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2048) q JOIN (SELECT k, count(*) AS c FROM a GROUP BY k) f ON q.k = f.k AND q.c = f.c
+----
+2048
+
+# b: ties at the boundary: one key of 10 rows, seven keys of 5 rows, 1,000,000 keys of 2 rows
+statement ok
+CREATE TABLE b AS SELECT (1000000007 * (i % 1000000))::BIGINT AS k FROM range(2000000) t(i) UNION ALL SELECT -1::BIGINT FROM range(10) UNION ALL SELECT (-2 - h)::BIGINT FROM range(7) r(h), range(5) s(j)
+
+query III
+SELECT max(c), count(*) FILTER (WHERE c = 5), count(*) FROM (SELECT k, count(*) AS c FROM b GROUP BY k ORDER BY c DESC LIMIT 3)
+----
+10	2	3
+
+query I
+SELECT count(*) FROM (SELECT k, count(*) AS c FROM b GROUP BY k ORDER BY c DESC LIMIT 3) q JOIN (SELECT k, count(*) AS c FROM b GROUP BY k) f ON q.k = f.k AND q.c = f.c
+----
+3
+
+query III
+SELECT min(c), max(c), count(*) FROM (SELECT k, count(*) AS c FROM b GROUP BY k ORDER BY c DESC LIMIT 8)
+----
+5	10	8
+
+# a limit past the group count: every group (c: five keys of 440,000 rows)
+statement ok
+CREATE TABLE c AS SELECT ((i % 5) * 1000000007)::BIGINT AS k FROM range(2200000) t(i)
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS n FROM c GROUP BY k ORDER BY n DESC LIMIT 100
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=100 topk_order=desc[^"]*".*
+
+query II rowsort
+SELECT k, count(*) AS n FROM c GROUP BY k ORDER BY n DESC LIMIT 100
+----
+0	440000
+1000000007	440000
+2000000014	440000
+3000000021	440000
+4000000028	440000
+
+# m: the open-addressing build (a 32-byte compact row keeps the row without the stored hash): unique keys and five
+# heavy groups of 60, 50, 40, 30 and 20 rows (b1 = j, b2 = h, z = j % 2)
+statement ok
+CREATE TABLE m AS SELECT (i * 1000003)::BIGINT AS k1, ((i * 7919) % 2147483647)::INTEGER AS k2, (i * 5)::BIGINT AS b1, (i * 3)::BIGINT AS b2, (i % 1000)::SMALLINT AS z FROM range(2200000) t(i) UNION ALL SELECT (-1 - h)::BIGINT, h::INTEGER, j::BIGINT, h::BIGINT, (j % 2)::SMALLINT FROM range(5) r(h), range(60) s(j) WHERE j < 60 - 10 * h
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 2
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=2 topk_order=desc[^"]*".*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 2
+----
+physical_plan	<!REGEX>:.*hash=stored.*
+
+query IIIIII
+SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 2
+----
+-1	0	60	1770	0	0.5
+-2	1	50	1225	50	0.5
+
+query IIIIII
+SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 1 OFFSET 4
+----
+-5	4	20	190	80	0.5
+
+# r: the run kind (an RLE BIGINT key): runs of 300, 200 and 100 rows, then runs of 4
+statement ok
+CREATE TABLE r(k BIGINT USING COMPRESSION 'rle');
+
+statement ok
+INSERT INTO r SELECT (CASE WHEN i < 300 THEN -1 WHEN i < 500 THEN -2 WHEN i < 600 THEN -3 ELSE (i // 4) * 4294967311 END)::BIGINT FROM range(2097152) t(i);
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM r GROUP BY k ORDER BY c DESC LIMIT 3
+----
+physical_plan	<REGEX>:.*"Fused Aggregate": "[^"]* kind=run[^"]* topk=3 topk_order=desc[^"]*".*
+
+query II
+SELECT k, count(*) AS c FROM r GROUP BY k ORDER BY c DESC LIMIT 3
+----
+-1	300
+-2	200
+-3	100
+
+query III
+SELECT count(*), min(c), max(c) FROM (SELECT k, count(*) AS c FROM r GROUP BY k ORDER BY c ASC LIMIT 5)
+----
+5	4	4
+
+# the shapes that must not engage: a second order key, a SUM order key, a key order, limit + offset past 2048, a
+# filter between the Top-N and the aggregate
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC, k LIMIT 3
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c, sum(x) AS sx FROM a GROUP BY k ORDER BY sx DESC LIMIT 3
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY k LIMIT 3
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2049
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k ORDER BY c DESC LIMIT 2000 OFFSET 100
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k, count(*) AS c FROM a GROUP BY k HAVING count(*) > 1 ORDER BY c DESC LIMIT 3
+----
+physical_plan	<!REGEX>:.*topk=.*
+
+# the not-engaged forms still answer
+query II
+SELECT k, count(*) AS c FROM a GROUP BY k HAVING count(*) > 1 ORDER BY c DESC, k LIMIT 3
+----
+5000000000000	60
+5000000000001	50
+5000000000002	40
+
+# the count-first rewrite (a near-unique key: m's): its count-only inner aggregate takes the top-k (the chained build), the
+# outer aggregate over the semi join is not fused, and the answers are the same
+statement ok
+RESET disabled_optimizers
+
+query II
+EXPLAIN (FORMAT JSON) SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 2
+----
+physical_plan	<REGEX>:.*"HASH_JOIN".*"Fused Aggregate": "keys=2 aggregates=1 [^"]*chain=on[^"]* topk=2 topk_order=desc[^"]*".*
+
+query IIIIII
+SELECT k1, k2, count(*) AS c, sum(b1) AS s1, sum(b2) AS s2, avg(z) AS az FROM m GROUP BY k1, k2 ORDER BY c DESC LIMIT 2
+----
+-1	0	60	1770	0	0.5
+-2	1	50	1225	50	0.5
+
+statement ok
+SET disabled_optimizers = 'count_first_topk'
+
+# the EXPLAIN ANALYZE marker: every group built, at most threads x (limit + offset) rows emitted
+statement ok
+SET threads=4
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT k, count(*) AS c, sum(x) AS sx, avg(w) AS aw FROM a GROUP BY k ORDER BY c DESC LIMIT 3
+----
+analyzed_plan	<REGEX>:.*"Fused Aggregate": "[^"]* topk=3 topk_order=desc[^"]*".*"Fused Source TopK": "topk_tasks=[1-4] topk_groups=1099908 topk_rows=([0-9]|1[0-2])".*
+
+query IIII
+SELECT k, count(*) AS c, sum(x) AS sx, avg(w) AS aw FROM a GROUP BY k ORDER BY c DESC LIMIT 3
+----
+5000000000000	60	60	0.5
+5000000000001	50	49	13.5
+5000000000002	40	39	26.5
+
+statement ok
+RESET threads
+
+statement ok
+RESET disabled_optimizers

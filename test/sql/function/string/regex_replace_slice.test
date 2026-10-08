@@ -1,0 +1,174 @@
+# name: test/sql/function/string/regex_replace_slice.test
+# description: regexp_replace with a one-group rewrite of a match spanning the input, and regexp_extract of one group, on uncompressed and dictionary-compressed strings with 3 000 and 25 000 distinct values: other rewrites, the 'g' option, short and long results, NULL and empty strings, per-row patterns, and results read after a scan of several vectors ends
+# group: [string]
+
+load __TEST_DIR__/regex_replace_slice.db readwrite v1.3.0
+
+statement ok
+PRAGMA force_compression='uncompressed'
+
+# key k: NULL (k = 0), the empty string (k = 1), a word (k % 10 = 7), otherwise a web address
+statement ok
+CREATE TABLE p3 AS SELECT i, CASE WHEN i % 3000 = 0 THEN NULL WHEN i % 3000 = 1 THEN '' WHEN i % 3000 % 10 = 7 THEN 'word' || (i % 3000)::VARCHAR ELSE 'https://h' || (i % 3000 % 40)::VARCHAR || '.example.com/p' || (i % 3000)::VARCHAR || '/' || repeat('x', (i % 3000 % 17)::INTEGER) END AS s FROM range(30000) t(i)
+
+statement ok
+CREATE TABLE p25 AS SELECT i, CASE WHEN i % 25000 = 0 THEN NULL WHEN i % 25000 = 1 THEN '' WHEN i % 25000 % 10 = 7 THEN 'word' || (i % 25000)::VARCHAR ELSE 'https://h' || (i % 25000 % 40)::VARCHAR || '.example.com/p' || (i % 25000)::VARCHAR || '/' || repeat('x', (i % 25000 % 17)::INTEGER) END AS s FROM range(50000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE d3 AS SELECT * FROM p3
+
+statement ok
+CREATE TABLE d25 AS SELECT * FROM p25
+
+statement ok
+CHECKPOINT
+
+restart
+
+query II
+SELECT (SELECT count(*) > 0 FROM pragma_storage_info('d3') WHERE column_name = 's' AND segment_type = 'VARCHAR' AND compression = 'DICT_FSST'), (SELECT count(*) > 0 FROM pragma_storage_info('d25') WHERE column_name = 's' AND segment_type = 'VARCHAR' AND compression = 'DICT_FSST')
+----
+true	true
+
+# whole-input matches with one group (results longer and shorter than 12 bytes, the whole input), a match with a
+# prefix and a suffix, a match with a suffix, two groups, a backslash rewrite, the 'g' option, and regexp_extract
+query ITTTTTTTTTT nosort slice_3k
+SELECT i,
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1'),
+	regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1'),
+	regexp_replace(s, '^(.*)$', '\1'),
+	regexp_replace(s, '/(p[0-9]+)/', '\1'),
+	regexp_replace(s, '^https://([^/]+)', '\1'),
+	regexp_replace(s, '^https://([^/]+)/(.*)$', '\2@\1'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\\'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1', 'g'),
+	regexp_extract(s, '^https://([^/]+)/.*$', 1),
+	regexp_extract(s, '/(p[0-9]+)/', 1)
+FROM p3 ORDER BY i
+----
+
+query ITTTTTTTTTT nosort slice_3k
+SELECT i,
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1'),
+	regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1'),
+	regexp_replace(s, '^(.*)$', '\1'),
+	regexp_replace(s, '/(p[0-9]+)/', '\1'),
+	regexp_replace(s, '^https://([^/]+)', '\1'),
+	regexp_replace(s, '^https://([^/]+)/(.*)$', '\2@\1'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\\'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1', 'g'),
+	regexp_extract(s, '^https://([^/]+)/.*$', 1),
+	regexp_extract(s, '/(p[0-9]+)/', 1)
+FROM d3 ORDER BY i
+----
+
+query ITTTTTTTTTT nosort slice_25k
+SELECT i,
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1'),
+	regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1'),
+	regexp_replace(s, '^(.*)$', '\1'),
+	regexp_replace(s, '/(p[0-9]+)/', '\1'),
+	regexp_replace(s, '^https://([^/]+)', '\1'),
+	regexp_replace(s, '^https://([^/]+)/(.*)$', '\2@\1'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\\'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1', 'g'),
+	regexp_extract(s, '^https://([^/]+)/.*$', 1),
+	regexp_extract(s, '/(p[0-9]+)/', 1)
+FROM p25 ORDER BY i
+----
+
+query ITTTTTTTTTT nosort slice_25k
+SELECT i,
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1'),
+	regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1'),
+	regexp_replace(s, '^(.*)$', '\1'),
+	regexp_replace(s, '/(p[0-9]+)/', '\1'),
+	regexp_replace(s, '^https://([^/]+)', '\1'),
+	regexp_replace(s, '^https://([^/]+)/(.*)$', '\2@\1'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\\'),
+	regexp_replace(s, '^https://([^/]+)/.*$', '\1', 'g'),
+	regexp_extract(s, '^https://([^/]+)/.*$', 1),
+	regexp_extract(s, '/(p[0-9]+)/', 1)
+FROM d25 ORDER BY i
+----
+
+# a pattern per row
+query IT nosort per_row_3k
+SELECT i, regexp_replace(s, CASE WHEN i % 2 = 0 THEN '^https://([^/]+)/.*$' ELSE '^(.*)$' END, '\1') FROM p3 ORDER BY i
+----
+
+query IT nosort per_row_3k
+SELECT i, regexp_replace(s, CASE WHEN i % 2 = 0 THEN '^https://([^/]+)/.*$' ELSE '^(.*)$' END, '\1') FROM d3 ORDER BY i
+----
+
+# where the whole-input pattern matches, the one-group rewrite and regexp_extract of that group agree: every key but
+# 0, 1 and those with k % 10 = 7 is a web address (2 698 of each 3 000 keys, 22 498 of each 25 000)
+query II
+SELECT count(*) FILTER (WHERE m), count(*) FILTER (WHERE m AND r IS DISTINCT FROM e) FROM (SELECT regexp_full_match(s, '^https://([^/]+)/.*$') AS m, regexp_replace(s, '^https://([^/]+)/.*$', '\1') AS r, regexp_extract(s, '^https://([^/]+)/.*$', 1) AS e FROM d3)
+----
+26980	0
+
+query II
+SELECT count(*) FILTER (WHERE m), count(*) FILTER (WHERE m AND r IS DISTINCT FROM e) FROM (SELECT regexp_full_match(s, '^https://[^/]+/(p[0-9]+)/x*$') AS m, regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1') AS r, regexp_extract(s, '^https://[^/]+/(p[0-9]+)/x*$', 1) AS e FROM d3)
+----
+26980	0
+
+query II
+SELECT count(*) FILTER (WHERE m), count(*) FILTER (WHERE m AND r IS DISTINCT FROM e) FROM (SELECT regexp_full_match(s, '^https://([^/]+)/.*$') AS m, regexp_replace(s, '^https://([^/]+)/.*$', '\1') AS r, regexp_extract(s, '^https://([^/]+)/.*$', 1) AS e FROM d25)
+----
+44996	0
+
+query II
+SELECT count(*) FILTER (WHERE m), count(*) FILTER (WHERE m AND r IS DISTINCT FROM e) FROM (SELECT regexp_full_match(s, '^https://([^/]+)/.*$') AS m, regexp_replace(s, '^https://([^/]+)/.*$', '\1') AS r, regexp_extract(s, '^https://([^/]+)/.*$', 1) AS e FROM p3)
+----
+26980	0
+
+# results stored by a scan of several vectors and read after it ends
+statement ok
+CREATE TABLE r3 AS SELECT i, regexp_replace(s, '^https://([^/]+)/.*$', '\1') AS host, regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1') AS path, regexp_extract(s, '^https://([^/]+)/.*$', 1) AS extracted, regexp_replace(s, '^https://([^/]+)/.*$', '\\') AS backslash FROM d3
+
+statement ok
+CREATE TABLE r25 AS SELECT i, regexp_replace(s, '^https://([^/]+)/.*$', '\1') AS host, regexp_replace(s, '^https://[^/]+/(p[0-9]+)/x*$', '\1') AS path, regexp_extract(s, '^https://([^/]+)/.*$', 1) AS extracted, regexp_replace(s, '^https://([^/]+)/.*$', '\\') AS backslash FROM d25
+
+query IIII
+SELECT count(*), count(*) FILTER (WHERE host IS DISTINCT FROM regexp_replace(p3.s, '^https://([^/]+)/.*$', '\1')), count(*) FILTER (WHERE path IS DISTINCT FROM regexp_replace(p3.s, '^https://[^/]+/(p[0-9]+)/x*$', '\1')), count(*) FILTER (WHERE extracted IS DISTINCT FROM regexp_extract(p3.s, '^https://([^/]+)/.*$', 1)) FROM r3 JOIN p3 USING (i)
+----
+30000	0	0	0
+
+query IIII
+SELECT count(*), count(*) FILTER (WHERE host IS DISTINCT FROM regexp_replace(p25.s, '^https://([^/]+)/.*$', '\1')), count(*) FILTER (WHERE path IS DISTINCT FROM regexp_replace(p25.s, '^https://[^/]+/(p[0-9]+)/x*$', '\1')), count(*) FILTER (WHERE extracted IS DISTINCT FROM regexp_extract(p25.s, '^https://([^/]+)/.*$', 1)) FROM r25 JOIN p25 USING (i)
+----
+50000	0	0	0
+
+query ITTTT
+SELECT i, host, path, extracted, backslash FROM r3 WHERE i IN (0, 1, 2, 5, 16, 17, 1234, 3005) ORDER BY i
+----
+0	NULL	NULL	NULL	NULL
+1	(empty)	(empty)	(empty)	(empty)
+2	h2.example.com	p2	h2.example.com	\
+5	h5.example.com	p5	h5.example.com	\
+16	h16.example.com	p16	h16.example.com	\
+17	word17	word17	(empty)	word17
+1234	h34.example.com	p1234	h34.example.com	\
+3005	h5.example.com	p5	h5.example.com	\
+
+query ITTTT
+SELECT i, host, path, extracted, backslash FROM r25 WHERE i IN (25000, 25001, 25005, 24999, 24997) ORDER BY i
+----
+24997	word24997	word24997	(empty)	word24997
+24999	h39.example.com	p24999	h39.example.com	\
+25000	NULL	NULL	NULL	NULL
+25001	(empty)	(empty)	(empty)	(empty)
+25005	h5.example.com	p5	h5.example.com	\
+
+# literals
+query TTTT
+SELECT regexp_replace('https://example.com/a/b', '^https://([^/]+)/.*$', '\1'), regexp_replace('https://example.com/a/b', '^https://[^/]+/(a)/b$', '\1'), regexp_replace('https://example.com/a/b', '/(a)/', '\1'), regexp_extract('https://example.com/a/b', '^https://([^/]+)/(.*)$', 2)
+----
+example.com	a	https://example.comab	a/b

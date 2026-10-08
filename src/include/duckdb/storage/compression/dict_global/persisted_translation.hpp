@@ -57,6 +57,12 @@ struct PersistedColumn {
 	idx_t blob_bytes = 0;
 	//! the blob's block ids, in blob order
 	vector<int64_t> blocks;
+	//! the byte-length table's block ids, in order (empty: the entry stores no byte lengths)
+	vector<int64_t> length_blocks;
+	//! the byte-length table's bytes: its header and one 16-bit length per code
+	idx_t length_bytes = 0;
+	//! the longest decoded string of the column, in bytes (0 when no length pass ran)
+	idx_t max_length = 0;
 
 	void Serialize(Serializer &serializer) const;
 	static PersistedColumn Deserialize(Deserializer &deserializer);
@@ -98,6 +104,13 @@ public:
 	string_t Fetch(Vector &result, uint32_t code);
 	//! The entry of the segment stored at (block_id, offset), or INVALID_INDEX
 	idx_t FindEntry(int64_t block_id, uint32_t offset);
+	//! Whether the entry stores the byte length of every code
+	bool HasLengths() const {
+		return !column.length_blocks.empty();
+	}
+	//! The decoded byte length of every code (Count() entries, slot 0 = 0), read whole on first use; null when the entry
+	//! stores none
+	const uint16_t *Lengths();
 	//! Set when a publication skipped the link walk (the table unchanged since its load): from then on each load of
 	//! the column in a row group links its segments (LinkLoadedColumn) before the column is visible to a scan
 	atomic<bool> lazy_link {false};
@@ -119,6 +132,10 @@ private:
 	//! the segment blocks Fetch has read (under `lock`): held so an unpinned block stays registered in the buffer pool
 	//! (evictable under pressure) instead of being dropped when Fetch returns and read again by the next decode
 	unordered_map<int64_t, shared_ptr<BlockHandle>> fetch_blocks;
+	//! the byte-length table once read (Lengths(), under `lock`), and the bytes reserved for it in the buffer pool
+	atomic<bool> lengths_loaded {false};
+	unsafe_unique_array<uint16_t> lengths;
+	idx_t lengths_reserved = 0;
 };
 
 //===--------------------------------------------------------------------===//

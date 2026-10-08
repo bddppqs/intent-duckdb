@@ -248,6 +248,9 @@ void SingleFileTableDataWriter::FinalizeTable(const TableStatistics &global_stat
 				for (auto &block : column.blocks) {
 					checkpoint_manager.verify_block_usage_count[block]++;
 				}
+				for (auto &block : column.length_blocks) {
+					checkpoint_manager.verify_block_usage_count[block]++;
+				}
 			}
 		}
 		serializer.WritePropertyWithDefault<vector<dict_global::PersistedColumn>>(106, "dict_global_translations",

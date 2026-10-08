@@ -2,6 +2,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
 
 namespace duckdb {
 
@@ -38,6 +39,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalProjection &op) {
 
 	auto &proj = Make<PhysicalProjection>(op.types, std::move(op.expressions), op.estimated_cardinality);
 	proj.children.push_back(plan);
+	// a column the projection reads only through strlen or bit_length is read as codes and their stored byte lengths
+	dict_global::MarkByteLengthConsumers(context, proj);
 	return proj;
 }
 

@@ -1,3 +1,4 @@
+#include "duckdb/execution/operator/aggregate/fused_integer_aggregate.hpp"
 #include "duckdb/execution/operator/order/physical_top_n.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -12,6 +13,8 @@ PhysicalOperator &PhysicalPlanGenerator::CreatePlan(LogicalTopN &op) {
 	auto &plan = CreatePlan(*op.children[0]);
 	// A code key read through stored translations: the Top-N carries codes; a projection decodes the rows it keeps
 	auto decodes = dict_global::PlanLateDecode(plan, op.orders);
+	// a Top-N ordered by a COUNT output of a fused aggregate below it hands the kernel its order and limit + offset
+	FusedIntegerAggregate::TryAttachTopK(plan, op.orders, NumericCast<idx_t>(op.limit), NumericCast<idx_t>(op.offset));
 	auto &top_n = Make<PhysicalTopN>(decodes.empty() ? op.types : plan.types, std::move(op.orders),
 	                                 NumericCast<idx_t>(op.limit), NumericCast<idx_t>(op.offset),
 	                                 std::move(op.dynamic_filter), op.estimated_cardinality);

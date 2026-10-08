@@ -1947,6 +1947,76 @@ unique_ptr<Expression> CodesExpression(unique_ptr<Expression> child) {
 	return make_uniq<BoundFunctionExpression>(LogicalType::INTEGER, std::move(function), std::move(children), nullptr);
 }
 
+namespace {
+struct ByteLengthData : public FunctionData {
+	ByteLengthData(shared_ptr<ColumnDictionary> dict_p, bool bits_p) : dict(std::move(dict_p)), bits(bits_p) {
+	}
+	//! the column's publication entry over its stored translations, which store the byte lengths
+	shared_ptr<ColumnDictionary> dict;
+	//! bit_length: the byte length times 8
+	bool bits;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ByteLengthData>(dict, bits);
+	}
+	bool Equals(const FunctionData &other) const override {
+		auto &cast = other.Cast<ByteLengthData>();
+		return dict == cast.dict && bits == cast.bits;
+	}
+};
+
+//! __dict_global_byte_length: strlen (or bit_length) of a codes-only vector, each row's code looked up in the stored byte
+//! lengths, NULL for code 0. Fail closed: any vector that is not a codes-only vector of the bind data's translations
+//! (strings, or codes of other translations) throws, never a lookup
+void ByteLengthFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &data = expr.bind_info->Cast<ByteLengthData>();
+	auto &input = args.data[0];
+	const idx_t count = args.size();
+	auto &translations = *data.dict->persisted;
+	// a vector over the entry's own tag child is codes-only over these translations; any other is resolved by its id
+	if (input.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
+	    (&DictionaryVector::Child(input) != &data.dict->child->data &&
+	     CodesOnlyTranslationsOf(DictionaryVector::DictionaryId(input)) != data.dict->persisted)) {
+		throw InternalException("a codes-only vector of the stored byte lengths' translations was expected");
+	}
+	auto lengths = translations.Lengths();
+	if (!lengths) {
+		throw InternalException("Stored column translations without byte lengths read for them");
+	}
+	const idx_t code_count = translations.Count();
+	const int64_t factor = data.bits ? 8 : 1;
+	auto &codes = DictionaryVector::SelVector(input);
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto out = FlatVector::GetData<int64_t>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < count; i++) {
+		const auto code = codes.get_index(i);
+		if (code == 0) {
+			validity.SetInvalid(i);
+			continue;
+		}
+		if (code >= code_count) {
+			throw IOException("Stored column translations: a code outside the byte-length table - the database file "
+			                  "appears corrupted");
+		}
+		out[i] = int64_t(lengths[code]) * factor;
+	}
+}
+
+unique_ptr<Expression> ByteLengthExpression(const shared_ptr<ColumnDictionary> &dict, bool bits,
+                                            unique_ptr<Expression> child) {
+	ScalarFunction function("__dict_global_byte_length", {LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                        ByteLengthFunction);
+	// it throws on a vector that is not codes-only: never evaluated over a dictionary's entries instead of its rows
+	function.SetFallible();
+	vector<unique_ptr<Expression>> children;
+	children.push_back(std::move(child));
+	return make_uniq<BoundFunctionExpression>(LogicalType::BIGINT, std::move(function), std::move(children),
+	                                          make_uniq<ByteLengthData>(dict, bits));
+}
+} // namespace
+
 unique_ptr<CodeKeys> PlanCodeKeys(ClientContext &context, PhysicalOperator &child,
                                   vector<unique_ptr<Expression>> &groups, const vector<LogicalType> &output_types,
                                   const vector<unique_ptr<Expression>> &aggregates, idx_t grouping_set_count) {
@@ -2350,6 +2420,156 @@ void MarkFilterOnlyCodes(ClientContext &context, PhysicalTableScan &scan) {
 	}
 }
 
+//! Whether `expr` is strlen or bit_length of VARCHAR over a bare reference to one of `positions`
+static bool IsByteLengthConsumer(const Expression &expr, const unordered_set<idx_t> &positions) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if ((function.function.name != "strlen" && function.function.name != "bit_length") ||
+	    function.children.size() != 1 || function.function.arguments.size() != 1 ||
+	    function.function.arguments[0].id() != LogicalTypeId::VARCHAR ||
+	    function.return_type.id() != LogicalTypeId::BIGINT) {
+		return false;
+	}
+	auto &child = *function.children[0];
+	return child.GetExpressionType() == ExpressionType::BOUND_REF &&
+	       positions.count(child.Cast<BoundReferenceExpression>().index) > 0;
+}
+
+void MarkByteLengthConsumers(ClientContext &context, PhysicalOperator &plan) {
+	if (!kDictionaryEntryLengths || !PersistedTranslationsEnabled() || !DictGlobalEnabled() ||
+	    plan.type != PhysicalOperatorType::PROJECTION || plan.children.size() != 1) {
+		return;
+	}
+	// off under query verification: the plan's serializer round trip cannot rebuild the internal function
+	auto &config = ClientConfig::GetConfig(context);
+	if (config.query_verification_enabled || config.verify_serializer) {
+		return;
+	}
+	auto &projection = plan.Cast<PhysicalProjection>();
+	// the chain: PROJECTION* over one seq_scan of a DuckDB table, no FILTER (a FILTER's cache appends the codes-only
+	// vector, whose dictionary holds no strings)
+	vector<reference<PhysicalOperator>> chain;
+	optional_ptr<PhysicalTableScan> scan;
+	if (!ScanChain(projection.children[0], chain, scan) || scan->dynamic_filters ||
+	    scan->estimated_cardinality < idx_t(kStoredCodeKeysMinScanRows)) {
+		return;
+	}
+	for (auto &op : chain) {
+		if (op.get().type == PhysicalOperatorType::FILTER) {
+			return;
+		}
+	}
+	auto &table_entry = scan->bind_data->Cast<TableScanBindData>().table;
+	if (!table_entry.IsDuckTable()) {
+		return;
+	}
+	auto &duck_table = table_entry.Cast<DuckTableEntry>();
+	auto &storage = duck_table.GetStorage();
+	// this transaction's local rows hold strings (a prepared plan re-binds once they appear)
+	if (LocalStorage::Get(context, storage.db).Find(storage)) {
+		return;
+	}
+	const idx_t outputs = scan->projection_ids.empty() ? scan->column_ids.size() : scan->projection_ids.size();
+	for (idx_t output = 0; output < outputs; output++) {
+		const idx_t scan_index = scan->projection_ids.empty() ? output : scan->projection_ids[output];
+		if (scan_index >= scan->column_ids.size()) {
+			continue;
+		}
+		auto &column_index = scan->column_ids[scan_index];
+		if (column_index.IsRowIdColumn() || column_index.IsVirtualColumn() || column_index.HasChildren() ||
+		    !column_index.HasPrimaryIndex()) {
+			continue;
+		}
+		auto &column = duck_table.GetColumns().GetColumn(LogicalIndex(column_index.GetPrimaryIndex()));
+		if (column.Generated() || column.Type().id() != LogicalTypeId::VARCHAR ||
+		    !StringType::GetCollation(column.Type()).empty()) {
+			continue;
+		}
+		// the scan emits the column once, and its pushed filter, if any, is decided on codes
+		bool once = true;
+		for (idx_t other = 0; other < outputs; other++) {
+			const idx_t other_index = scan->projection_ids.empty() ? other : scan->projection_ids[other];
+			once = once && (other == output || other_index >= scan->column_ids.size() ||
+			                !(scan->column_ids[other_index] == column_index));
+		}
+		if (!once) {
+			continue;
+		}
+		if (scan->table_filters) {
+			auto found = scan->table_filters->filters.find(scan_index);
+			if (found != scan->table_filters->filters.end() && !CodeTranslatable(*found->second)) {
+				continue;
+			}
+		}
+		// the chain carries the column by bare references only (CodesOnlyChain's walk, to any set of positions)
+		unordered_set<idx_t> carrying {output};
+		bool sound = true;
+		for (idx_t i = chain.size(); i > 0 && sound; i--) {
+			auto &lower = chain[i - 1].get().Cast<PhysicalProjection>();
+			unordered_set<idx_t> next;
+			for (idx_t out = 0; out < lower.select_list.size(); out++) {
+				auto &expr = *lower.select_list[out];
+				if (expr.GetExpressionType() == ExpressionType::BOUND_REF) {
+					if (carrying.count(expr.Cast<BoundReferenceExpression>().index)) {
+						next.insert(out);
+					}
+				} else if (ReferencesAny(expr, carrying)) {
+					sound = false;
+				}
+			}
+			carrying = std::move(next);
+		}
+		if (!sound || carrying.empty()) {
+			continue;
+		}
+		// the projection reads the column only as the sole argument of strlen or bit_length, and drops it
+		vector<idx_t> consumers;
+		for (idx_t out = 0; out < projection.select_list.size() && sound; out++) {
+			auto &expr = *projection.select_list[out];
+			if (IsByteLengthConsumer(expr, carrying)) {
+				consumers.push_back(out);
+			} else if (ReferencesAny(expr, carrying)) {
+				sound = false;
+			}
+		}
+		if (!sound || consumers.empty()) {
+			continue;
+		}
+		auto dict = PublishPersisted(storage, column.StorageOid());
+		if (!dict || !dict->persisted || !dict->persisted->HasLengths()) {
+			continue;
+		}
+		auto publishing = dynamic_cast<PublishingTableScanBindData *>(scan->bind_data.get());
+		if (!publishing) {
+			auto replacement = make_uniq<PublishingTableScanBindData>(scan->bind_data->Cast<TableScanBindData>());
+			publishing = replacement.get();
+			scan->bind_data = std::move(replacement);
+		}
+		if (!publishing->publication) {
+			publishing->publication = make_shared_ptr<ScanPublication>();
+		}
+		if (publishing->publication->Find(column.StorageOid())) {
+			continue;
+		}
+		// marked but gated: never built or emitted over a published dictionary, only read codes only
+		ScanPublication::Column marked;
+		marked.storage_index = column.StorageOid();
+		marked.name = column.Name();
+		marked.gated = true;
+		marked.byte_length = true;
+		publishing->publication->columns.push_back(std::move(marked));
+		SetCodesOnly(*scan, dict);
+		for (auto out : consumers) {
+			auto &function = projection.select_list[out]->Cast<BoundFunctionExpression>();
+			const bool bits = function.function.name == "bit_length";
+			projection.select_list[out] = ByteLengthExpression(dict, bits, std::move(function.children[0]));
+		}
+		NoteStoredTranslationPlan(context);
+	}
+}
+
 bool MarkCodeGroupKey(ClientContext &context, LogicalGet &get, idx_t column_index,
                       const shared_ptr<ColumnDictionary> &dict) {
 	// a get already carrying dynamic filters is refused: a runtime filter on a codes-only column must be decided on
@@ -2413,7 +2633,10 @@ string CodesOnlyColumnNames(const FunctionData *bind_data) {
 	for (auto &column : publication->columns) {
 		if (column.codes_only) {
 			result += (result.empty() ? "" : "\n") + column.name +
-			          (column.filter_only ? " (filter only)" : column.group_key_codes ? " (group key)" : "");
+			          (column.filter_only       ? " (filter only)"
+			           : column.group_key_codes ? " (group key)"
+			           : column.byte_length     ? " (byte length)"
+			                                    : "");
 		}
 	}
 	return result;

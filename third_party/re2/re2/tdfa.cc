@@ -19,6 +19,15 @@
 // finite; a transition that renumbers nothing changes no register, and a
 // state that loops on a byte that way is scanned over without stepping.
 //
+// The scan of such a run takes sixteen bytes at a time (SSE2, or NEON on
+// AArch64) when the state continues it on every ASCII byte but at most three
+// (RE2::Options::set_tdfa_vector_scan): a block is compared with those three
+// bytes, and every byte >= 0x80 ends the vector step too, so the step consumes
+// only bytes the byte-by-byte scan would, which then takes over at the first
+// byte that may end the run. Whether a state is admitted is read off its
+// transitions, which the first scan of a run on it builds for every byte class
+// with an ASCII byte.
+//
 // The match rules are the NFA's. When the match must end at the end of the
 // text (kFullMatch, or a program anchored at the end), the first Match thread
 // of the state at the end wins. Otherwise (leftmost-first), the first Match
@@ -46,6 +55,11 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#if defined(__GNUC__) && defined(__SSE2__)
+#include <emmintrin.h>
+#elif defined(__GNUC__) && defined(__aarch64__) && !defined(__AARCH64EB__)
+#include <arm_neon.h>
+#endif
 
 #include "util/logging.h"
 #include "re2/prog.h"
@@ -68,6 +82,18 @@ const int kMaxRegs = 64;
 const int kMaxStates = 4096;
 // The budget's ceiling (Prog::EnableTDFA).
 const int64_t kMaxBudget = 1 << 20;
+// Whether the vector step of a run's scan has a 16-byte kernel here (SSE2, or
+// NEON on little-endian AArch64); elsewhere every run is scanned byte by byte.
+#if defined(__GNUC__) && (defined(__SSE2__) || \
+                          (defined(__aarch64__) && !defined(__AARCH64EB__)))
+const bool kVectorScan = true;
+#else
+const bool kVectorScan = false;
+#endif
+// The ASCII bytes that may end a run the vector step takes.
+const int kMaxStops = 3;
+// TState::scan of a state whose runs are scanned byte by byte.
+const uint8_t kNoScan = 3;
 
 struct TState;
 
@@ -89,6 +115,11 @@ struct TState {
   // self_edge's register operations (each register kept or set to the
   // position after the byte)
   uint8_t self[256];
+  // the vector step of its runs (TDFA::AdmitScan): 0 not decided yet, the
+  // mode of the runs it takes (1 or 2), or kNoScan; and the ASCII bytes that
+  // end such a run, the unused entries 0x80 (every byte >= 0x80 ends the step)
+  uint8_t scan = 0;
+  uint8_t stop[kMaxStops];
   const TEdge* self_edge = NULL;
   // per byte class, in the allocation after the state: 0 not built; a TState*
   // (no register changes); a TEdge* with the low bit set
@@ -113,6 +144,50 @@ struct Thread {
   int8_t slots[kMaxTrack];
 };
 
+// The vector step of a run: from text position j, the position of the first
+// byte that is one of the stop bytes or >= 0x80, looking at whole blocks of 16
+// bytes only; past the last whole block, the position after it.
+inline size_t ScanBlocks(const char* begin, size_t j, size_t n,
+                         const uint8_t* stop) {
+#if defined(__GNUC__) && defined(__SSE2__)
+  const __m128i s0 = _mm_set1_epi8(static_cast<char>(stop[0]));
+  const __m128i s1 = _mm_set1_epi8(static_cast<char>(stop[1]));
+  const __m128i s2 = _mm_set1_epi8(static_cast<char>(stop[2]));
+  for (; j+16 <= n; j += 16) {
+    const __m128i b =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(begin+j));
+    const __m128i eq = _mm_or_si128(
+        _mm_or_si128(_mm_cmpeq_epi8(b, s0), _mm_cmpeq_epi8(b, s1)),
+        _mm_cmpeq_epi8(b, s2));
+    // the sign bit of a byte >= 0x80 is set
+    const int mask = _mm_movemask_epi8(_mm_or_si128(eq, b));
+    if (mask != 0)
+      return j + __builtin_ctz(static_cast<unsigned>(mask));
+  }
+#elif defined(__GNUC__) && defined(__aarch64__) && !defined(__AARCH64EB__)
+  const uint8x16_t s0 = vdupq_n_u8(stop[0]);
+  const uint8x16_t s1 = vdupq_n_u8(stop[1]);
+  const uint8x16_t s2 = vdupq_n_u8(stop[2]);
+  const uint8x16_t high = vdupq_n_u8(0x80);
+  for (; j+16 <= n; j += 16) {
+    const uint8x16_t b = vld1q_u8(reinterpret_cast<const uint8_t*>(begin+j));
+    const uint8x16_t eq = vorrq_u8(
+        vorrq_u8(vceqq_u8(b, s0), vceqq_u8(b, s1)),
+        vorrq_u8(vceqq_u8(b, s2), vcgeq_u8(b, high)));
+    // four bits per byte, in text order
+    const uint64_t mask = vget_lane_u64(
+        vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(eq), 4)), 0);
+    if (mask != 0)
+      return j + (__builtin_ctzll(mask) >> 2);
+  }
+#else
+  (void)begin;
+  (void)n;
+  (void)stop;
+#endif
+  return j;
+}
+
 }  // namespace
 
 class TDFA {
@@ -129,6 +204,7 @@ class TDFA {
   void AddToList(int id0, const int8_t* slots0, std::vector<Thread>* out);
   TState* Intern(const std::vector<Thread>& threads, TEdge* edge);
   uintptr_t Build(TState* s, int cls);
+  void AdmitScan(TState* s, uint8_t mode);
 
   Prog* prog_;
   bool endmatch_;
@@ -369,12 +445,38 @@ uintptr_t TDFA::Build(TState* s, int cls) {
   return v;
 }
 
+// Decides the vector step of s's runs on mode, at the first such run: builds
+// every byte class with an ASCII byte, so that self[0..127] is final, and
+// takes the step when at most kMaxStops ASCII bytes end the run. A state whose
+// builds run past the budget is scanned byte by byte.
+void TDFA::AdmitScan(TState* s, uint8_t mode) {
+  const uint8_t* bytemap = prog_->bytemap();
+  s->scan = kNoScan;
+  for (int b = 0; b < 128 && !failed_; b++)
+    if (s->next()[bytemap[b]] == 0)
+      Build(s, bytemap[b]);
+  if (failed_)
+    return;
+  uint8_t stop[kMaxStops] = {0x80, 0x80, 0x80};
+  int nstop = 0;
+  for (int b = 0; b < 128; b++) {
+    if (s->self[b] == mode)
+      continue;
+    if (nstop == kMaxStops)
+      return;
+    stop[nstop++] = static_cast<uint8_t>(b);
+  }
+  memcpy(s->stop, stop, sizeof stop);
+  s->scan = mode;
+}
+
 int TDFA::Search(const StringPiece& text, StringPiece* match, int nmatch) {
   if (failed_)
     return -1;
   const char* const begin = text.data();
   const size_t n = text.size();
   const uint8_t* bytemap = prog_->bytemap();
+  const bool vector_scan = kVectorScan && prog_->tdfa_vector_scan();
   const char* regs[2][kMaxRegs];
   int cur = 0;
   for (int k = 0; k < start_edge_.nregs; k++)
@@ -400,6 +502,13 @@ int TDFA::Search(const StringPiece& text, StringPiece* match, int nmatch) {
       // The state steps to itself on these bytes: the registers are what the
       // last step leaves, and a match the state holds is taken again at the
       // end of the run.
+      if (vector_scan) {
+        if (s->scan == 0)
+          AdmitScan(s, mode);
+        // the bytes before the first that may end the run continue it
+        if (s->scan == mode)
+          i = ScanBlocks(begin, i+1, n, s->stop) - 1;
+      }
       do {
         i++;
       } while (i < n && s->self[static_cast<uint8_t>(begin[i])] == mode);
@@ -441,8 +550,9 @@ int TDFA::Search(const StringPiece& text, StringPiece* match, int nmatch) {
 }
 
 // Programs whose instructions are all Fail, Nop, Capture (of a group),
-// ByteRange and Match. Call before any search.
-void Prog::EnableTDFA() {
+// ByteRange and Match. Call before any search; vector_scan: the scan of a run
+// takes 16-byte blocks where the state admits it.
+void Prog::EnableTDFA(bool vector_scan) {
   if (reversed_ || tdfa_admitted_)
     return;
   for (int id = 0; id < size_; id++) {
@@ -462,6 +572,7 @@ void Prog::EnableTDFA() {
     }
   }
   tdfa_admitted_ = true;
+  tdfa_vector_scan_ = vector_scan;
   tdfa_budget_ = std::min(kMaxBudget, dfa_mem_/4);
   dfa_mem_ -= tdfa_budget_;
 }

@@ -195,6 +195,13 @@ static string_t ReplaceFirst(const RE2 &pattern, const string_t &input, const st
 	const idx_t prefix = idx_t(groups[0].data() - text.data());
 	const idx_t suffix_begin = prefix + groups[0].size();
 	const idx_t suffix = text.size() - suffix_begin;
+	if (kRegexpReplaceSliceOutput && prefix == 0 && suffix == 0 && rewrite.size() == 2 && rewrite[0] == '\\' &&
+	    rewrite[1] >= '0' && rewrite[1] <= '9') {
+		// the match spans the input and the rewrite is one group: the result is the group's bytes of the input, which
+		// the result vector references (RegexReplaceFunction)
+		const auto &group = groups[rewrite[1] - '0'];
+		return string_t(group.data(), UnsafeNumericCast<uint32_t>(group.size()));
+	}
 	auto target = StringVector::EmptyString(result, prefix + rewrite_length + suffix);
 	auto out = target.GetDataWriteable();
 	memcpy(out, text.data(), prefix);
@@ -231,6 +238,10 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 	if (info.constant_pattern) {
 		auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<RegexLocalState>();
 		if (kRegexpReplaceInPlace && !info.global_replace) {
+			if (kRegexpReplaceSliceOutput) {
+				// ReplaceFirst may return a slice of the input
+				StringVector::AddHeapReference(result, strings);
+			}
 			BinaryExecutor::Execute<string_t, string_t, string_t>(
 			    strings, replaces, result, args.size(), [&](string_t input, string_t replace) {
 				    return ReplaceFirst(lstate.constant_pattern, input, replace, result);
@@ -248,6 +259,10 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 			    return StringVector::AddString(result, sstring);
 		    });
 	} else {
+		if (kRegexpReplaceInPlace && kRegexpReplaceSliceOutput && !info.global_replace) {
+			// ReplaceFirst may return a slice of the input
+			StringVector::AddHeapReference(result, strings);
+		}
 		TernaryExecutor::Execute<string_t, string_t, string_t, string_t>(
 		    strings, patterns, replaces, result, args.size(), [&](string_t input, string_t pattern, string_t replace) {
 			    RE2 re(CreateStringPiece(pattern), info.options);
@@ -295,6 +310,10 @@ static void RegexExtractFunction(DataChunk &args, ExpressionState &state, Vector
 
 	auto &strings = args.data[0];
 	auto &patterns = args.data[1];
+	if (kRegexpReplaceSliceOutput) {
+		// Extract may return a slice of the input
+		StringVector::AddHeapReference(result, strings);
+	}
 	if (info.constant_pattern) {
 		auto &lstate = ExecuteFunctionState::GetFunctionState(state)->Cast<RegexLocalState>();
 		UnaryExecutor::Execute<string_t, string_t>(strings, result, args.size(), [&](string_t input) {

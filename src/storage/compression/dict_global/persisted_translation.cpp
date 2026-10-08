@@ -24,6 +24,7 @@
 #include "duckdb/storage/compression/dict_fsst/decompression.hpp"
 #include "duckdb/storage/compression/dict_fsst/split_segment.hpp"
 #include "duckdb/storage/compression/dict_global/column_dictionary.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
 #include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
@@ -51,6 +52,10 @@ void PersistedColumn::Serialize(Serializer &serializer) const {
 	serializer.WriteProperty<idx_t>(104, "rows", rows);
 	serializer.WriteProperty<idx_t>(105, "blob_bytes", blob_bytes);
 	serializer.WriteProperty<vector<int64_t>>(106, "blocks", blocks);
+	// absent unless written: an entry without byte lengths serializes as before
+	serializer.WritePropertyWithDefault<vector<int64_t>>(107, "length_blocks", length_blocks);
+	serializer.WritePropertyWithDefault<idx_t>(108, "length_bytes", length_bytes);
+	serializer.WritePropertyWithDefault<idx_t>(109, "max_length", max_length);
 }
 
 PersistedColumn PersistedColumn::Deserialize(Deserializer &deserializer) {
@@ -62,6 +67,9 @@ PersistedColumn PersistedColumn::Deserialize(Deserializer &deserializer) {
 	result.rows = deserializer.ReadProperty<idx_t>(104, "rows");
 	result.blob_bytes = deserializer.ReadProperty<idx_t>(105, "blob_bytes");
 	result.blocks = deserializer.ReadProperty<vector<int64_t>>(106, "blocks");
+	result.length_blocks = deserializer.ReadPropertyWithDefault<vector<int64_t>>(107, "length_blocks");
+	result.length_bytes = deserializer.ReadPropertyWithDefault<idx_t>(108, "length_bytes");
+	result.max_length = deserializer.ReadPropertyWithDefault<idx_t>(109, "max_length");
 	return result;
 }
 
@@ -121,6 +129,21 @@ idx_t OldBytes(idx_t old_count, uint8_t width) {
 uint8_t WidthOf(uint32_t max_value) {
 	return max_value == 0 ? 0 : BitpackingPrimitives::MinimumBitWidth<uint32_t, false>(max_value);
 }
+
+// The byte-length table, a second blob: a 64-byte header, then the decoded byte length of every code as a 16-bit value
+// in code order (slot 0, NULL, holds 0), one stream over whole blocks of even size, so no length crosses a block
+static constexpr uint64_t LENGTHS_MAGIC = 0x31304E454C525453ULL; // "STRLEN01"
+static constexpr uint64_t LENGTHS_VERSION = 1;
+struct LengthsBlobHeader {
+	uint64_t magic;
+	uint64_t version;
+	uint64_t storage_index;
+	uint64_t count;
+	uint64_t width;
+	uint64_t max_length;
+	uint64_t reserved[2];
+};
+static_assert(sizeof(LengthsBlobHeader) == 64, "byte-length table header layout");
 } // namespace
 
 PersistedTranslations::PersistedTranslations(DatabaseInstance &db_p, BlockManager &block_manager_p,
@@ -130,6 +153,12 @@ PersistedTranslations::PersistedTranslations(DatabaseInstance &db_p, BlockManage
 }
 
 PersistedTranslations::~PersistedTranslations() {
+	if (lengths_reserved) {
+		try {
+			BufferManager::GetBufferManager(db).FreeReservedMemory(lengths_reserved);
+		} catch (std::exception &) { // NOLINT: a destructor never throws
+		}
+	}
 }
 
 const_data_ptr_t PersistedTranslations::Read(idx_t offset, idx_t bytes, BufferHandle &handle) {
@@ -205,6 +234,57 @@ const vector<PersistedTranslations::Entry> &PersistedTranslations::Entries() {
 uint32_t PersistedTranslations::EmptyCode() {
 	EnsureDirectory();
 	return empty_code;
+}
+
+const uint16_t *PersistedTranslations::Lengths() {
+	if (column.length_blocks.empty()) {
+		return nullptr;
+	}
+	if (lengths_loaded.load(std::memory_order_acquire)) {
+		return lengths.get();
+	}
+	lock_guard<mutex> guard(lock);
+	if (lengths_loaded.load(std::memory_order_relaxed)) {
+		return lengths.get();
+	}
+	const idx_t block_size = block_manager.GetBlockSize();
+	const idx_t count = column.count;
+	const idx_t stream_bytes = sizeof(LengthsBlobHeader) + count * sizeof(uint16_t);
+	if (count == 0 || column.length_bytes != stream_bytes ||
+	    (stream_bytes + block_size - 1) / block_size != column.length_blocks.size()) {
+		throw IOException("Stored column translations: the byte-length table does not match its table entry - the "
+		                  "database file appears corrupted");
+	}
+	// the table is held with the translations: its bytes are reserved in the buffer pool as a global dictionary's are
+	auto &buffer_manager = BufferManager::GetBufferManager(db);
+	if (!lengths_reserved) {
+		buffer_manager.ReserveMemory(count * sizeof(uint16_t));
+		lengths_reserved = count * sizeof(uint16_t);
+	}
+	auto result = make_unsafe_uniq_array_uninitialized<uint16_t>(count);
+	auto target = data_ptr_cast(result.get());
+	LengthsBlobHeader header;
+	for (idx_t b = 0; b < column.length_blocks.size(); b++) {
+		auto block = block_manager.RegisterBlock(column.length_blocks[b]);
+		auto handle = buffer_manager.Pin(block);
+		auto source = handle.Ptr();
+		idx_t position = b * block_size;
+		const idx_t end = MinValue<idx_t>(position + block_size, stream_bytes);
+		if (b == 0) {
+			memcpy(&header, source, sizeof(header));
+			source += sizeof(header);
+			position += sizeof(header);
+		}
+		memcpy(target + position - sizeof(header), source, end - position);
+	}
+	if (header.magic != LENGTHS_MAGIC || header.version != LENGTHS_VERSION || header.storage_index != storage_index ||
+	    header.count != count) {
+		throw IOException("Stored column translations: the byte-length table's header does not match its table entry "
+		                  "- the database file appears corrupted");
+	}
+	lengths = std::move(result);
+	lengths_loaded.store(true, std::memory_order_release);
+	return lengths.get();
 }
 
 idx_t PersistedTranslations::FindEntry(int64_t block_id, uint32_t offset) {
@@ -410,6 +490,9 @@ void CommitDropPersisted(const DataTableInfo &info, BlockManager &block_manager)
 	}
 	for (auto &column : dropped) {
 		for (auto block_id : column.blocks) {
+			block_manager.MarkBlockAsModified(block_id);
+		}
+		for (auto block_id : column.length_blocks) {
 			block_manager.MarkBlockAsModified(block_id);
 		}
 	}
@@ -788,6 +871,81 @@ private:
 	idx_t end;
 };
 
+//! Per range of partitions: each string's decoded byte length at its code (all numbered by now), and the longest. The
+//! strings are the decoded entries the dedup inserted, not the segments' stored lengths (FSST-compressed sizes)
+class LengthTask : public BaseExecutorTask {
+public:
+	LengthTask(TaskExecutor &executor, CheckpointBuildState &state, uint16_t *lengths, idx_t begin, idx_t end,
+	           idx_t &longest)
+	    : BaseExecutorTask(executor), state(state), lengths(lengths), begin(begin), end(end), longest(longest) {
+	}
+	void ExecuteTask() override {
+		idx_t max_length = 0;
+		for (idx_t p = begin; p < end; p++) {
+			auto &partition = state.partitions[p];
+			for (idx_t id = 0; id < partition.strings.size(); id++) {
+				const idx_t length = partition.strings[id].GetSize();
+				max_length = MaxValue(max_length, length);
+				lengths[partition.codes[id]] =
+				    UnsafeNumericCast<uint16_t>(MinValue<idx_t>(length, NumericLimits<uint16_t>::Maximum()));
+			}
+		}
+		longest = max_length;
+	}
+	string TaskType() const override {
+		return "StoredTranslationLengthTask";
+	}
+
+private:
+	CheckpointBuildState &state;
+	uint16_t *lengths;
+	idx_t begin;
+	idx_t end;
+	idx_t &longest;
+};
+
+//! Per range of the byte-length table's blocks: fill each block from the stream (the header, then the lengths) and
+//! write it, so the blocks are compressed and written by the threads that fill them. The block ids were taken in
+//! stream order before the tasks ran
+class LengthBlockTask : public BaseExecutorTask {
+public:
+	LengthBlockTask(TaskExecutor &executor, optional_ptr<ClientContext> context, BlockManager &block_manager,
+	                const LengthsBlobHeader &header, const_data_ptr_t source, idx_t stream_bytes,
+	                const vector<block_id_t> &block_ids, idx_t begin, idx_t end)
+	    : BaseExecutorTask(executor), context(context), block_manager(block_manager), header(header), source(source),
+	      stream_bytes(stream_bytes), block_ids(block_ids), begin(begin), end(end) {
+	}
+	void ExecuteTask() override {
+		const idx_t block_size = block_manager.GetBlockSize();
+		for (idx_t b = begin; b < end; b++) {
+			const idx_t position = b * block_size;
+			auto block = block_manager.CreateBlock(block_ids[b], nullptr);
+			idx_t offset = 0;
+			if (position == 0) {
+				memcpy(block->buffer, &header, sizeof(header));
+				offset = sizeof(header);
+			}
+			const idx_t stop = MinValue<idx_t>(block_size, stream_bytes - position);
+			memcpy(block->buffer + offset, source + position + offset - sizeof(LengthsBlobHeader), stop - offset);
+			memset(block->buffer + stop, 0, block_size - stop);
+			block_manager.Write(QueryContext(context), *block, block_ids[b]);
+		}
+	}
+	string TaskType() const override {
+		return "StoredTranslationLengthBlockTask";
+	}
+
+private:
+	optional_ptr<ClientContext> context;
+	BlockManager &block_manager;
+	const LengthsBlobHeader &header;
+	const_data_ptr_t source;
+	idx_t stream_bytes;
+	const vector<block_id_t> &block_ids;
+	idx_t begin;
+	idx_t end;
+};
+
 template <class TASK>
 void RunTasks(optional_ptr<ClientContext> context, DatabaseInstance &db, CheckpointBuildState &state) {
 	auto executor = MakeExecutor(context, db);
@@ -907,10 +1065,34 @@ bool BuildAtCheckpoint(optional_ptr<ClientContext> context, DatabaseInstance &db
 			}
 		}
 	}
+	// the byte length of every code (a file whose stored translations carry them), slot 0 (NULL) 0, written below when
+	// the longest fits 16 bits
+	unsafe_unique_array<uint16_t> lengths;
+	idx_t lengths_bytes = 0;
+	idx_t max_length = 0;
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&block_manager);
+	if (single_file && single_file->DictionaryEntryLengths() && block_manager.GetBlockSize() % sizeof(uint16_t) == 0) {
+		static constexpr idx_t PARTITIONS_PER_TASK = 64;
+		lengths_bytes = (distinct + 1) * sizeof(uint16_t);
+		state.reservation.Account(lengths_bytes);
+		lengths = make_unsafe_uniq_array_uninitialized<uint16_t>(distinct + 1);
+		lengths[0] = 0;
+		vector<idx_t> longest(DEDUP_PARTITIONS / PARTITIONS_PER_TASK, 0);
+		auto executor = MakeExecutor(context, db);
+		for (idx_t t = 0; t < longest.size(); t++) {
+			executor->ScheduleTask(make_uniq<LengthTask>(*executor, state, lengths.get(), t * PARTITIONS_PER_TASK,
+			                                             (t + 1) * PARTITIONS_PER_TASK, longest[t]));
+		}
+		executor->WorkOnTasks();
+		for (auto value : longest) {
+			max_length = MaxValue(max_length, value);
+		}
+	}
 	state.partitions.reset();
-	// what is left of the working set: the segments' records, bitmaps and old codes (their packed entries are gone)
+	// what is left of the working set: the segments' records, bitmaps and old codes (their packed entries are gone), and
+	// the byte lengths
 	state.reservation.ShrinkTo(state.segments.size() * (sizeof(DedupSegment) + sizeof(reference<ColumnSegment>)) +
-	                           bitmap_bytes_total + old_bytes_total);
+	                           bitmap_bytes_total + old_bytes_total + lengths_bytes);
 
 	// the blob, laid out so that no record crosses a block boundary
 	const idx_t block_size = block_manager.GetBlockSize();
@@ -982,6 +1164,40 @@ bool BuildAtCheckpoint(optional_ptr<ClientContext> context, DatabaseInstance &db
 		memcpy(block->buffer, blob.get() + b * block_size, block_size);
 		block_manager.Write(QueryContext(context), *block, block_id);
 		result.blocks.push_back(block_id);
+	}
+	// the byte-length table: its header, then the lengths, streamed over whole blocks (a column whose longest string
+	// does not fit 16 bits stores none and is read as strings by its byte-length consumers)
+	result.max_length = max_length;
+	if (lengths && max_length <= NumericLimits<uint16_t>::Maximum()) {
+		LengthsBlobHeader lengths_header;
+		memset(&lengths_header, 0, sizeof(lengths_header));
+		lengths_header.magic = LENGTHS_MAGIC;
+		lengths_header.version = LENGTHS_VERSION;
+		lengths_header.storage_index = storage_index;
+		lengths_header.count = distinct + 1;
+		lengths_header.width = sizeof(uint16_t);
+		lengths_header.max_length = max_length;
+		const idx_t length_bytes = sizeof(LengthsBlobHeader) + lengths_bytes;
+		const idx_t length_block_count = (length_bytes + block_size - 1) / block_size;
+		// the block ids in stream order (the ids one writer taking them block by block would get), then the blocks
+		// filled, compressed and written in parallel
+		static constexpr idx_t LENGTH_BLOCKS_PER_TASK = 4;
+		vector<block_id_t> length_block_ids;
+		length_block_ids.reserve(length_block_count);
+		for (idx_t b = 0; b < length_block_count; b++) {
+			length_block_ids.push_back(block_manager.GetFreeBlockIdForCheckpoint());
+		}
+		auto executor = MakeExecutor(context, db);
+		for (idx_t begin = 0; begin < length_block_count; begin += LENGTH_BLOCKS_PER_TASK) {
+			executor->ScheduleTask(make_uniq<LengthBlockTask>(
+			    *executor, context, block_manager, lengths_header, const_data_ptr_cast(lengths.get()), length_bytes,
+			    length_block_ids, begin, MinValue(length_block_count, begin + LENGTH_BLOCKS_PER_TASK)));
+		}
+		executor->WorkOnTasks();
+		for (auto block_id : length_block_ids) {
+			result.length_blocks.push_back(block_id);
+		}
+		result.length_bytes = length_bytes;
 	}
 	return true;
 }
@@ -1060,6 +1276,9 @@ vector<PersistedColumn> PersistAtCheckpoint(optional_ptr<ClientContext> context,
 			continue;
 		}
 		for (auto block_id : existing[e].blocks) {
+			block_manager.MarkBlockAsModified(block_id);
+		}
+		for (auto block_id : existing[e].length_blocks) {
 			block_manager.MarkBlockAsModified(block_id);
 		}
 	}

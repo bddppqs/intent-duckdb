@@ -32,6 +32,19 @@ inline duckdb_re2::StringPiece CreateStringPiece(const string_t &input) {
 }
 
 inline string_t Extract(const string_t &input, Vector &result, const RE2 &re, const duckdb_re2::StringPiece &rewrite) {
+	if (kRegexpReplaceSliceOutput && rewrite.size() == 2 && rewrite[0] == '\\' && rewrite[1] >= '0' &&
+	    rewrite[1] <= '9') {
+		// one group: RE2::Extract's result is the group's bytes of the input, which the result vector references
+		// (RegexExtractFunction); no match, or a group the pattern does not have, gives the empty string
+		const int group = rewrite[1] - '0';
+		duckdb_re2::StringPiece groups[10];
+		const auto text = CreateStringPiece(input);
+		if (group > re.NumberOfCapturingGroups() ||
+		    !re.Match(text, 0, text.size(), RE2::UNANCHORED, groups, group + 1)) {
+			return string_t(nullptr, 0);
+		}
+		return string_t(groups[group].data(), UnsafeNumericCast<uint32_t>(groups[group].size()));
+	}
 	string extracted;
 	RE2::Extract(input.GetString(), re, rewrite, &extracted);
 	return StringVector::AddString(result, extracted.c_str(), extracted.size());
@@ -172,6 +185,7 @@ public:
 //! The options of a constant pattern, which a local state compiles once and runs on many rows
 inline duckdb_re2::RE2::Options ConstantPatternOptions(duckdb_re2::RE2::Options options) {
 	options.set_tagged_dfa(kRegexpTaggedDFA);
+	options.set_tdfa_vector_scan(kRegexpTDFAVectorScan);
 	return options;
 }
 

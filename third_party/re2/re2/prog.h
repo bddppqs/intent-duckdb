@@ -222,10 +222,12 @@ class Prog {
   // EnableTDFA admits; its automata take their memory from the DFA budget.
   // Returns 1 if it matched, 0 if not, and -1 if it gives no answer (not
   // admitted, past its budget, or in use by another thread): the caller then
-  // runs another engine.
+  // runs another engine. vector_scan: a run of bytes on which a state steps to
+  // itself is scanned 16 bytes at a time where the state admits it (tdfa.cc).
   static const int kMaxTDFACapture = 10;
-  void EnableTDFA();
+  void EnableTDFA(bool vector_scan);
   bool tdfa_admitted() const { return tdfa_admitted_; }
+  bool tdfa_vector_scan() const { return tdfa_vector_scan_; }
   int SearchTDFA(const StringPiece& text, const StringPiece& context,
                  MatchKind kind, StringPiece* match, int nmatch);
   int64_t dfa_mem() { return dfa_mem_; }
@@ -461,6 +463,7 @@ class Prog {
   PODArray<uint16_t> charclass_run_tables_;
 
   bool tdfa_admitted_ = false;
+  bool tdfa_vector_scan_ = false;
   int64_t tdfa_budget_ = 0;           // bytes the tagged DFAs may still use
   std::atomic<bool> tdfa_busy_{false};
   TDFA* tdfa_[2][kMaxTDFACapture+1] = {};  // [match ends at the end][nmatch]
