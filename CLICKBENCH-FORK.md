@@ -2,8 +2,9 @@
 
 DuckDB v1.5.5 plus a series of engine changes, published so that the ClickBench entry `intent-gizmosql` can
 be built from source. Every change sits after upstream's release commit (`d8cdaa33fda8df955cc76ef58a280f68f4cd43fa`) and is summarised
-in this document. Tags never move: `v1.5.5-clickbench.1`, `v1.5.5-intent.2`, `v1.5.5-intent.3`,
-`v1.5.5-intent.4` and `v1.5.5-intent.5` are the earlier releases, `v1.5.5-intent.6` the tree the entry runs.
+in this document. Tags never move: `v1.5.5-clickbench.1`, `v1.5.5-intent.2`, `v1.5.5-intent.3`, `v1.5.5-intent.4`,
+`v1.5.5-intent.5` and `v1.5.5-intent.6` are the earlier releases, `v1.5.5-intent.8` the tree the entry runs.
+intent.7 had no release of its own; its changes are part of `v1.5.5-intent.8`.
 
 ## What changed
 
@@ -16,25 +17,39 @@ in this document. Tags never move: `v1.5.5-clickbench.1`, `v1.5.5-intent.2`, `v1
   last-key fold, `count(DISTINCT x)` by a code bitmap or an integer set, and early removal of constant group keys; a
   shared filter order per scan, a lock-free Top-N bound and `<> ''` pruning by the non-empty minimum; a tagged DFA for
   regular-expression submatches and `regexp_replace` without `'g'` in place; the row-group index (below), a shared
-  Top-N boundary heap with a wave gate (off by default), and run-fed `count(DISTINCT x)` sets.
-- Storage: new database files created at the latest storage version use storage version 0x40000004, and files at 0x40000001, 0x40000002 and 0x40000003 still open; their blocks are zstd-compressed at level 9 with 64 or more threads and 3 otherwise, set on this workload, and the setting zstd_block_compression_level overrides it. At each checkpoint a table also writes a row-group index after its row-group pointers: the
+  Top-N boundary heap with a wave gate (off by default), and run-fed `count(DISTINCT x)` sets; the decoded byte length
+  of every stored code, a Top-N on one `COUNT` output handed to the fused kernel, `strlen` and `bit_length` from the
+  stored byte lengths, the tagged DFA's 16-byte self-loop scan, slice results of `regexp_replace` and
+  `regexp_extract`, and RE2's tagged-DFA option fix.
+- Storage: new database files created at the latest storage version use storage version 0x40000005, and files at 0x40000001, 0x40000002, 0x40000003 and 0x40000004 still open; their blocks are zstd-compressed at level 9 with 64 or more threads and 3 otherwise, set on this workload, and the setting zstd_block_compression_level overrides it. At each checkpoint a table also writes a row-group index after its row-group pointers: the
   position of every row-group pointer and, column by column, every row group's column statistics as a load of the column
   computes them. The engine writes it by itself for every table, in the same database file. Nothing of it is read at
   attach; a table's first scan requests the index's metadata blocks at once, loads the remaining row-group pointers in
   parallel, and reads the statistics of a column it has not loaded from the index. Nested, geometry and variant columns
-  store none. In v1.5.5-intent.6, the stored translations of a VARCHAR column also hold the decoded byte length of
-  every code (16 bits each).
-- Aggregation: a Top-N ordered by one `COUNT` output of the fused kernel's grouped class hands the kernel its direction
-  and limit + offset, and each of the kernel's tasks emits only that many of the groups it builds; `strlen` and
-  `bit_length` of a column that a scan reads as codes read the stored byte lengths instead of the strings.
-- Regular expressions: the tagged DFA scans a run of bytes on which a state steps to itself 16 bytes at a time (SSE2
-  or NEON); `regexp_replace`'s one-group rewrite of a match that spans the input and `regexp_extract`'s one group
-  return a slice of the input, which the result references; and a fix: RE2's canned-options constructor initialises
-  the tagged-DFA option.
+  store none. In v1.5.5-intent.8, a new file's extents start at multiples of 512 bytes instead of 4 KiB, and a
+  bit-packed group may be stored as PATCHED_FOR: offsets from a base at a narrower width than FOR's, with at most 1 % of
+  its values stored raw beside their 16-bit positions, chosen when that takes fewer bytes than the group's other mode.
+  At the end of each collection of a bulk append into a block-compressed file, every column's partially filled blocks
+  are written as they are, one column's segments per block, instead of being merged into blocks shared by all columns.
+  The new setting `zstd_bulk_write_compression_level` (0, the default, leaves `zstd_block_compression_level` in force)
+  sets the zstd level of the blocks a bulk append writes.
+- Aggregation: a chunk whose group keys are all constant updates its one group's state by one update per aggregate;
+  grouped `count(DISTINCT x)` counts each new (group, value) pair as it inserts it, keeps each table's slot bits beside
+  its capacity and merges its group tables over slot ranges in parallel; the folds copy 16-byte rows at a fixed width;
+  an integer `AVG` whose sum and count are both below 2^53 divides in double; and after an ungrouped aggregate a
+  pipeline sizes its chunks to the one row its source returns.
+- Scans and filters: a pushed `OR` of 2 to 32 equality comparisons with constants on one integer column is evaluated in
+  one pass through a collision-free table of the constants; an RLE scan keeps its run state in locals; the DICT_FSST
+  single-code filter builds its block mask with Advanced SIMD on aarch64; and a negated `contains` or `LIKE` filter is
+  evaluated on the rows without a segment-skip check of the segment's dictionary.
+- Regular expressions: the tagged DFA runs a constant pattern on the thread that owns its state without the busy flag,
+  and `regexp_replace` without `'g'` parses a constant rewrite once per call instead of once per string.
 
-No SQL syntax or function is added. Results are upstream's except the choice SQL leaves open under `GROUP BY … LIMIT k`
-and among tied rows under `ORDER BY … LIMIT k`, and the `MIN`/`MAX` fix. A server keeps the dictionaries, verdicts, stored translations and their byte lengths, and the row-group index entries
-it reads for its lifetime.
+No SQL syntax or function is added; the fork's settings are `zstd_block_compression_level` and, new in this release,
+`zstd_bulk_write_compression_level`. Results are upstream's except the choice SQL leaves open under `GROUP BY … LIMIT k`
+and among tied rows under `ORDER BY … LIMIT k`, the `MIN`/`MAX` fix, and an integer `AVG` divided in double, which is
+the correctly rounded quotient. A server keeps the dictionaries, verdicts, stored translations and their byte lengths,
+and the row-group index entries it reads for its lifetime.
 
 ## Tuning
 
@@ -53,16 +68,22 @@ remaining row-group pointers in parallel when at least `PARALLEL_ROW_GROUP_LOAD_
 max(4, ceil(N / 4T)) pointers for N pointers and T threads; with `kTopNWaveGate` enabled (it is off by default), an
 ordered parallel scan under a Top-N bound hands out a prefix of `TOPN_WAVE_PREFIX_VECTORS` (4) vectors and then admits
 at most `TOPN_WAVE_WINDOW` (16) hand-outs in flight while the bound is set (both in
-`src/storage/table/row_group_collection.cpp`). The other bounds, the build-time flags
-(among them `kPersistedRowGroupIndex`,
-`kPersistedRowGroupStatistics`, `kParallelRowGroupLoad`, `kPersistedIndexReadAhead`, `kFusedRunFedDistinctSet`,
-`kFusedSetSourceRelease`, `kDictionaryEntryLengths`, `kFusedSourceTopK`, `kRegexpTDFAVectorScan` and
-`kRegexpReplaceSliceOutput`, enabled on both architectures, and `kTopNWaveGate`, disabled) and the per-architecture
-defaults are in `src/include/duckdb/common/tuning_defaults.hpp`:
+`src/storage/table/row_group_collection.cpp`). A bulk append writes partially filled blocks apart only under a memory
+limit of at least `kColumnPartialBlocksApartMinMemory` (48 GiB): each such block is held whole until it is written. The
+other bounds, the build-time flags (among them `kPersistedRowGroupIndex`, `kPersistedRowGroupStatistics`,
+`kParallelRowGroupLoad`, `kPersistedIndexReadAhead`, `kFusedRunFedDistinctSet`, `kFusedSetSourceRelease`,
+`kDictionaryEntryLengths`, `kFusedSourceTopK`, `kRegexpTDFAVectorScan`, `kRegexpReplaceSliceOutput`,
+`kConstantKeySimpleUpdate`, `kFusedDistinctInsertTimeGroups`, `kFusedGroupTableCachedBits`, `kFusedSlotRangeFinalMerge`,
+`kFusedFixedWidthRowCopy`, `kAverageDoubleFinalize`, `kBoundedPostAggregateChunks`, `kOrEqualsFilterOnePass`,
+`kRleScanRunsLocalState`, `kRegexpThreadPrivateTDFA`, `kRegexpReplaceRewritePlan`, `kColumnPartialBlocksApart`,
+`kExtent512Alignment` and `kPatchedForBitpacking`, enabled on both architectures, `kSingleCodeFilterBlockMaskNeon`,
+enabled (its code is compiled on aarch64 only), and `kTopNWaveGate` and `kDictionarySegmentSkipNegated`, disabled) and
+the per-architecture defaults are in
+`src/include/duckdb/common/tuning_defaults.hpp`:
 `kGlobalDictionaryFusedDistinct`, `kFusedIntegerAggregateVarcharKeys` and `kBorrowedStringGroupKeys` are enabled on x86-64 and
 disabled on arm64 (aarch64). The bundled jemalloc is built with `JEMALLOC_HAVE_MADVISE_HUGE`. Developed and evaluated
 against the 43 ClickBench queries; the version string stays `v1.5.5` so that extensions resolve as for
-upstream. GizmoSQL (https://github.com/bddppqs/intent-gizmosql, tag `v1.38.0-intent.6`) embeds this tree.
+upstream. GizmoSQL (https://github.com/bddppqs/intent-gizmosql, tag `v1.38.0-intent.8`) embeds this tree.
 
 ## License
 
