@@ -249,6 +249,11 @@ public:
 	//! arrive through Sink, and a run-fed state's drain re-sinks its rows into the distinct table through the radix path's
 	//! SinkRuns
 	bool set_runs = false;
+	//! the insert-time groups of the grouped DISTINCT class (kFusedDistinctInsertTimeGroups): with the stored hash and no
+	//! sum word in its (g, x) entry, phase 2's (g, x) build adds distinct 1 to g's group entry when it inserts a new
+	//! (g, x), and no sweep of the partition's (g, x) table follows (FusedFoldPartition); the (g, x) entry's count word
+	//! holds the build's stamp instead of a count
+	bool insert_groups = false;
 	shared_ptr<dict_global::ColumnDictionary> bitmap_dict;
 	idx_t bitmap_words;
 	//! the coverage bound: the scanned table's storage, re-read at every execution (GetGlobalSinkState): the
@@ -279,6 +284,8 @@ struct FusedGroupTable {
 	uint64_t *entries = nullptr;
 	idx_t capacity = 0;
 	idx_t occupancy = 0;
+	//! FusedTableBits(capacity), set with the capacity (read by the adds under kFusedGroupTableCachedBits)
+	idx_t bits = 0;
 };
 
 //! A thread's partition lists after its Combine: every chunk it filled, the slabs that hold them, per-partition rows

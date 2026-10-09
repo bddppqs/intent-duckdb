@@ -1,0 +1,67 @@
+# name: test/sql/storage/compression/dict_fsst/dict_fsst_segment_skip_negated.test
+# description: The per-segment dictionary skip leaves a negated canonical filter (NOT contains, NOT LIKE '%x%') to the row path: persistent DICT_FSST segments where every non-NULL entry holds the needle, where none does, and NULLs, alone and beside a positive contains on the same column, each query twice per server (the second read from the verdict slot) at threads 1 and 8; the answers are the plain engine answers
+# group: [dict_fsst]
+
+load {TEST_DIR}/dict_fsst_segment_skip_negated.db readwrite v1.5.0
+
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_neg AS SELECT i::BIGINT AS i, CASE WHEN i % 997 = 0 THEN NULL WHEN i < 150000 THEN 'https://x.example.com/' || md5(i::VARCHAR) ELSE 'https://y.example.org/' || md5(i::VARCHAR) END AS s FROM range(300000) tbl(i)
+
+statement ok
+CHECKPOINT
+
+restart
+
+query I
+SELECT count(*) > 0 AND bool_and(compression = 'DICT_FSST') FROM pragma_storage_info('t_neg') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+loop r 0 2
+
+# NOT contains: every entry of the first half's segments holds the needle, no entry of the second half's does
+query I
+SELECT count(*) FROM t_neg WHERE NOT contains(s, 'x.example')
+----
+149850
+
+# NOT LIKE '%x%' (the optimizer's NOT contains)
+query I
+SELECT count(*) FROM t_neg WHERE s NOT LIKE '%x.example%'
+----
+149850
+
+# every non-NULL entry holds the needle
+query I
+SELECT count(*) FROM t_neg WHERE NOT contains(s, 'example')
+----
+0
+
+# a positive contains still answers beside the negated filter on the same column
+query II
+SELECT count(*) FILTER (WHERE contains(s, 'x.example')), count(*) FILTER (WHERE NOT contains(s, 'x.example')) FROM t_neg
+----
+149849	149850
+
+# both forms pushed into one scan
+query I
+SELECT count(*) FROM t_neg WHERE contains(s, 'example') AND NOT contains(s, 'x.example')
+----
+149850
+
+query I
+SELECT count(*) FROM t_neg WHERE contains(s, 'y.example') AND s NOT LIKE '%x.example%' AND i >= 150000
+----
+149850
+
+endloop
+
+endloop

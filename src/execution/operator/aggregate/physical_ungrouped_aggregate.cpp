@@ -805,6 +805,12 @@ OrderPreservationType PhysicalUngroupedAggregate::SourceOrder() const {
 	return PhysicalOperator::SourceOrder();
 }
 
+idx_t PhysicalUngroupedAggregate::SourceRowBound() const {
+	// GetDataInternal writes the one row of GlobalUngroupedAggregateState::Finalize, unless the fused kernel owns the
+	// source
+	return fused ? STANDARD_VECTOR_SIZE : 1;
+}
+
 SourceResultType PhysicalUngroupedAggregate::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                              OperatorSourceInput &input) const {
 	if (fused) {

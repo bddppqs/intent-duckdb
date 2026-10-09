@@ -531,6 +531,48 @@ optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups
 	return new_group_count;
 }
 
+//! Whether one simple update per aggregate on a constant-key chunk's one state gives exactly the state the per-row
+//! update gives: COUNT, MIN and MAX of at most one argument of any type, and SUM and AVG of one integer argument of at
+//! most 64 bits or one DECIMAL of width 18 or less. Their simple update folds a constant input by its count; over these
+//! inputs that product cannot overflow where the row-at-a-time sum does not, and integer arithmetic is exact. A table
+//! with a DISTINCT or FILTER aggregate, a missing simple update or any other aggregate keeps the per-row update.
+static bool ConstantKeySimpleUpdateAdmits(const TupleDataLayout::Aggregates &aggregates, const DataChunk &payload,
+                                          const unsafe_vector<idx_t> &filter) {
+	idx_t filter_idx = 0;
+	idx_t payload_idx = 0;
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto &aggr = aggregates[i];
+		if (aggr.aggr_type == AggregateType::DISTINCT || aggr.filter) {
+			return false;
+		}
+		if (filter_idx >= filter.size() || i < filter[filter_idx]) {
+			payload_idx += aggr.child_count;
+			continue;
+		}
+		filter_idx++;
+		if (!aggr.function.HasStateSimpleUpdateCallback() || aggr.child_count > 1) {
+			return false;
+		}
+		auto &name = aggr.function.name;
+		if (name == "count_star" || name == "count" || name == "min" || name == "max") {
+			payload_idx += aggr.child_count;
+			continue;
+		}
+		if ((name != "sum" && name != "sum_no_overflow" && name != "avg") || aggr.child_count != 1) {
+			return false;
+		}
+		auto &type = payload.data[payload_idx].GetType();
+		const bool exact_integer = type.IsIntegral() && type.InternalType() != PhysicalType::INT128 &&
+		                           type.InternalType() != PhysicalType::UINT128;
+		const bool exact_decimal = type.id() == LogicalTypeId::DECIMAL && type.InternalType() != PhysicalType::INT128;
+		if (!exact_integer && !exact_decimal) {
+			return false;
+		}
+		payload_idx += aggr.child_count;
+	}
+	return true;
+}
+
 optional_idx GroupedAggregateHashTable::TryAddConstantGroups(DataChunk &groups, DataChunk &payload,
                                                              const unsafe_vector<idx_t> &filter) {
 #ifndef DEBUG
@@ -565,6 +607,28 @@ optional_idx GroupedAggregateHashTable::TryAddConstantGroups(DataChunk &groups, 
 	auto new_dict_addresses = FlatVector::GetData<uintptr_t>(new_dictionary_pointers);
 	auto result_addresses = FlatVector::GetData<uintptr_t>(state.addresses);
 	uintptr_t aggregate_address = new_dict_addresses[0] + layout_ptr->GetAggrOffset();
+	if (kConstantKeySimpleUpdate && ConstantKeySimpleUpdateAdmits(aggregates, payload, filter)) {
+		// every selected aggregate takes the chunk's rows into the one state by its simple update, in row order, as
+		// UpdateAggregates walks the aggregates and their payload columns
+		const MinMaxArenaScope min_max_string_arena(state.row_state.allocator,
+		                                               buffer_manager.GetMaxMemory() >= dict_global::SMALL_MEMORY_LIMIT);
+		auto state_ptr = reinterpret_cast<data_ptr_t>(aggregate_address);
+		idx_t filter_idx = 0;
+		idx_t payload_idx = 0;
+		for (idx_t i = 0; i < aggregates.size(); i++) {
+			auto &aggr = aggregates[i];
+			if (filter_idx < filter.size() && i == filter[filter_idx]) {
+				AggregateInputData aggr_input_data(aggr.GetFunctionData(), state.row_state.allocator);
+				aggr.function.GetStateSimpleUpdateCallback()(aggr.child_count == 0 ? nullptr : &payload.data[payload_idx],
+				                                             aggr_input_data, aggr.child_count, state_ptr, payload.size());
+				filter_idx++;
+			}
+			payload_idx += aggr.child_count;
+			state_ptr += aggr.payload_size;
+		}
+		Verify();
+		return new_group_count;
+	}
 	for (idx_t i = 0; i < payload.size(); i++) {
 		result_addresses[i] = aggregate_address;
 	}

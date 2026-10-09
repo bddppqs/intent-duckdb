@@ -1,0 +1,124 @@
+# name: test/sql/function/string/regexp_replace_rewrite_plan.test
+# description: regexp_replace without the 'g' option parses a constant rewrite once per call (kRegexpReplaceRewritePlan):
+#              its highest group, its validity and its literal bytes. Every rewrite shape (one group, the whole match,
+#              groups around literals, repeated and out-of-order groups, an escaped backslash, a digit after a group, a
+#              group the pattern lacks, an invalid escape, a trailing backslash, the empty rewrite) must give the answer
+#              the same rewrite gives as a per-row column, which is parsed per string, and the written-out values.
+# group: [string]
+
+load {TEST_DIR}/regexp_replace_rewrite_plan.db readwrite v1.5.0
+
+statement ok
+CREATE TABLE inputs(s VARCHAR);
+
+statement ok
+INSERT INTO inputs VALUES ('alpha=one'), ('beta=two;tail'), ('no match here'), (''), (NULL), ('x=y'), ('gamma=' || repeat('long', 20)), ('d' || chr(228) || 'lta=' || chr(20013));
+
+# the rewrites as a per-row column: parsed per string
+statement ok
+CREATE TABLE pairs AS SELECT s, r FROM inputs, (VALUES ('\1'), ('\0'), ('[\1|\2]'), ('\2\1\2'), ('\\'), ('a\\b\1'), ('\10'), ('\3'), ('\x'), ('abc\'), (''), ('plain text')) rw(r);
+
+# every shape as a constant rewrite (the plan) against the same rewrite read per row
+query I
+WITH c AS (
+   SELECT s, '\1' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\1') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\0' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\0') AS v FROM inputs
+   UNION ALL
+   SELECT s, '[\1|\2]' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '[\1|\2]') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\2\1\2' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\2\1\2') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\\' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\\') AS v FROM inputs
+   UNION ALL
+   SELECT s, 'a\\b\1' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', 'a\\b\1') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\10' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\10') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\3' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\3') AS v FROM inputs
+   UNION ALL
+   SELECT s, '\x' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '\x') AS v FROM inputs
+   UNION ALL
+   SELECT s, 'abc\' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', 'abc\') AS v FROM inputs
+   UNION ALL
+   SELECT s, '' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', '') AS v FROM inputs
+   UNION ALL
+   SELECT s, 'plain text' AS r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', 'plain text') AS v FROM inputs),
+p AS (SELECT s, r, regexp_replace(s, '^([a-z' || chr(228) || ']+)=([^;]*)', r) AS v FROM pairs)
+SELECT count(*) FROM ((SELECT * FROM p EXCEPT ALL SELECT * FROM c) UNION ALL (SELECT * FROM c EXCEPT ALL SELECT * FROM p))
+----
+0
+
+query I
+SELECT count(*) FROM pairs
+----
+96
+
+# written-out values: groups around literals, the whole match, an escaped backslash, a digit after a group
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '[\1|\2]')
+----
+[beta|two];tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '<\0>')
+----
+<beta=two>;tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', 'a\\b\1')
+----
+a\bbeta;tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '\10')
+----
+beta0;tail
+
+# a group the pattern lacks, an invalid escape and a trailing backslash leave the input unchanged
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '\3')
+----
+beta=two;tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '\x')
+----
+beta=two;tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', 'abc\')
+----
+beta=two;tail
+
+# the empty rewrite and a NULL rewrite
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', '')
+----
+;tail
+
+query T
+SELECT regexp_replace('beta=two;tail', '^([a-z]+)=([^;]*)', NULL)
+----
+NULL
+
+# many rows over a dictionary-compressed column (the per-entry evaluation) against the per-row rewrite
+statement ok
+CREATE TABLE t(i BIGINT, s VARCHAR USING COMPRESSION 'dict_fsst', r VARCHAR);
+
+statement ok
+INSERT INTO t SELECT i, CASE WHEN i % 31 = 0 THEN NULL ELSE (CASE WHEN i % 2 = 0 THEN 'https://' ELSE 'http://www.' END) || 'host' || (i % 300)::VARCHAR || '.example/' || (i % 7)::VARCHAR END, '<\1>' FROM range(50000) r(i);
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) FROM t
+WHERE regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '<\1>') IS DISTINCT FROM regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', r)
+----
+0
+
+query IT
+SELECT count(*), min(regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '<\1>')) FROM t WHERE s IS NOT NULL
+----
+48387	<host0.example>

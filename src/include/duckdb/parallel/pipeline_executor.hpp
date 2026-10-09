@@ -73,6 +73,8 @@ public:
 
 	//! Initializes a chunk with the types that will flow out of the chunk
 	void InitializeChunk(DataChunk &chunk);
+	//! As above, with room for `capacity` rows
+	void InitializeChunk(DataChunk &chunk, idx_t capacity);
 	//! Execute a pipeline without a sink, and retrieve a single DataChunk
 	//! Returns an empty chunk when finished.
 

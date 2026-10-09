@@ -1,0 +1,123 @@
+# name: test/sql/aggregate/distinct/distinct_insert_groups.test
+# description: The grouped DISTINCT class's insert-time groups (kFusedDistinctInsertTimeGroups): the marker groups=insert on
+#              the grouped shapes whose (g, x) build reads the stored bits (one key, two keys at the 12-byte key bound, the
+#              mixed shape) and its absence on the ungrouped (set member), the non-DISTINCT and the refused (nullable x)
+#              shapes; answers from the generator for groups spanning every partition, one group holding every row, a group
+#              table that grows, the mixed shape's companion aggregates and NULL keys (the drain), at threads 1, 2 and 8
+#              (one task building every partition over one stamped buffer, and several tasks merging)
+# group: [distinct]
+
+# t1: g = i % 3, x = i // 3: each x meets every g once, so each g holds 800,000 distinct x spread over every partition;
+# SMALLINT v = i % 11
+statement ok
+CREATE TABLE t1 AS SELECT (i % 3)::INTEGER AS g, (i // 3)::BIGINT AS x, (i % 11)::SMALLINT AS v FROM range(2400000) t(i);
+
+# t2: one group holding 2,200,000 distinct x
+statement ok
+CREATE TABLE t2 AS SELECT 7::INTEGER AS g, i::BIGINT AS x FROM range(2200000) t(i);
+
+# t3: 300,000 groups (the group table grows past its first capacity): each g holds 7 or 8 distinct x
+statement ok
+CREATE TABLE t3 AS SELECT (i % 300000)::INTEGER AS g, (i // 300000)::BIGINT AS x FROM range(2200000) t(i);
+
+# t4: a nullable g with a NULL every 1,000 rows (a NULL crosses: the operator drains to the general path)
+statement ok
+CREATE TABLE t4 AS SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE (i % 3)::INTEGER END AS g, (i // 3)::BIGINT AS x FROM range(2400000) t(i);
+
+# t5: two SMALLINT keys and a BIGINT x (the 12-byte key region): 200 groups of 5,500 distinct x
+statement ok
+CREATE TABLE t5 AS SELECT (i % 10)::SMALLINT AS g1, ((i // 10) % 20)::SMALLINT AS g2, (i // 400)::BIGINT AS x FROM range(2200000) t(i);
+
+# t6: a nullable x (the class is refused at plan time)
+statement ok
+CREATE TABLE t6 AS SELECT (i % 3)::INTEGER AS g, CASE WHEN i % 1000 = 0 THEN NULL ELSE (i // 3)::BIGINT END AS x FROM range(2400000) t(i);
+
+# the marker: the grouped shapes
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*groups=insert.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(v) AS s, avg(v) AS a FROM t1 GROUP BY g
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*groups=insert.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g1, g2, count(DISTINCT x) AS u FROM t5 GROUP BY g1, g2
+----
+physical_plan	<REGEX>:.*"Fused Distinct Aggregate": "[^"]*groups=insert.*
+
+# its absence: the ungrouped shape (the set member), a non-DISTINCT grouped shape, the refused nullable x
+query II
+EXPLAIN (FORMAT JSON) SELECT count(DISTINCT x) FROM t1
+----
+physical_plan	<!REGEX>:.*groups=insert.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(*) AS c FROM t1 GROUP BY g
+----
+physical_plan	<!REGEX>:.*groups=insert.*
+
+query II
+EXPLAIN (FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM t6 GROUP BY g
+----
+physical_plan	<!REGEX>:.*groups=insert.*
+
+foreach threads 1 2 8
+
+statement ok
+SET threads=${threads}
+
+# groups spanning every partition
+query II
+SELECT g, count(DISTINCT x)::BIGINT AS u FROM t1 GROUP BY g ORDER BY g
+----
+0	800000
+1	800000
+2	800000
+
+# the mixed shape: the companion's aggregates beside the distinct count
+query IIIII
+SELECT g, count(DISTINCT x)::BIGINT AS u, count(*)::BIGINT AS c, sum(v)::BIGINT AS s, round(avg(v) * count(*))::BIGINT FROM t1 GROUP BY g ORDER BY g
+----
+0	800000	800000	3999994	3999994
+1	800000	800000	3999997	3999997
+2	800000	800000	4000000	4000000
+
+# one group holding every row
+query II
+SELECT g, count(DISTINCT x)::BIGINT AS u FROM t2 GROUP BY g
+----
+7	2200000
+
+# a group table that grows
+query IIIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT, count(*) FILTER (WHERE u = 8)::BIGINT FROM (SELECT g, count(DISTINCT x) AS u FROM t3 GROUP BY g)
+----
+300000	2200000	7	8	100000
+
+# NULL keys
+query II
+SELECT g, count(DISTINCT x)::BIGINT AS u FROM t4 GROUP BY g ORDER BY g NULLS LAST
+----
+0	799200
+1	799200
+2	799200
+NULL	2400
+
+# two keys
+query IIII
+SELECT count(*)::BIGINT, sum(u)::BIGINT, min(u)::BIGINT, max(u)::BIGINT FROM (SELECT g1, g2, count(DISTINCT x) AS u FROM t5 GROUP BY g1, g2)
+----
+200	1100000	5500	5500
+
+# the refused nullable x (the general path)
+query II
+SELECT g, count(DISTINCT x)::BIGINT AS u FROM t6 GROUP BY g ORDER BY g
+----
+0	799200
+1	799200
+2	799200
+
+endloop

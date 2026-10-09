@@ -59,6 +59,9 @@ public:
 	//! Parallel, and NO_ORDER (so the result collector can go parallel), while fused; the defaults otherwise
 	bool ParallelSource() const override;
 	OrderPreservationType SourceOrder() const override;
+	//! The most rows one GetData call writes into its chunk: one (the finalized states), or STANDARD_VECTOR_SIZE when
+	//! the fused kernel may own the source
+	idx_t SourceRowBound() const;
 
 public:
 	// Sink interface

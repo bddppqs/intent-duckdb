@@ -166,12 +166,12 @@ DETACH vnew
 statement ok
 DETACH vold
 
-# a new block-compressed file is created at a version that admits FOR_SCALED (0x40000004, little-endian after the
+# a new block-compressed file is created at a version that admits FOR_SCALED (0x40000005, little-endian after the
 # magic "DUCK"); the v1.4.0 file keeps upstream's 67
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_new.db')
 ----
-4455434B	0400004000000000
+4455434B	0500004000000000
 
 query II
 SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/for_scaled_old.db')

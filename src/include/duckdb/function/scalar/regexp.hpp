@@ -182,10 +182,12 @@ public:
 	duckdb_re2::StringPiece *group_buffer;
 };
 
-//! The options of a constant pattern, which a local state compiles once and runs on many rows
+//! The options of a constant pattern, which a local state compiles once and runs on many rows; the local state belongs
+//! to one expression executor, which one thread runs at a time, so the pattern is thread-private
 inline duckdb_re2::RE2::Options ConstantPatternOptions(duckdb_re2::RE2::Options options) {
 	options.set_tagged_dfa(kRegexpTaggedDFA);
 	options.set_tdfa_vector_scan(kRegexpTDFAVectorScan);
+	options.set_tdfa_thread_private(kRegexpThreadPrivateTDFA);
 	return options;
 }
 

@@ -1,0 +1,96 @@
+# name: test/sql/storage/block_compression/extent_512_alignment.test
+# description: The extents of a file at the format-riders version start at multiples of 512 bytes, not of the 4 KiB page; checkpoints, deletes and reopening keep that alignment and the rows
+# group: [block_compression]
+
+require block_size 262144
+
+require skip_reload
+
+# a little-endian u64 at a byte offset of a file's hex
+statement ok
+CREATE MACRO le_u64(x, b) AS ('0x' || substr(x, 2 * b::BIGINT + 15, 2) || substr(x, 2 * b::BIGINT + 13, 2) || substr(x, 2 * b::BIGINT + 11, 2) ||
+	substr(x, 2 * b::BIGINT + 9, 2) || substr(x, 2 * b::BIGINT + 7, 2) || substr(x, 2 * b::BIGINT + 5, 2) || substr(x, 2 * b::BIGINT + 3, 2) ||
+	substr(x, 2 * b::BIGINT + 1, 2))::UBIGINT
+
+# the live extents of a block-compressed file: the extent map of the newer database header (its iteration at +8, the
+# map's offset at +64 and entry count at +72), each entry an offset (u64) and a stored length (u32)
+statement ok
+CREATE MACRO extents(path) AS TABLE
+	WITH f AS (SELECT hex(content) AS x FROM read_blob(path)),
+	h AS (SELECT le_u64(x, o + 8) AS iteration, le_u64(x, o + 64) AS map_offset, le_u64(x, o + 72) AS entries
+	      FROM f, (VALUES (4096), (8192)) v(o)),
+	a AS (SELECT map_offset, entries FROM h ORDER BY iteration DESC LIMIT 1)
+	SELECT le_u64(x, map_offset + 32 + 12 * i) AS off FROM f, a, range(entries::BIGINT) r(i)
+
+statement ok
+ATTACH '__TEST_DIR__/extent_512.db' AS x512 (STORAGE_VERSION 'latest')
+
+statement ok
+CREATE TABLE x512.t AS SELECT i, hash(i) AS h, (i * 7919) % 100003 AS m, 'row ' || (i * 31 % 9973)::VARCHAR AS s
+FROM range(1500000) r(i)
+
+statement ok
+CREATE TABLE x512.small AS SELECT i FROM range(10) r(i)
+
+statement ok
+CHECKPOINT x512
+
+statement ok
+DETACH x512
+
+# every live extent starts at a multiple of 512, and some not at a multiple of 4096
+query II
+SELECT count(*) FILTER (off <> 0 AND off % 512 <> 0), count(*) FILTER (off % 4096 <> 0) > 0 FROM extents('__TEST_DIR__/extent_512.db')
+----
+0	true
+
+# the format-riders version 0x40000005 in the main header
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/extent_512.db')
+----
+4455434B	0500004000000000
+
+statement ok
+ATTACH '__TEST_DIR__/extent_512.db' AS x512
+
+query IIII
+SELECT count(*), sum(m), sum(h % 1000), count(DISTINCT s) FROM x512.t
+----
+1500000	75001345892	749389137	9973
+
+# a delete and an update, checkpointed: freed extents are reused at 512-byte offsets
+statement ok
+DELETE FROM x512.t WHERE i % 3 = 0
+
+statement ok
+UPDATE x512.t SET m = m + 1 WHERE i % 5 = 0
+
+statement ok
+CHECKPOINT x512
+
+statement ok
+INSERT INTO x512.t SELECT i, hash(i), (i * 7919) % 100003, 'new ' || i::VARCHAR FROM range(1500000, 1700000) r(i)
+
+statement ok
+CHECKPOINT x512
+
+statement ok
+DETACH x512
+
+query I
+SELECT count(*) FILTER (off <> 0 AND off % 512 <> 0) FROM extents('__TEST_DIR__/extent_512.db')
+----
+0
+
+statement ok
+ATTACH '__TEST_DIR__/extent_512.db' AS x512
+
+query IIII
+SELECT count(*), sum(m), count(*) FILTER (s LIKE 'new %'), max(i) FROM x512.t
+----
+1200000	60001349505	200000	1699999
+
+query I
+SELECT sum(i) FROM x512.small
+----
+45

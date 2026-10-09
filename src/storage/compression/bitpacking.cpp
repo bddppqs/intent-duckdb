@@ -125,6 +125,44 @@ static void ApplyScaledFrameOfReference(T *dst, T frame_of_reference, T divisor,
 	throw InternalException("Invalid bitpacking mode");
 }
 
+//===--------------------------------------------------------------------===//
+// PATCHED_FOR (kPatchedForBitpacking)
+//===--------------------------------------------------------------------===//
+//! A group whose valid values' offsets from the minimum, divided by their common divisor d (FOR_SCALED's, 1 without
+//! one), mostly fall in a window [lo, lo + 2^b) narrower than FOR's width stores: base = minimum + lo * d, b and d (T
+//! each), the exception count and a pad (u16 each), each exception's position in the group (u16) and raw value (T),
+//! then the in-window offsets minus lo packed at width b (0 for an exception or a NULL). A scan computes
+//! packed * d + base and writes the exceptions back. At most 1 % of a group's values are exceptions.
+static constexpr idx_t BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS = BITPACKING_METADATA_GROUP_SIZE / 100;
+
+static bool PatchedForAllowed(BlockManager &block_manager) {
+	if (!kPatchedForBitpacking) {
+		return false;
+	}
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&block_manager);
+	return single_file && single_file->PatchedForFile();
+}
+
+//! The bytes of a PATCHED_FOR group: base, width and divisor, the exception count and pad, the exceptions, the packing
+template <class T>
+static idx_t PatchedForBytes(idx_t count, bitpacking_width_t width, idx_t exceptions) {
+	return 3 * sizeof(T) + 2 * sizeof(uint16_t) + exceptions * (sizeof(uint16_t) + sizeof(T)) +
+	       BitpackingPrimitives::GetRequiredSize(count, width);
+}
+
+//! The bit width of an unsigned offset, rounded as BitpackingPrimitives rounds a T width (a width within sizeof(T) bits
+//! of the type's is the type's)
+template <class T>
+static bitpacking_width_t PatchedForWidth(uint64_t value) {
+	bitpacking_width_t width = 0;
+	while (value) {
+		width++;
+		value >>= 1;
+	}
+	const bitpacking_width_t bits_of_type = sizeof(T) * 8;
+	return width + sizeof(T) > bits_of_type ? bits_of_type : width;
+}
+
 struct EmptyBitpackingWriter {
 	template <class T>
 	static void WriteConstant(T constant, idx_t count, void *data_ptr, bool all_invalid) {
@@ -144,6 +182,10 @@ struct EmptyBitpackingWriter {
 	template <class T>
 	static void WriteForScaled(T *values, bool *validity, bitpacking_width_t width, T frame_of_reference, T divisor,
 	                           idx_t count, void *data_ptr) {
+	}
+	template <class T>
+	static void WritePatchedFor(T *values, bitpacking_width_t width, T base, T divisor, idx_t count,
+	                            const uint16_t *positions, const T *exceptions, idx_t exception_count, void *data_ptr) {
 	}
 };
 
@@ -188,6 +230,11 @@ public:
 	BitpackingMode mode = BitpackingMode::AUTO;
 	// FOR may be written as FOR_SCALED (ScaledFrameOfReferenceAllowed)
 	bool allow_scaled = false;
+	// a non-constant group may be written as PATCHED_FOR (PatchedForAllowed)
+	bool allow_patched_for = false;
+	// PATCHED_FOR's working set: the exceptions of the group it writes
+	uint16_t patched_positions[BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS];
+	T patched_exceptions[BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS];
 
 public:
 	void Reset() {
@@ -287,6 +334,141 @@ public:
 		}
 	}
 
+	//! Writes the group as PATCHED_FOR when its bytes are fewer than stock_bytes, the stock mode's (or when the mode is
+	//! forced and a layout exists): the window and width minimising the group's bytes over every exception set of at
+	//! most BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS values, which a window leaves as some of the least and some of the
+	//! greatest offsets. The size the analyze reports stays the stock mode's (stock_total), so the choice between
+	//! bit-packing and the other compressions is the stock one. Must run before the group's values are changed in place
+	template <class OP, class T_INNER = T, typename std::enable_if<std::is_integral<T_INNER>::value, int>::type = 0>
+	bool TryPatchedFor(idx_t stock_bytes, idx_t stock_total) {
+		if (!allow_patched_for || (mode != BitpackingMode::AUTO && mode != BitpackingMode::PATCHED_FOR)) {
+			return false;
+		}
+		using T_U = typename MakeUnsigned<T>::type;
+		static constexpr idx_t CAP = BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS;
+		const idx_t count = compression_buffer_idx;
+		const uint64_t divisor =
+		    ScaledFrameOfReferenceDivisor<T>(compression_buffer, compression_buffer_validity, count, minimum);
+		if (divisor == 0) {
+			// every valid value is the minimum
+			return false;
+		}
+		// the CAP + 1 least offsets ascending and the CAP + 1 greatest descending, in one pass
+		uint64_t least[CAP + 1];
+		uint64_t greatest[CAP + 1];
+		idx_t valid = 0;
+		idx_t k = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (!compression_buffer_validity[i]) {
+				continue;
+			}
+			const uint64_t offset = ScaledOffset<T>(compression_buffer[i], minimum) / divisor;
+			valid++;
+			if (k < CAP + 1) {
+				idx_t l = k, g = k;
+				for (; l > 0 && least[l - 1] > offset; l--) {
+					least[l] = least[l - 1];
+				}
+				least[l] = offset;
+				for (; g > 0 && greatest[g - 1] < offset; g--) {
+					greatest[g] = greatest[g - 1];
+				}
+				greatest[g] = offset;
+				k++;
+				continue;
+			}
+			if (offset < least[CAP]) {
+				idx_t l = CAP;
+				for (; l > 0 && least[l - 1] > offset; l--) {
+					least[l] = least[l - 1];
+				}
+				least[l] = offset;
+			}
+			if (offset > greatest[CAP]) {
+				idx_t g = CAP;
+				for (; g > 0 && greatest[g - 1] < offset; g--) {
+					greatest[g] = greatest[g - 1];
+				}
+				greatest[g] = offset;
+			}
+		}
+		if (valid <= 1) {
+			return false;
+		}
+		const auto for_width = PatchedForWidth<T>(greatest[0] - least[0]);
+		idx_t best_bytes = NumericLimits<idx_t>::Maximum();
+		uint64_t best_low = 0;
+		bitpacking_width_t best_width = 0;
+		for (idx_t below = 0; below < k; below++) {
+			for (idx_t above = 0; below + above < k; above++) {
+				const idx_t exceptions = below + above;
+				if (exceptions == 0 || exceptions > CAP || exceptions >= valid || greatest[above] < least[below]) {
+					continue;
+				}
+				const auto width = PatchedForWidth<T>(greatest[above] - least[below]);
+				if (width >= for_width) {
+					continue;
+				}
+				const auto bytes = PatchedForBytes<T>(count, width, exceptions);
+				if (bytes < best_bytes) {
+					best_bytes = bytes;
+					best_low = least[below];
+					best_width = width;
+				}
+			}
+		}
+		if (best_bytes == NumericLimits<idx_t>::Maximum()) {
+			return false;
+		}
+		// the window [best_low, best_low + 2^best_width) holds at least the counted inliers: count the exceptions
+		const uint64_t span_mask = best_width >= 64 ? ~uint64_t(0) : (uint64_t(1) << best_width) - 1;
+		idx_t exception_count = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (!compression_buffer_validity[i]) {
+				continue;
+			}
+			const uint64_t offset = ScaledOffset<T>(compression_buffer[i], minimum) / divisor;
+			if (offset < best_low || ((offset - best_low) & ~span_mask) != 0) {
+				exception_count++;
+			}
+		}
+		if (exception_count == 0 || exception_count > CAP) {
+			return false;
+		}
+		const auto bytes = PatchedForBytes<T>(count, best_width, exception_count);
+		if (mode != BitpackingMode::PATCHED_FOR && bytes >= stock_bytes) {
+			return false;
+		}
+		// the packed values (offset - lo, or 0) in place, the exceptions' positions and raw values aside
+		idx_t e = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (!compression_buffer_validity[i]) {
+				compression_buffer[i] = T(0);
+				continue;
+			}
+			const uint64_t offset = ScaledOffset<T>(compression_buffer[i], minimum) / divisor;
+			if (offset < best_low || ((offset - best_low) & ~span_mask) != 0) {
+				patched_positions[e] = UnsafeNumericCast<uint16_t>(i);
+				patched_exceptions[e] = compression_buffer[i];
+				e++;
+				compression_buffer[i] = T(0);
+			} else {
+				compression_buffer[i] = static_cast<T>(static_cast<T_U>(offset - best_low));
+			}
+		}
+		const auto base_offset = static_cast<T_U>(best_low * divisor);
+		const T base = static_cast<T>(static_cast<T_U>(static_cast<T_U>(minimum) + base_offset));
+		OP::WritePatchedFor(compression_buffer, best_width, base, static_cast<T>(divisor), count, patched_positions,
+		                    patched_exceptions, exception_count, data_ptr);
+		total_size += stock_total;
+		return true;
+	}
+
+	template <class OP, class T_INNER = T, typename std::enable_if<!std::is_integral<T_INNER>::value, int>::type = 0>
+	bool TryPatchedFor(idx_t stock_bytes, idx_t stock_total) {
+		return false;
+	}
+
 	template <class OP>
 	bool Flush() {
 		if (compression_buffer_idx == 0) {
@@ -344,6 +526,12 @@ public:
 			}
 
 			if (!prefer_for && mode != BitpackingMode::FOR) {
+				auto delta_bytes =
+				    BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, delta_required_bitwidth);
+				if (TryPatchedFor<OP>(3 * sizeof(T) + delta_bytes,
+				                      2 * sizeof(T) + AlignValue(sizeof(bitpacking_width_t)) + delta_bytes)) {
+					return true;
+				}
 				SubtractFrameOfReference(delta_buffer, minimum_delta);
 
 				OP::WriteDeltaFor(reinterpret_cast<T *>(delta_buffer), compression_buffer_validity,
@@ -364,6 +552,11 @@ public:
 		}
 
 		if (can_do_for && for_divisor > 1) {
+			auto scaled_bytes = BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, scaled_width);
+			if (TryPatchedFor<OP>(3 * sizeof(T) + scaled_bytes,
+			                      2 * sizeof(T) + AlignValue(sizeof(bitpacking_width_t)) + scaled_bytes)) {
+				return true;
+			}
 			DivideFrameOfReference(compression_buffer, compression_buffer_validity, compression_buffer_idx, minimum,
 			                       for_divisor);
 			OP::WriteForScaled(compression_buffer, compression_buffer_validity, scaled_width, minimum,
@@ -379,6 +572,11 @@ public:
 
 		if (can_do_for) {
 			auto width = BitpackingPrimitives::MinimumBitWidth<T, false>(min_max_diff);
+			auto for_bytes = BitpackingPrimitives::GetRequiredSize(compression_buffer_idx, width);
+			if (TryPatchedFor<OP>(2 * sizeof(T) + for_bytes,
+			                      sizeof(T) + AlignValue(sizeof(bitpacking_width_t)) + for_bytes)) {
+				return true;
+			}
 			SubtractFrameOfReference(compression_buffer, minimum);
 			OP::WriteFor(compression_buffer, compression_buffer_validity, width, minimum, compression_buffer_idx,
 			             data_ptr);
@@ -433,6 +631,7 @@ unique_ptr<AnalyzeState> BitpackingInitAnalyze(ColumnData &col_data, PhysicalTyp
 	auto state = make_uniq<BitpackingAnalyzeState<T>>(info);
 	state->state.mode = Settings::Get<ForceBitpackingModeSetting>(col_data.GetDatabase());
 	state->state.allow_scaled = ScaledFrameOfReferenceAllowed(col_data.GetBlockManager());
+	state->state.allow_patched_for = PatchedForAllowed(col_data.GetBlockManager());
 
 	return std::move(state);
 }
@@ -485,6 +684,7 @@ public:
 		state.data_ptr = reinterpret_cast<void *>(this);
 		state.mode = Settings::Get<ForceBitpackingModeSetting>(checkpoint_data.GetDatabase());
 		state.allow_scaled = ScaledFrameOfReferenceAllowed(info.GetBlockManager());
+		state.allow_patched_for = PatchedForAllowed(info.GetBlockManager());
 	}
 
 	ColumnDataCheckpointData &checkpoint_data;
@@ -568,6 +768,35 @@ public:
 			WriteData(state->data_ptr, frame_of_reference);
 			WriteData(state->data_ptr, (T)width);
 			WriteData(state->data_ptr, divisor);
+
+			BitpackingPrimitives::PackBuffer<T, false>(state->data_ptr, values, count, width);
+			state->data_ptr += bp_size;
+
+			UpdateStats(state, count);
+		}
+
+		static void WritePatchedFor(T *values, bitpacking_width_t width, T base, T divisor, idx_t count,
+		                            const uint16_t *positions, const T *exceptions, idx_t exception_count,
+		                            void *data_ptr) {
+			auto state = reinterpret_cast<BitpackingCompressionState<T, WRITE_STATISTICS> *>(data_ptr);
+
+			auto bp_size = BitpackingPrimitives::GetRequiredSize(count, width);
+			ReserveSpace(state, PatchedForBytes<T>(count, width, exception_count));
+
+			WriteMetaData(state, BitpackingMode::PATCHED_FOR);
+			WriteData(state->data_ptr, base);
+			WriteData(state->data_ptr, (T)width);
+			WriteData(state->data_ptr, divisor);
+			WriteData(state->data_ptr, UnsafeNumericCast<uint16_t>(exception_count));
+			WriteData(state->data_ptr, uint16_t(0));
+			for (idx_t i = 0; i < exception_count; i++) {
+				Store<uint16_t>(positions[i], state->data_ptr);
+				state->data_ptr += sizeof(uint16_t);
+			}
+			for (idx_t i = 0; i < exception_count; i++) {
+				Store<T>(exceptions[i], state->data_ptr);
+				state->data_ptr += sizeof(T);
+			}
 
 			BitpackingPrimitives::PackBuffer<T, false>(state->data_ptr, values, count, width);
 			state->data_ptr += bp_size;
@@ -780,6 +1009,11 @@ public:
 	T current_constant;
 	T current_delta_offset;
 	T current_divisor;
+	// PATCHED_FOR: the group's exceptions (positions ascending) and the first one a scan has not passed
+	idx_t current_exception_count = 0;
+	idx_t current_exception_index = 0;
+	uint16_t current_exception_positions[BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS];
+	T current_exception_values[BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS];
 
 	idx_t current_group_offset = 0;
 	data_ptr_t current_group_ptr;
@@ -806,6 +1040,7 @@ public:
 			break;
 		case BitpackingMode::FOR:
 		case BitpackingMode::FOR_SCALED:
+		case BitpackingMode::PATCHED_FOR:
 		case BitpackingMode::CONSTANT_DELTA:
 		case BitpackingMode::DELTA_FOR:
 			current_frame_of_reference = *reinterpret_cast<T *>(current_group_ptr);
@@ -823,6 +1058,7 @@ public:
 			break;
 		case BitpackingMode::FOR:
 		case BitpackingMode::FOR_SCALED:
+		case BitpackingMode::PATCHED_FOR:
 		case BitpackingMode::DELTA_FOR:
 			current_width = (bitpacking_width_t)(*reinterpret_cast<T *>(current_group_ptr));
 			current_group_ptr += MaxValue(sizeof(T), sizeof(bitpacking_width_t));
@@ -837,9 +1073,46 @@ public:
 		if (current_group.mode == BitpackingMode::DELTA_FOR) {
 			current_delta_offset = *reinterpret_cast<T *>(current_group_ptr);
 			current_group_ptr += sizeof(T);
-		} else if (current_group.mode == BitpackingMode::FOR_SCALED) {
+		} else if (current_group.mode == BitpackingMode::FOR_SCALED ||
+		           current_group.mode == BitpackingMode::PATCHED_FOR) {
 			current_divisor = *reinterpret_cast<T *>(current_group_ptr);
 			current_group_ptr += sizeof(T);
+		}
+
+		// PATCHED_FOR: the exceptions, before the packing
+		current_exception_count = 0;
+		current_exception_index = 0;
+		if (current_group.mode == BitpackingMode::PATCHED_FOR) {
+			current_exception_count = Load<uint16_t>(current_group_ptr);
+			current_group_ptr += 2 * sizeof(uint16_t);
+			if (current_exception_count > BITPACKING_PATCHED_FOR_MAX_EXCEPTIONS) {
+				throw InternalException(
+				    "Bitpacking group holds %llu exceptions at block \"%llu\" - corrupt database file",
+				    current_exception_count, current_segment.block->BlockId());
+			}
+			for (idx_t i = 0; i < current_exception_count; i++) {
+				current_exception_positions[i] = Load<uint16_t>(current_group_ptr);
+				current_group_ptr += sizeof(uint16_t);
+			}
+			for (idx_t i = 0; i < current_exception_count; i++) {
+				current_exception_values[i] = Load<T>(current_group_ptr);
+				current_group_ptr += sizeof(T);
+			}
+		}
+	}
+
+	//! PATCHED_FOR: writes the exceptions at group offsets [start, start + count) into dst (dst[0] = offset start).
+	//! Offsets only move forward within a group, so the first exception not yet passed is kept
+	void ApplyExceptions(T *dst, idx_t start, idx_t count) {
+		while (current_exception_index < current_exception_count &&
+		       current_exception_positions[current_exception_index] < start) {
+			current_exception_index++;
+		}
+		while (current_exception_index < current_exception_count &&
+		       current_exception_positions[current_exception_index] < start + count) {
+			dst[current_exception_positions[current_exception_index] - start] =
+			    current_exception_values[current_exception_index];
+			current_exception_index++;
 		}
 	}
 
@@ -866,7 +1139,8 @@ public:
 		D_ASSERT(current_group_offset + remaining_to_skip < BITPACKING_METADATA_GROUP_SIZE);
 
 		if (current_group.mode == BitpackingMode::CONSTANT || current_group.mode == BitpackingMode::CONSTANT_DELTA ||
-		    current_group.mode == BitpackingMode::FOR || current_group.mode == BitpackingMode::FOR_SCALED) {
+		    current_group.mode == BitpackingMode::FOR || current_group.mode == BitpackingMode::FOR_SCALED ||
+		    current_group.mode == BitpackingMode::PATCHED_FOR) {
 			// Skipping within a constant or constant delta is done by increasing the current_group_offset
 			skipped += remaining_to_skip;
 			current_group_offset += remaining_to_skip;
@@ -972,6 +1246,7 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		}
 		D_ASSERT(scan_state.current_group.mode == BitpackingMode::FOR ||
 		         scan_state.current_group.mode == BitpackingMode::FOR_SCALED ||
+		         scan_state.current_group.mode == BitpackingMode::PATCHED_FOR ||
 		         scan_state.current_group.mode == BitpackingMode::DELTA_FOR);
 
 		idx_t to_scan = MinValue<idx_t>(scan_count - scanned, BitpackingPrimitives::BITPACKING_ALGORITHM_GROUP_SIZE -
@@ -1007,6 +1282,10 @@ void BitpackingScanPartial(ColumnSegment &segment, ColumnScanState &state, idx_t
 		} else if (scan_state.current_group.mode == BitpackingMode::FOR_SCALED) {
 			ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
 			                               scan_state.current_divisor, to_scan);
+		} else if (scan_state.current_group.mode == BitpackingMode::PATCHED_FOR) {
+			ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
+			                               scan_state.current_divisor, to_scan);
+			scan_state.ApplyExceptions(current_result_ptr, scan_state.current_group_offset, to_scan);
 		} else {
 			ApplyFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference, to_scan);
 		}
@@ -1069,6 +1348,7 @@ void BitpackingFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t r
 
 	D_ASSERT(scan_state.current_group.mode == BitpackingMode::FOR ||
 	         scan_state.current_group.mode == BitpackingMode::FOR_SCALED ||
+	         scan_state.current_group.mode == BitpackingMode::PATCHED_FOR ||
 	         scan_state.current_group.mode == BitpackingMode::DELTA_FOR);
 
 	BitpackingPrimitives::UnPackBlock<T>(data_ptr_cast(scan_state.decompression_buffer),
@@ -1078,6 +1358,12 @@ void BitpackingFetchRow(ColumnSegment &segment, ColumnFetchState &state, row_t r
 	if (scan_state.current_group.mode == BitpackingMode::FOR_SCALED) {
 		ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
 		                               scan_state.current_divisor, 1);
+		return;
+	}
+	if (scan_state.current_group.mode == BitpackingMode::PATCHED_FOR) {
+		ApplyScaledFrameOfReference<T>(current_result_ptr, scan_state.current_frame_of_reference,
+		                               scan_state.current_divisor, 1);
+		scan_state.ApplyExceptions(current_result_ptr, scan_state.current_group_offset, 1);
 		return;
 	}
 	*current_result_ptr += scan_state.current_frame_of_reference;

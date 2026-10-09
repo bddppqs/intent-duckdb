@@ -1,0 +1,237 @@
+# name: test/sql/aggregate/aggregates/constant_key_simple_update.test
+# description: A chunk whose group keys are all constant updates its one group's state by one simple update per
+#              aggregate instead of a per-row update over equal addresses (kConstantKeySimpleUpdate). COUNT, MIN and MAX
+#              of any type and SUM and AVG of integer inputs up to 64 bits and DECIMAL inputs up to width 18 take the
+#              simple update; every other aggregate (DOUBLE, HUGEINT and DECIMAL(38) SUM/AVG, FILTER, DISTINCT and other
+#              functions) keeps the per-row update for the whole chunk. Every answer must equal the same query grouped by
+#              a second key that is never constant ((i - i), one value, computed per row), and, where written out, the
+#              exact values.
+# group: [aggregates]
+
+load __TEST_DIR__/constant_key_simple_update.db
+
+statement ok
+PRAGMA enable_verification
+
+# four row groups loaded in order: the key k is constant per row group (1000003, 2000006, NULL, then 1000003 again, so a
+# group takes folded chunks from two row groups); k2 is constant per row group too; c and xn are constant payloads (xn is
+# NULL in the second row group); km is constant over the first half of each row group and varies over the second, so the
+# group 5000011 takes both folded and per-row chunks
+statement ok
+CREATE TABLE t(i BIGINT, k BIGINT, k2 INTEGER, km BIGINT USING COMPRESSION 'rle', x INTEGER, xn INTEGER, c SMALLINT,
+               tt TINYINT, u UBIGINT, d DECIMAL(18,3), dh DECIMAL(38,3), f DOUBLE, h HUGEINT, s VARCHAR);
+
+statement ok
+SET threads=1
+
+statement ok
+INSERT INTO t SELECT i,
+       CASE i // 122880 WHEN 0 THEN 1000003 WHEN 1 THEN 2000006 WHEN 2 THEN NULL ELSE 1000003 END,
+       CASE i // 122880 WHEN 1 THEN 88 ELSE 77 END,
+       CASE WHEN i % 122880 < 61440 OR i % 3 = 0 THEN 5000011 ELSE (i % 3) * 7000003 END,
+       CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 1000)::INTEGER END,
+       CASE WHEN i // 122880 = 1 THEN NULL ELSE (i % 5)::INTEGER END,
+       (i // 122880 + 3)::SMALLINT,
+       (i % 100)::TINYINT,
+       (i * 3)::UBIGINT,
+       ((i % 1000) / 8)::DECIMAL(18,3),
+       ((i % 1000) / 8)::DECIMAL(38,3),
+       (i % 1000) * 0.5,
+       i::HUGEINT,
+       'value-number-' || (i % 997)::VARCHAR
+FROM range(491520) r(i);
+
+statement ok
+CHECKPOINT
+
+statement ok
+RESET threads
+
+# the plan is the radix hash aggregate (not the run channel, a perfect hash or the fused kernel)
+query II
+EXPLAIN SELECT k, count(*), min(x), avg(x) FROM t GROUP BY k;
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+query II
+EXPLAIN SELECT k, count(*), min(x), avg(x) FROM t GROUP BY k;
+----
+physical_plan	<!REGEX>:.*Run Aggregate.*
+
+# every admitted kind over one constant key, with a NULL key group and a constant NULL payload (xn in 2000006's row group)
+query IIIIIIIIIIIIIIII
+SELECT k, count(*), count(x), min(x), max(x), sum(x), sum(tt), sum(u) // 1000000, sum(u) % 1000000, sum(c), min(c), max(c),
+       count(xn), sum(xn), min(s), max(s)
+FROM t GROUP BY k ORDER BY k NULLS LAST;
+----
+1000003	245760	210650	0	999	105166675	12164720	181193	564160	1105920	3	6	245760	491520	value-number-0	value-number-996
+2000006	122880	105326	0	999	52577103	6082160	67947	540480	491520	4	4	0	NULL	value-number-0	value-number-996
+NULL	122880	105326	0	999	52590091	6082560	113246	23680	614400	5	5	122880	245760	value-number-0	value-number-996
+
+# the same aggregates, the averages and the DECIMAL(18) kinds against the never-constant second key
+query I
+SELECT count(*) FROM (
+  (SELECT k, count(*), count(x), min(x), max(x), sum(x), avg(x), sum(tt), avg(tt), sum(u), avg(u), sum(c), avg(c), min(c),
+          max(c), count(xn), sum(xn), avg(xn), min(xn), max(xn), sum(d), avg(d), min(d), max(d), min(s), max(s), count(s),
+          count(k), min(k), max(k), sum(k), avg(k)
+   FROM t GROUP BY k
+   EXCEPT ALL
+   SELECT k, count(*), count(x), min(x), max(x), sum(x), avg(x), sum(tt), avg(tt), sum(u), avg(u), sum(c), avg(c), min(c),
+          max(c), count(xn), sum(xn), avg(xn), min(xn), max(xn), sum(d), avg(d), min(d), max(d), min(s), max(s), count(s),
+          count(k), min(k), max(k), sum(k), avg(k)
+   FROM t GROUP BY k, (i - i))
+  UNION ALL
+  (SELECT k, count(*), count(x), min(x), max(x), sum(x), avg(x), sum(tt), avg(tt), sum(u), avg(u), sum(c), avg(c), min(c),
+          max(c), count(xn), sum(xn), avg(xn), min(xn), max(xn), sum(d), avg(d), min(d), max(d), min(s), max(s), count(s),
+          count(k), min(k), max(k), sum(k), avg(k)
+   FROM t GROUP BY k, (i - i)
+   EXCEPT ALL
+   SELECT k, count(*), count(x), min(x), max(x), sum(x), avg(x), sum(tt), avg(tt), sum(u), avg(u), sum(c), avg(c), min(c),
+          max(c), count(xn), sum(xn), avg(xn), min(xn), max(xn), sum(d), avg(d), min(d), max(d), min(s), max(s), count(s),
+          count(k), min(k), max(k), sum(k), avg(k)
+   FROM t GROUP BY k)
+);
+----
+0
+
+# two keys, both constant: the chunk folds
+query IIIII
+SELECT k, k2, count(*), sum(x), max(s) FROM t GROUP BY k, k2 ORDER BY k NULLS LAST, k2;
+----
+1000003	77	245760	105166675	value-number-996
+2000006	88	122880	52577103	value-number-996
+NULL	77	122880	52590091	value-number-996
+
+query I
+SELECT count(*) FROM (
+  (SELECT k, k2, count(*), sum(x), avg(x), min(s), max(u) FROM t GROUP BY k, k2
+   EXCEPT ALL
+   SELECT k, k2, count(*), sum(x), avg(x), min(s), max(u) FROM t GROUP BY k, k2, (i - i))
+  UNION ALL
+  (SELECT k, k2, count(*), sum(x), avg(x), min(s), max(u) FROM t GROUP BY k, k2, (i - i)
+   EXCEPT ALL
+   SELECT k, k2, count(*), sum(x), avg(x), min(s), max(u) FROM t GROUP BY k, k2)
+);
+----
+0
+
+# two keys, one constant and one not: the per-row path
+query IIII
+SELECT count(*), sum(c), sum(cx), sum(sx) FROM (SELECT k, tt, count(*) AS c, count(x) AS cx, sum(x) AS sx FROM t GROUP BY k, tt);
+----
+300	491520	421302	210333869
+
+query I
+SELECT count(*) FROM (
+  (SELECT k, tt, count(*), sum(x), avg(x), min(s) FROM t GROUP BY k, tt
+   EXCEPT ALL
+   SELECT k, tt, count(*), sum(x), avg(x), min(s) FROM t GROUP BY k, tt, (i - i))
+  UNION ALL
+  (SELECT k, tt, count(*), sum(x), avg(x), min(s) FROM t GROUP BY k, tt, (i - i)
+   EXCEPT ALL
+   SELECT k, tt, count(*), sum(x), avg(x), min(s) FROM t GROUP BY k, tt)
+);
+----
+0
+
+# folded and per-row chunks of the same group
+query IIII
+SELECT km, count(*), count(x), sum(x) FROM t GROUP BY km ORDER BY km;
+----
+5000011	327680	280868	140206985
+7000003	81920	70217	35064101
+14000006	81920	70217	35062783
+
+query I
+SELECT count(*) FROM (
+  (SELECT km, count(*), sum(x), avg(x), min(x), max(s), sum(d) FROM t GROUP BY km
+   EXCEPT ALL
+   SELECT km, count(*), sum(x), avg(x), min(x), max(s), sum(d) FROM t GROUP BY km, (i - i))
+  UNION ALL
+  (SELECT km, count(*), sum(x), avg(x), min(x), max(s), sum(d) FROM t GROUP BY km, (i - i)
+   EXCEPT ALL
+   SELECT km, count(*), sum(x), avg(x), min(x), max(s), sum(d) FROM t GROUP BY km)
+);
+----
+0
+
+# a filtered scan feeding a constant key, a string-length sum and a HAVING over the group count
+query III
+SELECT k, sum(length(s)), count(*) FROM t WHERE x <> 3 GROUP BY k HAVING count(*) > 100000 ORDER BY k NULLS LAST;
+----
+1000003	3343769	210439
+2000006	1671922	105220
+NULL	1671969	105221
+
+query I
+SELECT count(*) FROM (
+  (SELECT k, avg(length(s)) AS l, count(*) AS c FROM t WHERE x <> 3 GROUP BY k HAVING count(*) > 100000
+   EXCEPT ALL
+   SELECT k, avg(length(s)) AS l, count(*) AS c FROM t WHERE x <> 3 GROUP BY k, (i - i) HAVING count(*) > 100000)
+  UNION ALL
+  (SELECT k, avg(length(s)) AS l, count(*) AS c FROM t WHERE x <> 3 GROUP BY k, (i - i) HAVING count(*) > 100000
+   EXCEPT ALL
+   SELECT k, avg(length(s)) AS l, count(*) AS c FROM t WHERE x <> 3 GROUP BY k HAVING count(*) > 100000)
+);
+----
+0
+
+# refused kinds keep the per-row update for the whole chunk, admitted aggregates beside them included: DOUBLE, HUGEINT
+# and DECIMAL(38) SUM/AVG, a FILTER clause, DISTINCT and functions outside the admitted set
+query I
+SELECT count(*) FROM (
+  (SELECT k, sum(f), avg(f), sum(h), avg(h), sum(dh), avg(dh), count(*) FILTER (WHERE x > 500), sum(DISTINCT tt),
+          count(DISTINCT s), bool_or(x > 998), bit_or(tt), arg_max(tt, i), sum(x), min(s)
+   FROM t GROUP BY k
+   EXCEPT ALL
+   SELECT k, sum(f), avg(f), sum(h), avg(h), sum(dh), avg(dh), count(*) FILTER (WHERE x > 500), sum(DISTINCT tt),
+          count(DISTINCT s), bool_or(x > 998), bit_or(tt), arg_max(tt, i), sum(x), min(s)
+   FROM t GROUP BY k, (i - i))
+  UNION ALL
+  (SELECT k, sum(f), avg(f), sum(h), avg(h), sum(dh), avg(dh), count(*) FILTER (WHERE x > 500), sum(DISTINCT tt),
+          count(DISTINCT s), bool_or(x > 998), bit_or(tt), arg_max(tt, i), sum(x), min(s)
+   FROM t GROUP BY k, (i - i)
+   EXCEPT ALL
+   SELECT k, sum(f), avg(f), sum(h), avg(h), sum(dh), avg(dh), count(*) FILTER (WHERE x > 500), sum(DISTINCT tt),
+          count(DISTINCT s), bool_or(x > 998), bit_or(tt), arg_max(tt, i), sum(x), min(s)
+   FROM t GROUP BY k)
+);
+----
+0
+
+query IIII
+SELECT k, sum(h), count(*) FILTER (WHERE x > 500), arg_max(tt, i) FROM t GROUP BY k ORDER BY k NULLS LAST;
+----
+1000003	60397854720	105012	19
+2000006	22649180160	52505	59
+NULL	37748674560	52507	39
+
+# an ORDER BY inside an aggregate: dropped for COUNT, MIN, MAX and SUM by the optimizer; AVG becomes a sorted wrapper,
+# refused over two arguments (ORDER BY i) and, ordered by its own argument, buffering the rows in order under either update
+query I
+SELECT count(*) FROM (
+  (SELECT k, avg(x ORDER BY x), avg(x ORDER BY i), min(s ORDER BY i), sum(x ORDER BY i DESC), count(x ORDER BY x)
+   FROM t GROUP BY k
+   EXCEPT ALL
+   SELECT k, avg(x ORDER BY x), avg(x ORDER BY i), min(s ORDER BY i), sum(x ORDER BY i DESC), count(x ORDER BY x)
+   FROM t GROUP BY k, (i - i))
+  UNION ALL
+  (SELECT k, avg(x ORDER BY x), avg(x ORDER BY i), min(s ORDER BY i), sum(x ORDER BY i DESC), count(x ORDER BY x)
+   FROM t GROUP BY k, (i - i)
+   EXCEPT ALL
+   SELECT k, avg(x ORDER BY x), avg(x ORDER BY i), min(s ORDER BY i), sum(x ORDER BY i DESC), count(x ORDER BY x)
+   FROM t GROUP BY k)
+);
+----
+0
+
+# one thread: a single sink takes every chunk
+statement ok
+SET threads=1
+
+query IIII
+SELECT k, count(*), sum(x), min(s) FROM t GROUP BY k ORDER BY k NULLS LAST;
+----
+1000003	245760	105166675	value-number-0
+2000006	122880	52577103	value-number-0
+NULL	122880	52590091	value-number-0

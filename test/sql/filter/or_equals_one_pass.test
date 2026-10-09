@@ -1,0 +1,61 @@
+# name: test/sql/filter/or_equals_one_pass.test
+# description: The first-keys aggregate's key filter, an OR of equality comparisons with the first keys pushed into the
+#              probe scan, evaluated in one pass (kOrEqualsFilterOnePass): BIGINT, INTEGER, SMALLINT and UBIGINT keys spread
+#              over ranges compressed materialization keeps at their width, with 2, 3, 10 and 32 distinct first keys (33 keeps
+#              the per-child loop), at 1 and 8 threads; every group returned is a group of the whole relation with its exact
+#              count, against the same data stored in memory
+# group: [filter]
+
+# the stored_translations_first_keys_codes.test form: a VARCHAR key with stored translations makes the rewrite a SEMI
+# join whose probe scan takes the key filter on the integer key (no PRAGMA enable_verification: its plan round trip keeps
+# string keys, and the key filter is then not pushed)
+load __TEST_DIR__/or_equals_one_pass.db readwrite latest
+
+statement ok
+SET checkpoint_threshold='100GB'
+
+# 5 * 2^20 rows (the scan estimate reaches kStoredCodeKeysMinScanRows); every row a new integer key, s in runs of three
+statement ok
+CREATE TABLE t AS SELECT i, (((i * 2654435761) % 1000003) * 1000000007)::BIGINT AS u, (((i * 2654435761) % 1000003) * 2003 - 1000000000)::INTEGER AS u32, (((i * 2654435761) % 60001) - 30000)::SMALLINT AS u16, (((i * 2654435761) % 1000003) * 1000000007)::UBIGINT AS uu, 'wval-' || ((i // 3) % 200003) || '-0123456789' AS s FROM range(5242880) r(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TEMP TABLE r AS SELECT * FROM t
+
+query II
+EXPLAIN SELECT u, s, count(*) FROM t GROUP BY u, s LIMIT 10
+----
+physical_plan	<REGEX>:.*Key Filters: pushed.*
+
+loop th 0 2
+
+statement ok
+SET threads = CASE WHEN ${th} = 0 THEN 1 ELSE 8 END
+
+foreach n 2 3 10 32 33
+
+query I
+SELECT count(*) = ${n} FROM (SELECT u, s, count(*) AS c FROM t GROUP BY u, s LIMIT ${n}) l JOIN (SELECT u, s, count(*) AS c FROM r GROUP BY u, s) f ON l.u = f.u AND l.s = f.s AND l.c = f.c
+----
+true
+
+query I
+SELECT count(*) = ${n} FROM (SELECT u32, s, count(*) AS c FROM t GROUP BY u32, s LIMIT ${n}) l JOIN (SELECT u32, s, count(*) AS c FROM r GROUP BY u32, s) f ON l.u32 = f.u32 AND l.s = f.s AND l.c = f.c
+----
+true
+
+query I
+SELECT count(*) = ${n} FROM (SELECT u16, s, count(*) AS c FROM t GROUP BY u16, s LIMIT ${n}) l JOIN (SELECT u16, s, count(*) AS c FROM r GROUP BY u16, s) f ON l.u16 = f.u16 AND l.s = f.s AND l.c = f.c
+----
+true
+
+query I
+SELECT count(*) = ${n} FROM (SELECT uu, s, count(*) AS c FROM t GROUP BY uu, s LIMIT ${n}) l JOIN (SELECT uu, s, count(*) AS c FROM r GROUP BY uu, s) f ON l.uu = f.uu AND l.s = f.s AND l.c = f.c
+----
+true
+
+endloop
+
+endloop

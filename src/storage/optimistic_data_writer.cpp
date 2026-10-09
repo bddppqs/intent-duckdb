@@ -1,5 +1,8 @@
 #include "duckdb/storage/optimistic_data_writer.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
+#include "duckdb/storage/single_file_block_manager.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 #include "duckdb/storage/table/column_checkpoint_state.hpp"
 #include "duckdb/main/settings.hpp"
 
@@ -132,7 +135,20 @@ void OptimisticDataWriter::WriteUnflushedRowGroups(OptimisticWriteCollection &ro
 		FlushToDisk(row_groups, to_flush, segment_indexes);
 	}
 
+	// in a block-compressed file each column's partially filled blocks are written as they are, holding that column's
+	// segments only, instead of being merged into this writer's blocks shared by all columns (kColumnPartialBlocksApart);
+	// below kColumnPartialBlocksApartMinMemory of memory limit the shared blocks are kept
+	auto single_file = dynamic_cast<SingleFileBlockManager *>(&table.GetTableIOManager().GetBlockManagerForRowData());
+	auto apart = kColumnPartialBlocksApart && single_file && single_file->BlockCompression() &&
+	             BufferManager::GetBufferManager(context).GetMaxMemory() >= kColumnPartialBlocksApartMinMemory;
 	for (auto &partial_manager : row_groups.partial_block_managers) {
+		if (apart) {
+			if (partial_manager) {
+				BulkAppendWriteScope bulk_write;
+				partial_manager->FlushPartialBlocks();
+			}
+			continue;
+		}
 		Merge(partial_manager);
 	}
 	row_groups.unflushed_row_groups.clear();
@@ -185,6 +201,7 @@ void OptimisticDataWriter::FlushToDisk(OptimisticWriteCollection &collection,
 		compression_types.push_back(column.CompressionType());
 	}
 	RowGroupWriteInfo info(*partial_manager, compression_types, collection.partial_block_managers);
+	BulkAppendWriteScope bulk_write;
 	auto result = RowGroup::WriteToDisk(info, row_groups);
 	// move new (checkpointed) row groups to the row group collection
 	for (idx_t i = 0; i < row_groups.size(); i++) {
@@ -210,6 +227,7 @@ void OptimisticDataWriter::Merge(OptimisticDataWriter &other) {
 
 void OptimisticDataWriter::FinalFlush() {
 	if (partial_manager) {
+		BulkAppendWriteScope bulk_write;
 		partial_manager->FlushPartialBlocks();
 		partial_manager.reset();
 	}

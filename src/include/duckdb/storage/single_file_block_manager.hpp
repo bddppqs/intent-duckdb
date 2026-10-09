@@ -60,6 +60,18 @@ struct StorageManagerOptions {
 	EncryptionOptions encryption_options;
 };
 
+//! While alive, the blocks the constructing thread writes to a block-compressed file are a bulk append's own, written
+//! by its optimistic writer: they take zstd_bulk_write_compression_level when that setting is not 0. Scopes nest; the
+//! destructor restores the enclosing state
+class BulkAppendWriteScope {
+public:
+	BulkAppendWriteScope();
+	~BulkAppendWriteScope();
+
+private:
+	bool previous;
+};
+
 //! SingleFileBlockManager is an implementation for a BlockManager which manages blocks in a single file
 class SingleFileBlockManager : public BlockManager {
 	//! The location in the file where the block writing starts
@@ -164,6 +176,9 @@ public:
 	//! Whether the file's stored column translations carry the decoded byte length of every code (the
 	//! dictionary-entry-lengths version, which a reader without them refuses)
 	bool DictionaryEntryLengths() const;
+	//! Whether new bit-packing groups of the file may be PATCHED_FOR (kPatchedForBitpacking at the format-riders
+	//! version, which a reader without them refuses)
+	bool PatchedForFile() const;
 
 private:
 	//! Loads the free list of the file.
@@ -203,7 +218,7 @@ private:
 
 	//! Block compression: the file position of a block is its extent (offset, stored length), not its id
 	struct BlockExtent {
-		//! The file offset of the extent (page-aligned); 0 = the block has no extent
+		//! The file offset of the extent (a multiple of the file's extent alignment); 0 = the block has no extent
 		uint64_t offset = 0;
 		//! The bytes stored after the block header: a zstd frame, or the raw payload when it equals the block size
 		uint32_t length = 0;
@@ -284,11 +299,14 @@ private:
 	bool block_compression = false;
 	//! Whether the file is at the version that may hold FOR_SCALED bit-packing groups (a block-compressed file)
 	bool scaled_frame_of_reference = false;
+	//! The alignment of a compressed file's extents: 512 bytes at the format-riders version with kExtent512Alignment,
+	//! else the 4 KiB page
+	idx_t extent_alignment = 4096;
 	//! Lock for the extent map and the extent allocator
 	mutex extent_lock;
 	//! The extent of each block id
 	vector<BlockExtent> extents;
-	//! The next free (page-aligned) file offset of the append-only extent allocator
+	//! The next free (extent-aligned) file offset of the append-only extent allocator
 	uint64_t next_extent_offset = BLOCK_START;
 	//! The position of the extent map written with the last database header
 	idx_t extent_map_offset = 0;

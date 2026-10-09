@@ -1,0 +1,201 @@
+# name: test/sql/storage/block_compression/bulk_write_level.test
+# description: zstd_bulk_write_compression_level compresses the blocks a bulk append's optimistic writer writes; blocks the checkpoint writes keep zstd_block_compression_level, and data written at either level reads back unchanged
+# group: [block_compression]
+
+require skip_reload
+
+# the default and the range
+query I
+SELECT current_setting('zstd_bulk_write_compression_level')
+----
+0
+
+statement error
+SET zstd_bulk_write_compression_level = 23
+----
+must be 0
+
+# one thread, so that every file below is laid out the same way
+statement ok
+SET threads = 1
+
+statement ok
+SET zstd_block_compression_level = 3
+
+# the same bulk append (a CREATE TABLE AS of eight row groups, written by the optimistic writer) at bulk levels 0, 3, 19
+foreach lvl 0 3 19
+
+statement ok
+SET zstd_bulk_write_compression_level = ${lvl}
+
+statement ok
+ATTACH '__TEST_DIR__/bulk_level_${lvl}.db' AS b${lvl} (STORAGE_VERSION 'latest')
+
+statement ok
+CREATE TABLE b${lvl}.t AS SELECT i, i % 1000 AS g, 'value-' || (i % 5000)::VARCHAR AS s, (i * 7919) % 1000003 AS r
+    FROM range(983040) t(i)
+
+statement ok
+CHECKPOINT b${lvl}
+
+statement ok
+DETACH b${lvl}
+
+endloop
+
+# bulk level 0 leaves the block level (3) in force: byte-equal to an explicit bulk level 3
+query I
+SELECT (SELECT size FROM read_blob('__TEST_DIR__/bulk_level_0.db')) = (SELECT size FROM read_blob('__TEST_DIR__/bulk_level_3.db'))
+----
+true
+
+# bulk level 19 compresses the appended blocks harder
+query I
+SELECT (SELECT size FROM read_blob('__TEST_DIR__/bulk_level_19.db')) < (SELECT size FROM read_blob('__TEST_DIR__/bulk_level_0.db'))
+----
+true
+
+# a small append, which the commit's checkpoint writes: the bulk level does not reach it, the block level does
+statement ok
+SET zstd_bulk_write_compression_level = 0
+
+statement ok
+SET zstd_block_compression_level = 3
+
+statement ok
+ATTACH '__TEST_DIR__/small_c0.db' AS s_c0 (STORAGE_VERSION 'latest')
+
+statement ok
+CREATE TABLE s_c0.t (i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO s_c0.t SELECT i, 'value-' || (i % 5000)::VARCHAR FROM range(60000) t(i)
+
+statement ok
+CHECKPOINT s_c0
+
+statement ok
+DETACH s_c0
+
+statement ok
+SET zstd_bulk_write_compression_level = 19
+
+statement ok
+SET zstd_block_compression_level = 3
+
+statement ok
+ATTACH '__TEST_DIR__/small_c19.db' AS s_c19 (STORAGE_VERSION 'latest')
+
+statement ok
+CREATE TABLE s_c19.t (i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO s_c19.t SELECT i, 'value-' || (i % 5000)::VARCHAR FROM range(60000) t(i)
+
+statement ok
+CHECKPOINT s_c19
+
+statement ok
+DETACH s_c19
+
+statement ok
+SET zstd_bulk_write_compression_level = 0
+
+statement ok
+SET zstd_block_compression_level = 19
+
+statement ok
+ATTACH '__TEST_DIR__/small_k19.db' AS s_k19 (STORAGE_VERSION 'latest')
+
+statement ok
+CREATE TABLE s_k19.t (i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO s_k19.t SELECT i, 'value-' || (i % 5000)::VARCHAR FROM range(60000) t(i)
+
+statement ok
+CHECKPOINT s_k19
+
+statement ok
+DETACH s_k19
+
+query I
+SELECT (SELECT size FROM read_blob('__TEST_DIR__/small_c0.db')) = (SELECT size FROM read_blob('__TEST_DIR__/small_c19.db'))
+----
+true
+
+query I
+SELECT (SELECT size FROM read_blob('__TEST_DIR__/small_k19.db')) < (SELECT size FROM read_blob('__TEST_DIR__/small_c0.db'))
+----
+true
+
+statement ok
+SET zstd_block_compression_level = 3
+
+statement ok
+SET zstd_bulk_write_compression_level = 0
+
+# every file reads back the same rows
+statement ok
+ATTACH '__TEST_DIR__/bulk_level_0.db' AS b0
+
+statement ok
+ATTACH '__TEST_DIR__/bulk_level_19.db' AS b19
+
+query I
+SELECT (SELECT count(*) FROM b0.t) = (SELECT count(*) FROM b19.t) AND (SELECT count(*) FROM b0.t) = 983040
+----
+true
+
+query I
+SELECT count(*) FROM (FROM b0.t EXCEPT ALL FROM b19.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM b19.t EXCEPT ALL FROM b0.t)
+----
+0
+
+query I
+SELECT sum(i) = 983039::BIGINT * 983040 // 2 FROM b19.t
+----
+true
+
+# the round trip across the two levels: rows the bulk writer stored at level 19, rewritten by the checkpoint at level 3
+foreach n 0 19
+
+statement ok
+UPDATE b${n}.t SET s = 'updated' WHERE i % 97 = 0
+
+statement ok
+DELETE FROM b${n}.t WHERE i % 89 = 0
+
+statement ok
+INSERT INTO b${n}.t SELECT i, i % 1000, 'appended-' || i::VARCHAR, i FROM range(983040, 1083040) t(i)
+
+statement ok
+CHECKPOINT b${n}
+
+statement ok
+DETACH b${n}
+
+statement ok
+ATTACH '__TEST_DIR__/bulk_level_${n}.db' AS b${n}
+
+endloop
+
+query I
+SELECT count(*) FROM (FROM b0.t EXCEPT ALL FROM b19.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM b19.t EXCEPT ALL FROM b0.t)
+----
+0
+
+query II
+SELECT count(*) = (SELECT count(*) FROM b0.t), count(*) FILTER (WHERE s = 'updated') > 0 FROM b19.t
+----
+true	true

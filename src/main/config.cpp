@@ -211,6 +211,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(WriteBufferRowGroupCountSetting),
     DUCKDB_GLOBAL(WriteBufferRowGroupMemoryLimitSetting),
     DUCKDB_SETTING_CALLBACK(ZstdBlockCompressionLevelSetting),
+    DUCKDB_SETTING_CALLBACK(ZstdBulkWriteCompressionLevelSetting),
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 

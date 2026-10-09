@@ -68,7 +68,8 @@ RE2::Options::Options(RE2::CannedOptions opt)
     word_boundary_(false),
     one_line_(false),
     tagged_dfa_(false),
-    tdfa_vector_scan_(true) {
+    tdfa_vector_scan_(true),
+    tdfa_thread_private_(false) {
 }
 
 // Empty objects for use as const references.
@@ -278,7 +279,8 @@ void RE2::Init(const StringPiece& pattern, const Options& options) {
   is_one_pass_ = prog_->IsOnePass();
 
   if (options_.tagged_dfa())
-    prog_->EnableTDFA(options_.tdfa_vector_scan());
+    prog_->EnableTDFA(options_.tdfa_vector_scan(),
+                      options_.tdfa_thread_private());
 }
 
 // Returns rprog_, computing it if needed.

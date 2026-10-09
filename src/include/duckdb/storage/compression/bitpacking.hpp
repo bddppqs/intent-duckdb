@@ -12,6 +12,15 @@
 
 namespace duckdb {
 
-enum class BitpackingMode : uint8_t { INVALID, AUTO, CONSTANT, CONSTANT_DELTA, DELTA_FOR, FOR, FOR_SCALED };
+enum class BitpackingMode : uint8_t {
+	INVALID,
+	AUTO,
+	CONSTANT,
+	CONSTANT_DELTA,
+	DELTA_FOR,
+	FOR,
+	FOR_SCALED,
+	PATCHED_FOR
+};
 
 } // namespace duckdb

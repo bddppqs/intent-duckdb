@@ -72,10 +72,18 @@ static constexpr bool kFusedDistinctFold = true;
 static constexpr bool kFusedDistinctTreeMerge = true;
 //! The kernel's mixed DISTINCT shape (one distinct count beside plain aggregates)
 static constexpr bool kFusedMixedDistinct = true;
+//! The grouped DISTINCT class counts each distinct (g, x) into the task's group table when the (g, x) build inserts it,
+//! so no sweep of the partition's (g, x) table follows
+static constexpr bool kFusedDistinctInsertTimeGroups = true;
+//! The DISTINCT class's group tables keep their slot bits beside their capacity instead of recomputing them on every add
+static constexpr bool kFusedGroupTableCachedBits = true;
 //! The kernel accepts run-length encoded input
 static constexpr bool kFusedRunChannel = true;
 //! The kernel stores each row's hash for the partition build
 static constexpr bool kFusedStoredHash = true;
+//! The folds copy a kept row at a compile-time width when the shape's row has it (16 bytes) instead of the width read
+//! at run time
+static constexpr bool kFusedFixedWidthRowCopy = true;
 //! The partition build chains on the stored hash bits
 static constexpr bool kFusedStoredHashChain = true;
 //! A chunk's bytes are reserved by one fetch_add, rolled back when the sum crosses the drain threshold
@@ -87,12 +95,19 @@ static constexpr bool kFusedAggregateLocalAllowance = true;
 static constexpr bool kFusedSourceTopK = true;
 //! A run partial hands its state over at its seal
 static constexpr bool kRunPartialSeal = true;
+//! The grouped DISTINCT class merges its group tables over slot ranges of one output table, in parallel on its tasks
+static constexpr bool kFusedSlotRangeFinalMerge = true;
 //! A run partial builds its state outside the shared lock
 static constexpr bool kRunPartialLocalBuild = true;
+//! AVG over integers divides in double when the sum and the count are both exact doubles
+static constexpr bool kAverageDoubleFinalize = true;
 //! The radix merge appends a new group without re-copying its string key
 static constexpr bool kBorrowedGroupKeysInCombine = true;
 //! MIN/MAX over strings keep their state in the aggregate's arena
 static constexpr bool kMinMaxStringArena = true;
+//! A chunk whose group keys are all constant updates its one group's state by one simple update per aggregate (count,
+//! min and max of any type; sum and avg of integer or DECIMAL inputs) instead of a per-row update over equal addresses
+static constexpr bool kConstantKeySimpleUpdate = true;
 
 //===--------------------------------------------------------------------===//
 // Global dictionary
@@ -130,10 +145,15 @@ static constexpr bool kDictionarySegmentSkip = true;
 static constexpr bool kDictionarySegmentSkipEager = true;
 //! The segment skip reuses its slot summary across scans
 static constexpr bool kDictionarySegmentSkipReuse = true;
+//! The segment skip also asks a negated `contains` / `LIKE` filter, which prunes a segment only when every entry
+//! holds the needle; off, such a filter answers without the segment's dictionary being read
+static constexpr bool kDictionarySegmentSkipNegated = false;
 //! The dictionary filter compares codes with the one failing or passing code
 static constexpr bool kSingleCodeFilterFastPath = true;
 //! The single-code path unpacks a block of 32 codes to a survivor mask
 static constexpr bool kSingleCodeFilterBlockMask = true;
+//! The block mask's Advanced SIMD form (compiled on aarch64 only; off, aarch64 runs the per-code term)
+static constexpr bool kSingleCodeFilterBlockMaskNeon = true;
 //! The single-code path skips a block of 32 copies of the failing code
 static constexpr bool kSingleCodeFilterBlockSkip = true;
 //! The single-code path also runs under a domain verdict
@@ -146,6 +166,10 @@ static constexpr bool kSegmentObjectCacheReferences = true;
 static constexpr bool kContainsNeonKernel = true;
 //! The RLE select walks the runs and the selection once
 static constexpr bool kRleMergedSelect = true;
+//! The RLE run scan keeps its position and the sink's run count in locals, written back once per call and before a flush
+static constexpr bool kRleScanRunsLocalState = true;
+//! A pushed OR of equality comparisons with constants on one column is evaluated in one pass over the selection
+static constexpr bool kOrEqualsFilterOnePass = true;
 
 //===--------------------------------------------------------------------===//
 // Scans, planning and scheduling
@@ -179,6 +203,9 @@ static constexpr bool kTopNBoundLockFree = true;
 static constexpr bool kTopNWaveGate = false;
 //! A pipeline with one task runs it inline on the scheduling thread
 static constexpr bool kInlineSingleTaskPipelines = true;
+//! A pipeline's chunks are sized to the rows its source and operators can put in them: one row after an ungrouped
+//! aggregate's source, carried through projections; STANDARD_VECTOR_SIZE from the first operator that proves no bound
+static constexpr bool kBoundedPostAggregateChunks = true;
 
 //! A global-dictionary build whose statistics estimate cannot fit the global-dictionary budget beside the
 //! reservations already taken is not started
@@ -196,6 +223,15 @@ static constexpr bool kVectorAlignedDictionarySegments = true;
 //! storage version number; off, it is created at the requested version with the fixed block layout (block-compressed
 //! files are still read)
 static constexpr bool kBlockCompression = true;
+//! At the end of each collection of a bulk append into a block-compressed file, every column's partially filled blocks
+//! are written as they are, one column's segments per block, instead of being merged into the writer's blocks shared by
+//! all columns: a scan of a column reads its own bytes only. A block's unused tail costs only its compressed bytes in
+//! this file; nothing is held longer than without it, and nothing is left for the writer's final flush
+static constexpr bool kColumnPartialBlocksApart = true;
+//! ... only when the buffer manager's memory limit is at least this: each block written apart is zero-filled past its
+//! segments and held as a whole block, which raises a load's peak resident memory (about 2.9 GB at a 25.6 GiB limit) and
+//! a small-memory load pays in swap; there the blocks stay shared as before
+static constexpr uint64_t kColumnPartialBlocksApartMinMemory = uint64_t(48) << 30;
 
 //! A new block-compressed file is created with split dictionaries (storage version 0x40000002, which an older reader
 //! refuses): a DICT_FSST segment of a VARCHAR column keeps its local dictionary in the segment and writes its local
@@ -264,6 +300,8 @@ static constexpr bool kDictionaryEntryLengths = true;
 //! A regular-expression function's constant pattern, compiled once per thread, finds submatches with RE2's tagged DFA
 //! (third_party/re2/re2/tdfa.cc) where RE2 admits the pattern; RE2's other engines run otherwise, with the same results
 static constexpr bool kRegexpTaggedDFA = true;
+//! The tagged DFA searches a constant pattern, which only its local state's thread runs, without the busy flag
+static constexpr bool kRegexpThreadPrivateTDFA = true;
 //! The tagged DFA scans a run of bytes on which a state steps to itself 16 bytes at a time (SSE2 or NEON)
 static constexpr bool kRegexpTDFAVectorScan = true;
 //! regexp_replace without the 'g' option matches the input in place and writes the result string once
@@ -271,9 +309,23 @@ static constexpr bool kRegexpReplaceInPlace = true;
 //! regexp_replace's one-group rewrite of a match spanning the input, and regexp_extract's one group, return the group's
 //! bytes of the input, which the result references; a VARCHAR result over a storage dictionary is kept by reference
 static constexpr bool kRegexpReplaceSliceOutput = true;
+//! regexp_replace without the 'g' option parses a constant rewrite once per call of the function (its highest group,
+//! its validity and the bytes it writes itself) instead of once per input string
+static constexpr bool kRegexpReplaceRewritePlan = true;
 //! In the block-compressed file, a bit-packed group whose offsets from its minimum share a common divisor greater than
 //! one stores the offsets divided by it, at the narrower width (FOR_SCALED); a scan multiplies them back
 static constexpr bool kScaledFrameOfReference = true;
+//! A new block-compressed file is created at the format-riders version (the public version 0x40000005, which
+//! an older reader refuses), whose extents start at multiples of 512 bytes instead of the 4 KiB page, so an extent's
+//! tail is padded to at most 511 bytes; the extent map already records each extent's exact offset and stored length,
+//! so the reads are unchanged, and whether a block is stored as a frame or raw is still decided on the page. A file
+//! below that version keeps its page-aligned extents when written again
+static constexpr bool kExtent512Alignment = true;
+//! In a file at the format-riders version, a non-constant bit-packed group may be PATCHED_FOR: its offsets
+//! from a base are packed at a narrower width than FOR's and the at most 1 % of its values outside that width are
+//! stored raw with their positions (a u16 position and the value each), taken when the group's bytes are fewer than
+//! its stock mode's; a scan unpacks the group and writes the exceptions back
+static constexpr bool kPatchedForBitpacking = true;
 //! A Top-N scan whose order column is filtered by `<> ''` orders its row groups by their minimum non-empty value, so
 //! the row groups holding the smallest non-empty values are scanned first and the Top-N bound tightens early
 static constexpr bool kNonEmptyMinRowGroupOrder = true;

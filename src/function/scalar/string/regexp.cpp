@@ -163,13 +163,45 @@ static unique_ptr<FunctionData> RegexReplaceBind(ClientContext &context, ScalarF
 	return std::move(data);
 }
 
+//! A constant rewrite parsed once (kRegexpReplaceRewritePlan): one more than the highest group it references
+//! (RE2::MaxSubmatch), whether RE2::Rewrite accepts it (a backslash takes a digit or a backslash), the bytes it writes
+//! itself and the groups it references, in order
+struct RegexpRewritePlan {
+	explicit RegexpRewritePlan(const duckdb_re2::StringPiece &rewrite) {
+		for (const char *s = rewrite.data(), *end = s + rewrite.size(); s < end; s++) {
+			if (*s != '\\') {
+				literal_length++;
+				continue;
+			}
+			s++;
+			const int c = s < end ? *s : -1;
+			if (c >= '0' && c <= '9') {
+				group_count = MaxValue(group_count, c - '0' + 1);
+				group_references.push_back(c - '0');
+			} else if (c == '\\') {
+				literal_length++;
+			} else {
+				// RE2::MaxSubmatch reads on past an invalid escape, and so does this parse
+				valid = false;
+			}
+		}
+	}
+
+	int group_count = 1;
+	bool valid = true;
+	idx_t literal_length = 0;
+	vector<int> group_references;
+};
+
 //! RE2::Replace on one string (kRegexpReplaceInPlace): the first match replaced by the rewrite, the input unchanged
-//! when nothing matches or the rewrite is invalid - matched on the input itself and written once into the result
-static string_t ReplaceFirst(const RE2 &pattern, const string_t &input, const string_t &replace, Vector &result) {
+//! when nothing matches or the rewrite is invalid - matched on the input itself and written once into the result; a
+//! constant rewrite comes with its plan, any other is parsed here
+static string_t ReplaceFirst(const RE2 &pattern, const string_t &input, const string_t &replace, Vector &result,
+                             const RegexpRewritePlan *plan = nullptr) {
 	static constexpr int MAX_GROUPS = 17;
 	const auto text = CreateStringPiece(input);
 	const auto rewrite = CreateStringPiece(replace);
-	const int group_count = 1 + RE2::MaxSubmatch(rewrite);
+	const int group_count = plan ? plan->group_count : 1 + RE2::MaxSubmatch(rewrite);
 	duckdb_re2::StringPiece groups[MAX_GROUPS];
 	if (group_count > 1 + pattern.NumberOfCapturingGroups() || group_count > MAX_GROUPS ||
 	    !pattern.Match(text, 0, text.size(), RE2::UNANCHORED, groups, group_count)) {
@@ -177,19 +209,29 @@ static string_t ReplaceFirst(const RE2 &pattern, const string_t &input, const st
 	}
 	// the rewrite's length, with RE2::Rewrite's validity rule: a backslash takes a digit or a backslash
 	idx_t rewrite_length = 0;
-	for (const char *s = rewrite.data(), *end = s + rewrite.size(); s < end; s++) {
-		if (*s != '\\') {
-			rewrite_length++;
-			continue;
-		}
-		s++;
-		const int c = s < end ? *s : -1;
-		if (c >= '0' && c <= '9') {
-			rewrite_length += groups[c - '0'].size();
-		} else if (c == '\\') {
-			rewrite_length++;
-		} else {
+	if (plan) {
+		if (!plan->valid) {
 			return StringVector::AddString(result, input);
+		}
+		rewrite_length = plan->literal_length;
+		for (auto group : plan->group_references) {
+			rewrite_length += groups[group].size();
+		}
+	} else {
+		for (const char *s = rewrite.data(), *end = s + rewrite.size(); s < end; s++) {
+			if (*s != '\\') {
+				rewrite_length++;
+				continue;
+			}
+			s++;
+			const int c = s < end ? *s : -1;
+			if (c >= '0' && c <= '9') {
+				rewrite_length += groups[c - '0'].size();
+			} else if (c == '\\') {
+				rewrite_length++;
+			} else {
+				return StringVector::AddString(result, input);
+			}
 		}
 	}
 	const idx_t prefix = idx_t(groups[0].data() - text.data());
@@ -242,9 +284,16 @@ static void RegexReplaceFunction(DataChunk &args, ExpressionState &state, Vector
 				// ReplaceFirst may return a slice of the input
 				StringVector::AddHeapReference(result, strings);
 			}
+			const bool constant_rewrite = kRegexpReplaceRewritePlan &&
+			                              replaces.GetVectorType() == VectorType::CONSTANT_VECTOR &&
+			                              !ConstantVector::IsNull(replaces);
+			const RegexpRewritePlan plan(constant_rewrite
+			                                 ? CreateStringPiece(*ConstantVector::GetData<string_t>(replaces))
+			                                 : duckdb_re2::StringPiece());
 			BinaryExecutor::Execute<string_t, string_t, string_t>(
 			    strings, replaces, result, args.size(), [&](string_t input, string_t replace) {
-				    return ReplaceFirst(lstate.constant_pattern, input, replace, result);
+				    return ReplaceFirst(lstate.constant_pattern, input, replace, result,
+				                        constant_rewrite ? &plan : nullptr);
 			    });
 			return;
 		}

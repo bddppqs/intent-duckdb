@@ -1,6 +1,8 @@
 #include "duckdb/parallel/pipeline_executor.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
+#include "duckdb/execution/operator/aggregate/physical_ungrouped_aggregate.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #ifdef DUCKDB_DEBUG_ASYNC_SINK_SOURCE
@@ -9,6 +11,15 @@
 #endif
 
 namespace duckdb {
+
+//! The most rows one GetData call of the source writes into its chunk: an ungrouped aggregate proves its own bound; any
+//! other source proves none
+static idx_t SourceRowBound(const PhysicalOperator &source) {
+	if (source.type == PhysicalOperatorType::UNGROUPED_AGGREGATE) {
+		return source.Cast<PhysicalUngroupedAggregate>().SourceRowBound();
+	}
+	return STANDARD_VECTOR_SIZE;
+}
 
 PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_p)
     : pipeline(pipeline_p), thread(context_p), context(context_p, thread, &pipeline_p) {
@@ -27,6 +38,10 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 	}
 	local_source_state = pipeline.source->GetLocalSourceState(context, *pipeline.source_state);
 
+	// a chunk holds the most rows the source and the operators before it can put in it: the source's bound carries
+	// through projections (one output row per input row); any other operator proves none, so its chunk and every later
+	// one are full size
+	idx_t chunk_capacity = kBoundedPostAggregateChunks ? SourceRowBound(*pipeline.source) : STANDARD_VECTOR_SIZE;
 	intermediate_chunks.reserve(pipeline.operators.size());
 	intermediate_states.reserve(pipeline.operators.size());
 	for (idx_t i = 0; i < pipeline.operators.size(); i++) {
@@ -34,8 +49,11 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 		auto &current_operator = pipeline.operators[i].get();
 
 		auto chunk = make_uniq<DataChunk>();
-		chunk->Initialize(BufferAllocator::Get(context.client), prev_operator.GetTypes());
+		chunk->Initialize(BufferAllocator::Get(context.client), prev_operator.GetTypes(), chunk_capacity);
 		intermediate_chunks.push_back(std::move(chunk));
+		if (current_operator.type != PhysicalOperatorType::PROJECTION) {
+			chunk_capacity = STANDARD_VECTOR_SIZE;
+		}
 
 		auto op_state = current_operator.GetOperatorState(context);
 		intermediate_states.push_back(std::move(op_state));
@@ -46,7 +64,7 @@ PipelineExecutor::PipelineExecutor(ClientContext &context_p, Pipeline &pipeline_
 			FinishProcessing();
 		}
 	}
-	InitializeChunk(final_chunk);
+	InitializeChunk(final_chunk, chunk_capacity);
 }
 
 bool PipelineExecutor::TryFlushCachingOperators(ExecutionBudget &chunk_budget) {
@@ -542,8 +560,12 @@ SourceResultType PipelineExecutor::FetchFromSource(DataChunk &result) {
 }
 
 void PipelineExecutor::InitializeChunk(DataChunk &chunk) {
+	InitializeChunk(chunk, STANDARD_VECTOR_SIZE);
+}
+
+void PipelineExecutor::InitializeChunk(DataChunk &chunk, idx_t capacity) {
 	auto &last_op = pipeline.operators.empty() ? *pipeline.source : pipeline.operators.back().get();
-	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes());
+	chunk.Initialize(BufferAllocator::Get(context.client), last_op.GetTypes(), capacity);
 }
 
 void PipelineExecutor::StartOperator(PhysicalOperator &op) {

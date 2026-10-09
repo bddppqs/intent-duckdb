@@ -1667,6 +1667,20 @@ struct ZstdBlockCompressionLevelSetting {
 	static void OnSet(SettingCallbackInfo &info, Value &input);
 };
 
+struct ZstdBulkWriteCompressionLevelSetting {
+	using RETURN_TYPE = idx_t;
+	static constexpr const char *Name = "zstd_bulk_write_compression_level";
+	static constexpr const char *Description =
+	    "The zstd level at which a bulk append's optimistic writer compresses the blocks it writes to a database file "
+	    "that stores compressed blocks (1 to 22; 0 = zstd_block_compression_level applies). The commit's checkpoint "
+	    "and every other block write keep zstd_block_compression_level";
+	static constexpr const char *InputType = "UBIGINT";
+	static constexpr const char *DefaultValue = "0";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
+	static constexpr idx_t SettingIndex = 97;
+	static void OnSet(SettingCallbackInfo &info, Value &input);
+};
+
 struct ZstdMinStringLengthSetting {
 	using RETURN_TYPE = idx_t;
 	static constexpr const char *Name = "zstd_min_string_length";
@@ -1675,11 +1689,11 @@ struct ZstdMinStringLengthSetting {
 	static constexpr const char *InputType = "UBIGINT";
 	static constexpr const char *DefaultValue = "4096";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::GLOBAL_ONLY;
-	static constexpr idx_t SettingIndex = 97;
+	static constexpr idx_t SettingIndex = 98;
 };
 
 struct GeneratedSettingInfo {
-	static constexpr idx_t MaxSettingIndex = 98;
+	static constexpr idx_t MaxSettingIndex = 99;
 };
 
 //===----------------------------------------------------------------------===//

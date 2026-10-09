@@ -677,7 +677,8 @@ class RE2 {
       word_boundary_(false),
       one_line_(false),
       tagged_dfa_(false),
-      tdfa_vector_scan_(true) {
+      tdfa_vector_scan_(true),
+      tdfa_thread_private_(false) {
     }
 
     /*implicit*/ Options(CannedOptions);
@@ -734,6 +735,12 @@ class RE2 {
     bool tdfa_vector_scan() const { return tdfa_vector_scan_; }
     void set_tdfa_vector_scan(bool b) { tdfa_vector_scan_ = b; }
 
+    // The RE2 is searched by one thread at a time, its owner's: the tagged
+    // DFA's search then takes no flag against another thread's. Never set it
+    // for an RE2 that threads may search at once.
+    bool tdfa_thread_private() const { return tdfa_thread_private_; }
+    void set_tdfa_thread_private(bool b) { tdfa_thread_private_ = b; }
+
     void Copy(const Options& src) {
       *this = src;
     }
@@ -756,6 +763,7 @@ class RE2 {
     bool one_line_;
     bool tagged_dfa_;
     bool tdfa_vector_scan_;
+    bool tdfa_thread_private_;
   };
 
   // Returns the options set in the constructor.

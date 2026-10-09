@@ -1,0 +1,228 @@
+# name: test/sql/storage/compression/bitpacking/bitpacking_patched_for.test
+# description: PATCHED_FOR: in a file at the format-riders version, a bit-packed group whose values mostly fall in a narrower window than FOR's stores them at that width and at most 1 % of its values raw, with their positions
+# group: [bitpacking]
+
+require block_size 262144
+
+require vector_size 2048
+
+require skip_reload
+
+# the same rows in a file at the format-riders version (latest) and in a file that never holds PATCHED_FOR (v1.4.0)
+statement ok
+ATTACH '__TEST_DIR__/patched_for_new.db' AS vnew (STORAGE_VERSION 'latest')
+
+statement ok
+ATTACH '__TEST_DIR__/patched_for_old.db' AS vold (STORAGE_VERSION 'v1.4.0')
+
+statement ok
+PRAGMA force_compression = 'bitpacking'
+
+# rare outliers (about 0.5 % of a 2048-value group) over a narrow range, for every type bit-packing serves with integer
+# arithmetic; outliers in both directions and at the 64-bit limits (the base wraps in unsigned arithmetic); a seconds
+# timestamp (a divisor of 10^6 with outlier clocks); NULLs; exactly 20 outliers per group (the cap: patched) and 21 (one
+# more than the cap: FOR); inlier widths at the effective-width boundary (28 bits patched and 29 bits rounded to 32 on
+# INTEGER, 55 and 57 on BIGINT); a range without outliers (FOR); a sequence (CONSTANT_DELTA); HUGEINT keeps FOR
+statement ok
+CREATE TABLE vnew.t AS SELECT
+	i,
+	CASE WHEN i % 211 = 0 THEN 1099511627776 + i ELSE (i * 7919) % 1000 END AS p64,
+	CASE WHEN i % 307 = 0 THEN -4611686018427387904 + i WHEN i % 401 = 0 THEN 4611686018427387904 - i ELSE (i * 31) % 5000 - 2500 END AS both64,
+	CASE WHEN i % 997 = 0 THEN -9223372036854775808 ELSE -1 - (i * 13) % 100 END AS limitlo,
+	CASE WHEN i % 991 = 0 THEN 9223372036854775807 ELSE (i * 13) % 100 END AS limithi,
+	(CASE WHEN i % 389 = 0 THEN 18446744073709551615 - i ELSE (i * 17) % 4096 END)::UBIGINT AS ulimit,
+	(CASE WHEN i % 211 = 0 THEN 1000000000 + i ELSE (i * 7919) % 300 END)::INTEGER AS p32,
+	(CASE WHEN i % 211 = 0 THEN 30000 ELSE (i * 7919) % 30 END)::SMALLINT AS p16,
+	(CASE WHEN i % 211 = 0 THEN 100 ELSE i % 4 END)::TINYINT AS p8,
+	(CASE WHEN i % 211 = 0 THEN 250 ELSE i % 4 END)::UTINYINT AS pu8,
+	(CASE WHEN i % 211 = 0 THEN 65000 ELSE i % 64 END)::USMALLINT AS pu16,
+	(CASE WHEN i % 211 = 0 THEN 4000000000 ELSE (i * 7919) % 5000 END)::UINTEGER AS pu32,
+	TIMESTAMP '2021-03-01' + to_seconds(CASE WHEN i % 223 = 0 THEN -(i * 86400) ELSE (i * 7919) % 86400 END) AS ts,
+	DATE '2021-03-01' + (CASE WHEN i % 227 = 0 THEN 100000 + i ELSE (i * 7) % 60 END)::INTEGER AS dt,
+	(CASE WHEN i % 211 = 0 THEN 1000000000000 + i ELSE (i * 7919) % 1000 END)::DECIMAL(18, 2) AS dec,
+	CASE WHEN i % 5 = 0 THEN NULL WHEN i % 211 = 1 THEN 1099511627776 ELSE (i * 13) % 1000 END AS nulls,
+	CASE WHEN i % 2048 < 20 THEN 1000000000 + i ELSE i % 100 END AS cap20,
+	CASE WHEN i % 2048 < 21 THEN 1000000000 + i ELSE i % 100 END AS cap21,
+	(CASE WHEN i % 211 = 0 THEN 1073741824 + i ELSE (hash(i) % 268435456)::BIGINT END)::INTEGER AS w28,
+	(CASE WHEN i % 211 = 0 THEN 1610612736 + i ELSE (hash(i) % 536870912)::BIGINT END)::INTEGER AS w29,
+	CASE WHEN i % 211 = 0 THEN 4611686018427387904 + i ELSE (hash(i) % 36028797018963968)::BIGINT END AS w55,
+	CASE WHEN i % 211 = 0 THEN 4611686018427387904 + i ELSE (hash(i) % 144115188075855872)::BIGINT END AS w57,
+	(i * 7919) % 1000 AS plain,
+	(CASE WHEN i % 211 = 0 THEN 1099511627776 + i ELSE (i * 7919) % 1000 END)::HUGEINT AS huge
+FROM range(300000) r(i)
+
+statement ok
+CREATE TABLE vold.t AS FROM vnew.t
+
+statement ok
+CHECKPOINT vnew
+
+statement ok
+CHECKPOINT vold
+
+query TT
+SELECT column_name, bool_or(coalesce(segment_info, '') LIKE '%PATCHED_FOR%') FROM pragma_storage_info('vnew.t')
+WHERE segment_type NOT IN ('VALIDITY') GROUP BY ALL ORDER BY column_name
+----
+both64	true
+cap20	true
+cap21	false
+dec	true
+dt	true
+huge	false
+i	false
+limithi	true
+limitlo	true
+nulls	true
+p16	true
+p32	true
+p64	true
+p8	true
+plain	false
+pu16	true
+pu32	true
+pu8	true
+ts	true
+ulimit	true
+w28	true
+w29	false
+w55	true
+w57	false
+
+# the file without the mode holds none
+query I
+SELECT count(*) FROM pragma_storage_info('vold.t') WHERE coalesce(segment_info, '') LIKE '%PATCHED_FOR%'
+----
+0
+
+# every value round-trips: a full scan, both directions
+query I
+SELECT count(*) FROM (FROM vnew.t EXCEPT ALL FROM vold.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM vold.t EXCEPT ALL FROM vnew.t)
+----
+0
+
+# a scan that skips (a selective filter on another column), and a filter on a patched column itself
+query IIIII
+SELECT sum(p64), sum(both64::HUGEINT), sum(limitlo::HUGEINT + limithi), max(ts), count(nulls) FROM vnew.t WHERE i % 7 = 3
+----
+223200912154205	-156797324626526013679	-42810	2021-03-01 23:59:59	34285
+
+query IIIII
+SELECT sum(p64), sum(both64::HUGEINT), sum(limitlo::HUGEINT + limithi), max(ts), count(nulls) FROM vold.t WHERE i % 7 = 3
+----
+223200912154205	-156797324626526013679	-42810	2021-03-01 23:59:59	34285
+
+query II
+SELECT count(*), sum(i) FROM vnew.t WHERE p64 > 1000000 AND cap20 > 999999999 AND ulimit > 1000000
+----
+1	0
+
+query I
+SELECT count(*) FROM (SELECT i, p64, limitlo, limithi, ulimit, ts FROM vnew.t WHERE p64 > 999 OR limitlo < -100 OR limithi > 99 OR ulimit > 4095 OR ts < TIMESTAMP '2021-03-01'
+EXCEPT ALL SELECT i, p64, limitlo, limithi, ulimit, ts FROM vold.t WHERE p64 > 999 OR limitlo < -100 OR limithi > 99 OR ulimit > 4095 OR ts < TIMESTAMP '2021-03-01')
+----
+0
+
+# a fetch of single rows (an index lookup) at group starts, ends, exceptions and the last row
+statement ok
+CREATE INDEX vnew_i ON vnew.t(i)
+
+query I
+SELECT count(*) FROM (SELECT * FROM vnew.t WHERE i IN (0, 1, 211, 2047, 2048, 4095, 4096, 121880, 122880, 150000, 211000, 299999)
+EXCEPT ALL SELECT * FROM vold.t WHERE i IN (0, 1, 211, 2047, 2048, 4095, 4096, 121880, 122880, 150000, 211000, 299999))
+----
+0
+
+query IIII
+SELECT p64, limitlo, limithi, cap20 FROM vnew.t WHERE i = 2048
+----
+112	-25	24	1000002048
+
+# the files reopened: the same rows
+statement ok
+DETACH vnew
+
+statement ok
+DETACH vold
+
+statement ok
+ATTACH '__TEST_DIR__/patched_for_new.db' AS vnew
+
+statement ok
+ATTACH '__TEST_DIR__/patched_for_old.db' AS vold
+
+query I
+SELECT count(*) FROM (FROM vnew.t EXCEPT ALL FROM vold.t)
+----
+0
+
+query I
+SELECT count(*) FROM (FROM vold.t EXCEPT ALL FROM vnew.t)
+----
+0
+
+# an update and a delete rewrite some row groups; the rest stay as written
+statement ok
+UPDATE vnew.t SET p64 = p64 + 1 WHERE i % 1000 = 0
+
+statement ok
+UPDATE vold.t SET p64 = p64 + 1 WHERE i % 1000 = 0
+
+statement ok
+DELETE FROM vnew.t WHERE i BETWEEN 100000 AND 130000
+
+statement ok
+DELETE FROM vold.t WHERE i BETWEEN 100000 AND 130000
+
+statement ok
+CHECKPOINT vnew
+
+statement ok
+CHECKPOINT vold
+
+query I
+SELECT count(*) FROM (FROM vnew.t EXCEPT ALL FROM vold.t)
+----
+0
+
+# forced PATCHED_FOR (the debug setting): a group with a layout is patched
+statement ok
+SET force_bitpacking_mode = 'patched_for'
+
+query I
+SELECT current_setting('force_bitpacking_mode') = 'patched_for'
+----
+true
+
+statement ok
+CREATE TABLE vnew.f AS SELECT i, CASE WHEN i % 1024 = 0 THEN 4095 ELSE (i * 7) % 2048 END AS v FROM range(100000) r(i)
+
+statement ok
+CHECKPOINT vnew
+
+query I
+SELECT bool_or(coalesce(segment_info, '') LIKE '%PATCHED_FOR%') FROM pragma_storage_info('vnew.f') WHERE column_name = 'v'
+----
+true
+
+query II
+SELECT count(*), sum(v) FROM vnew.f WHERE v = 4095 OR v < 2048
+----
+100000	102652526
+
+statement ok
+SET force_bitpacking_mode = 'auto'
+
+# a new block-compressed file is created at the format-riders version 0x40000005 (little-endian after the magic "DUCK")
+statement ok
+DETACH vnew
+
+query II
+SELECT substr(hex(content), 17, 8), substr(hex(content), 25, 16) FROM read_blob('__TEST_DIR__/patched_for_new.db')
+----
+4455434B	0500004000000000

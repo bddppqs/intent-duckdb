@@ -1,0 +1,99 @@
+# name: test/sql/aggregate/group/fold_fixed_width_copy.test
+# description: The folds' fixed-width row copy (kFusedFixedWidthRowCopy): a kept 16-byte row is copied at that
+#              compile-time width, every other row width at the width read at run time. The DISTINCT class's fold at
+#              row widths 16 and 12 and the last-key fold at row widths 16, 12, 20 and 24, each over runs of equal keys
+#              (the fold drops rows, so each later kept row is copied down): the fold engaged (folded_rows on the
+#              analyzed plan) and the answers in closed form, at threads 1, 2 and 8. The answers are the same with the
+#              copy at either width. No require line.
+# group: [group]
+
+# td16: g and x in 9 bytes (a 16-byte row with the stored hash); each (g, x) in a run of 3, every g holding 8,000
+# distinct x, or 500 distinct x2 (x2 repeats across runs that are not adjacent)
+statement ok
+CREATE TABLE td16 AS SELECT ((i // 3) % 100)::INTEGER AS g, ((i // 3) * 4294967311)::BIGINT AS x, (((i // 3) % 50000) * 4294967311)::BIGINT AS x2 FROM range(2400000) t(i);
+
+# td12: g and x in at most 8 bytes (a 12-byte row with the stored hash)
+statement ok
+CREATE TABLE td12 AS SELECT ((i // 3) % 100)::SMALLINT AS g, ((i // 3) * 7919 % 2147483647)::INTEGER AS x FROM range(2400000) t(i);
+
+# tl: COUNT-only grouped shapes in runs of 3 (the last-key fold): k4, k5 (8 key bytes, a 16-byte row), k6, k7 (a
+# 12-byte row), k1, k2 (12 key bytes, a 20-byte row), k1, k3 (16 key bytes, a 24-byte row)
+statement ok
+CREATE TABLE tl AS SELECT ((i // 3) * 4294967311)::BIGINT AS k1, ((i // 3) % 1000)::INTEGER AS k2, (((i // 3) % 77777) * 4294967311)::BIGINT AS k3, ((i // 3) * 7919 % 2147483647)::INTEGER AS k4, ((i // 3) * 104729 % 2147483647)::INTEGER AS k5, ((i // 3) % 100)::SMALLINT AS k6, ((i // 300) % 100)::SMALLINT AS k7 FROM range(2400000) t(i);
+
+# the folds engaged: rows folded on every shape
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM td16 GROUP BY g;
+----
+analyzed_plan	<REGEX>:.*folded_rows=[1-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(DISTINCT x) AS u FROM td12 GROUP BY g;
+----
+analyzed_plan	<REGEX>:.*folded_rows=[1-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT k4, k5, count(*) AS c FROM tl GROUP BY k4, k5;
+----
+analyzed_plan	<REGEX>:.*fold=last_key.*folded_rows=[1-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT k6, k7, count(*) AS c FROM tl GROUP BY k6, k7;
+----
+analyzed_plan	<REGEX>:.*fold=last_key.*folded_rows=[1-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT k1, k2, count(*) AS c FROM tl GROUP BY k1, k2;
+----
+analyzed_plan	<REGEX>:.*fold=last_key.*folded_rows=[1-9].*
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT k1, k3, count(*) AS c FROM tl GROUP BY k1, k3;
+----
+analyzed_plan	<REGEX>:.*fold=last_key.*folded_rows=[1-9].*
+
+foreach threads 1 2 8
+
+statement ok
+SET threads=${threads}
+
+# the DISTINCT class's fold, 16-byte rows
+query IIIII
+SELECT count(*), sum(u), min(u), max(u), sum(g * u) FROM (SELECT g, count(DISTINCT x) AS u FROM td16 GROUP BY g);
+----
+100	800000	8000	8000	39600000
+
+query IIIII
+SELECT count(*), sum(u), min(u), max(u), sum(g * u) FROM (SELECT g, count(DISTINCT x2) AS u FROM td16 GROUP BY g);
+----
+100	50000	500	500	2475000
+
+# the DISTINCT class's fold, 12-byte rows
+query IIIII
+SELECT count(*), sum(u), min(u), max(u), sum(g * u) FROM (SELECT g, count(DISTINCT x) AS u FROM td12 GROUP BY g);
+----
+100	800000	8000	8000	39600000
+
+# the last-key fold at 16, 12, 20 and 24 bytes: groups, counts, and each group's key pair weighted by its count equal to
+# the same over the rows
+query IIIII
+SELECT count(*), sum(c), min(c), max(c), sum(hash(k4, k5)::HUGEINT * c) = (SELECT sum(hash(k4, k5)::HUGEINT) FROM tl) FROM (SELECT k4, k5, count(*) AS c FROM tl GROUP BY k4, k5);
+----
+800000	2400000	3	3	true
+
+query IIIII
+SELECT count(*), sum(c), min(c), max(c), sum(hash(k6, k7)::HUGEINT * c) = (SELECT sum(hash(k6, k7)::HUGEINT) FROM tl) FROM (SELECT k6, k7, count(*) AS c FROM tl GROUP BY k6, k7);
+----
+10000	2400000	240	240	true
+
+query IIIII
+SELECT count(*), sum(c), min(c), max(c), sum(hash(k1, k2)::HUGEINT * c) = (SELECT sum(hash(k1, k2)::HUGEINT) FROM tl) FROM (SELECT k1, k2, count(*) AS c FROM tl GROUP BY k1, k2);
+----
+800000	2400000	3	3	true
+
+query IIIII
+SELECT count(*), sum(c), min(c), max(c), sum(hash(k1, k3)::HUGEINT * c) = (SELECT sum(hash(k1, k3)::HUGEINT) FROM tl) FROM (SELECT k1, k3, count(*) AS c FROM tl GROUP BY k1, k3);
+----
+800000	2400000	3	3	true
+
+endloop

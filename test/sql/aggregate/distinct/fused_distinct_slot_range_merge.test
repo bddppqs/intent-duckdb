@@ -1,0 +1,195 @@
+# name: test/sql/aggregate/distinct/fused_distinct_slot_range_merge.test
+# description: The grouped DISTINCT class's slot-range merge (kFusedSlotRangeFinalMerge): every task hands its group table
+#              in, and the tasks merge slot ranges of one output table. Answers against a formulation outside the class
+#              (DISTINCT (g, x) pairs counted per g, the plain aggregates per g) for: group tables that grow, keys whose
+#              hash homes sit just before a range boundary (displaced entries crossing it) and at the table's last slot
+#              (wrap-around), per-task tables of unequal capacities, the mixed shape's companions (smaller and larger
+#              than the output), two keys, an output the group sketch under-sized; the marker ranges=<n> of EXPLAIN
+#              ANALYZE (n > 0 merged over ranges, 0 the degenerate sets: one task, one non-empty table)
+# group: [distinct]
+
+statement ok
+SET threads=8
+
+# the home slots (top 16 hash bits) right before every boundary of 2 to 8 ranges over 65,536 slots, and the last slot
+statement ok
+CREATE TABLE homes AS SELECT DISTINCT (65536 * k // n - 1)::UBIGINT AS h FROM range(2, 9) a(n), range(1, 8) b(k) WHERE k < n UNION ALL SELECT 65535::UBIGINT;
+
+# t1: 20,000 groups of 110 distinct x (every task's table holds them all and grows to 65,536 slots), and the keys of
+# [1,000,000, 3,200,000) whose hash homes are those slots (about 34 each), 10 distinct x per key
+statement ok
+CREATE TABLE t1 AS SELECT (i % 20000)::INTEGER AS g, (i // 20000)::BIGINT AS x, (i % 7)::SMALLINT AS s FROM range(2200000) t(i) UNION ALL SELECT g::INTEGER, x::BIGINT, (x % 7)::SMALLINT FROM (SELECT g FROM range(1000000, 3200000) t(g) WHERE (hash(g) >> 48) IN (SELECT h FROM homes)), range(10) r(x);
+
+query I
+SELECT count(*) > 700 FROM (SELECT DISTINCT g FROM t1 WHERE g >= 1000000)
+----
+true
+
+# t2: 100 groups in every partition, and 7,392 groups of one row each: about 1,024 groups per task at 8 tasks, so
+# tables of 2,048 and 4,096 slots meet in one merge; the output is larger than both
+statement ok
+CREATE TABLE t2 AS SELECT (i % 100)::INTEGER AS g, (i // 100)::BIGINT AS x, (i % 5)::SMALLINT AS s FROM range(2200000) t(i) UNION ALL SELECT (100 + i)::INTEGER, (50000000 + i)::BIGINT, 1::SMALLINT FROM range(7392) t(i);
+
+# t3: 50 groups: the companions (sized for a whole chunk) are larger than the 1,024-slot output
+statement ok
+CREATE TABLE t3 AS SELECT (i % 50)::INTEGER AS g, (i // 50)::BIGINT AS x, (i % 9)::SMALLINT AS s FROM range(2200000) t(i);
+
+# t4: one (g, x) pair: one non-empty partition, one task
+statement ok
+CREATE TABLE t4 AS SELECT 3::INTEGER AS g, 5::BIGINT AS x, 1::SMALLINT AS s FROM range(2200000) t(i);
+
+# t5: two SMALLINT keys and a BIGINT x (the 12-byte key region): 200 groups of 5,500 distinct x
+statement ok
+CREATE TABLE t5 AS SELECT (i % 10)::SMALLINT AS g1, ((i // 10) % 20)::SMALLINT AS g2, (i // 400)::BIGINT AS x FROM range(2200000) t(i);
+
+# t6: 100 groups in every partition, and the keys of [1,000, 521,000) whose hash has its low 6 bits zero, one row each:
+# the sketch counts them all in one register, so the output is sized for far fewer groups and the tail re-inserts it
+statement ok
+CREATE TABLE t6 AS SELECT (i % 100)::INTEGER AS g, (i // 100)::BIGINT AS x, (i % 5)::SMALLINT AS s FROM range(2200000) t(i) UNION ALL SELECT g::INTEGER, (100000000 + g)::BIGINT, 1::SMALLINT FROM range(1000, 521000) t(g) WHERE hash(g) & 63 = 0;
+
+# t1, count(DISTINCT) alone: merged over ranges; the answer equals the pairs counted per g
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g) EXCEPT (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g))
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g) EXCEPT (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g))
+----
+0
+
+query II
+SELECT count(*) = (SELECT count(DISTINCT g) FROM t1), sum(u) = (SELECT count(*) FROM (SELECT DISTINCT g, x FROM t1)) FROM (SELECT g, count(DISTINCT x) AS u FROM t1 GROUP BY g)
+----
+true	true
+
+# t1, the mixed shape: the companions merged over the same ranges
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, round(avg(s) * count(*))::BIGINT AS a FROM t1 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss, q.a FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss, sum(s)::BIGINT AS a FROM t1 GROUP BY g) q USING (g)))
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss, round(avg(s) * count(*))::BIGINT AS a FROM t1 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss, q.a FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss, sum(s)::BIGINT AS a FROM t1 GROUP BY g) q USING (g)))
+----
+0
+
+query I
+SELECT count(*) = (SELECT count(DISTINCT g) FROM t1) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g)
+----
+true
+
+# t2, tables of unequal capacities: count(DISTINCT) alone and the mixed shape
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u FROM t2 GROUP BY g) EXCEPT (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t2) GROUP BY g))
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u FROM t2 GROUP BY g) EXCEPT (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t2) GROUP BY g))
+----
+0
+
+query IIII
+SELECT count(*), sum(u), min(u), max(u) FROM (SELECT g, count(DISTINCT x) AS u FROM t2 GROUP BY g)
+----
+7492	2207392	1	22000
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t2 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t2) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t2 GROUP BY g) q USING (g)))
+----
+0
+
+query IIII
+SELECT count(*), sum(u), sum(c), sum(ss) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t2 GROUP BY g)
+----
+7492	2207392	2207392	4407392
+
+# t3, the mixed shape on 50 groups: the companions are larger than the output
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t3 GROUP BY g
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query IIII
+SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t3 GROUP BY g ORDER BY g LIMIT 3
+----
+0	44000	44000	176000
+1	44000	44000	175999
+2	44000	44000	175998
+
+query IIII
+SELECT count(*), sum(u), sum(c), sum(ss) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t3 GROUP BY g)
+----
+50	2200000	2200000	8799990
+
+# t4, one non-empty table: the degenerate set merges alone
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM t4 GROUP BY g
+----
+analyzed_plan	<REGEX>:.*ranges=0.*
+
+query III
+SELECT g, count(DISTINCT x) AS u, count(*) AS c FROM t4 GROUP BY g
+----
+3	1	2200000
+
+# t5, two keys
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g1, g2, count(DISTINCT x) AS u FROM t5 GROUP BY g1, g2
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query IIII
+SELECT count(*), sum(u), min(u), max(u) FROM (SELECT g1, g2, count(DISTINCT x) AS u FROM t5 GROUP BY g1, g2)
+----
+200	1100000	5500	5500
+
+# t6, an output the sketch under-sized: the mixed shape
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t6 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t6) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t6 GROUP BY g) q USING (g)))
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t6 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t6) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t6 GROUP BY g) q USING (g)))
+----
+0
+
+query II
+SELECT count(*) = (SELECT count(DISTINCT g) FROM t6), count(*) > 8000 FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t6 GROUP BY g)
+----
+true	true
+
+# three tasks: ranges whose boundaries are not powers of two
+statement ok
+SET threads=3
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) q USING (g)))
+----
+analyzed_plan	<REGEX>:.*ranges=[1-9].*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) q USING (g)))
+----
+0
+
+# one task: the degenerate set merges alone, with the same answers
+statement ok
+SET threads=1
+
+query II
+EXPLAIN (ANALYZE, FORMAT JSON) SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g
+----
+analyzed_plan	<REGEX>:.*ranges=0.*
+
+query I
+SELECT count(*) FROM ((SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) EXCEPT (SELECT p.g, p.u, q.c, q.ss FROM (SELECT g, count(*) AS u FROM (SELECT DISTINCT g, x FROM t1) GROUP BY g) p JOIN (SELECT g, count(*) AS c, sum(s) AS ss FROM t1 GROUP BY g) q USING (g)))
+----
+0
+
+query IIII
+SELECT count(*), sum(u), sum(c), sum(ss) FROM (SELECT g, count(DISTINCT x) AS u, count(*) AS c, sum(s) AS ss FROM t2 GROUP BY g)
+----
+7492	2207392	2207392	4407392

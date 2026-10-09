@@ -11,6 +11,7 @@
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 #include "duckdb/storage/table/column_segment.hpp"
@@ -24,6 +25,9 @@
 #include <cstring>
 #if defined(__SSE2__)
 #include <emmintrin.h>
+#elif defined(__aarch64__) && !defined(__AARCH64EB__) && (defined(__GNUC__) || defined(__clang__))
+#include <arm_neon.h>
+#define DUCKDB_SINGLE_CODE_NEON 1
 #endif
 #ifndef _WIN32
 #include <unistd.h>
@@ -86,6 +90,12 @@ static bool DictionarySegmentSkipEagerEnabled() {
 //! The skip's reuse of its slot summary across scans (off: the fresh form, no slot summary read or written)
 static bool DictionarySegmentSkipReuseEnabled() {
 	return kDictionarySegmentSkipReuse;
+}
+
+//! The skip's ask of a negated canonical filter (off: a negated `contains` answers NO_PRUNING_POSSIBLE before the
+//! segment's scan state, and so its dictionary block, is initialized)
+static bool DictionarySegmentSkipNegatedEnabled() {
+	return kDictionarySegmentSkipNegated;
 }
 
 struct DictFSSTCompressionStorage {
@@ -567,6 +577,16 @@ static FilterPropagateResult DictionarySegmentSkipCheckDomain(ColumnSegment &seg
 	return FilterPropagateResult::FILTER_ALWAYS_FALSE;
 }
 
+//! Whether `filter` is a canonical `contains` under OPERATOR_NOT (the key's leading NOT bit)
+static bool IsNegatedCanonicalFilter(const TableFilter &filter) {
+	if (filter.filter_type != TableFilterType::EXPRESSION_FILTER ||
+	    filter.Cast<ExpressionFilter>().expr->GetExpressionType() != ExpressionType::OPERATOR_NOT) {
+		return false;
+	}
+	string key;
+	return CanonicalFilterKey(filter, key) && !key.empty() && key[0] != '\x00';
+}
+
 static FilterPropagateResult DictFSSTCheckDomain(ColumnSegment &segment, ColumnScanState &state,
                                                  const TableFilter &filter) {
 	const bool s1 = DictionarySegmentSkipEnabled();
@@ -574,6 +594,11 @@ static FilterPropagateResult DictFSSTCheckDomain(ColumnSegment &segment, ColumnS
 		return DictFSSTCheckDomainBase(segment, state, filter);
 	}
 	if (segment.segment_type != ColumnSegmentType::PERSISTENT || !state.current) {
+		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
+	}
+	if (!DictionarySegmentSkipNegatedEnabled() && IsNegatedCanonicalFilter(filter)) {
+		// a negated filter prunes only a segment whose every entry holds the needle, and the domain walk does not
+		// take an expression filter: answer before the scan state pins the segment's dictionary block
 		return FilterPropagateResult::NO_PRUNING_POSSIBLE;
 	}
 	if (!state.initialized) {
@@ -944,6 +969,8 @@ static constexpr uint8_t SINGLE_CODE_ONE_PASSES = 2;
 static bool SingleCodeFilterBlockMaskEnabled() {
 #if defined(__SSE2__)
 	return kSingleCodeFilterBlockMask;
+#elif defined(DUCKDB_SINGLE_CODE_NEON)
+	return kSingleCodeFilterBlockMask && kSingleCodeFilterBlockMaskNeon;
 #else
 	return false;
 #endif
@@ -953,7 +980,7 @@ static bool SingleCodeFilterBlockSkipEnabled() {
 	return kSingleCodeFilterBlockSkip;
 }
 
-#if defined(__SSE2__)
+#if defined(__SSE2__) || defined(DUCKDB_SINGLE_CODE_NEON)
 // The block mask's survivor extraction: the block's 32-bit mask by SSE2 compares
 // of its 32 unpacked codes (four uint32_t lanes per compare on the generic x86-64 target: no -march, no runtime
 // dispatch, no __AVX2__ path), packed to 32 bits; the survivors written per 8-bit mask group from a 256-entry table of 8
@@ -961,7 +988,8 @@ static bool SingleCodeFilterBlockSkipEnabled() {
 // _mm_add_epi32, two unconditional 128-bit stores per group, the output advanced by the group's popcount (read from a
 // 256-entry count table beside the index table: __builtin_popcount is a libgcc call at this target); no per-survivor
 // branch, the survivors in ascending order. The stores stay inside a STANDARD_VECTOR_SIZE output: before a group the
-// output holds at most the rows before it, so its eight slots end at or before the vector's last slot.
+// output holds at most the rows before it, so its eight slots end at or before the vector's last slot. On aarch64 the
+// Advanced SIMD twins below compute the same mask and write the same output.
 struct alignas(16) SingleCodeBlockTable {
 	uint32_t index[256][8]; // the set lanes of each 8-bit mask, ascending, zero-padded to 8
 	uint8_t count[256];     // the popcount of each 8-bit mask
@@ -988,7 +1016,9 @@ static const SingleCodeBlockTable &SingleCodeGetBlockTable() {
 	static const SingleCodeBlockTable table = SingleCodeBuildBlockTable();
 	return table;
 }
+#endif
 
+#if defined(__SSE2__)
 // ONE_FAILS: lane i set iff code i passes the per-code term, code != c && (code != 0 || null_passes); fails_zero is
 // all-ones when null_passes is 0 (the NULL slot's code 0 fails) and zero otherwise
 static inline uint32_t SingleCodeFailsMask(const uint32_t *codes, const __m128i vc, const __m128i fails_zero) {
@@ -1025,6 +1055,58 @@ static inline uint32_t *SingleCodeExtractBlock(const SingleCodeBlockTable &table
 		const __m128i *entry = reinterpret_cast<const __m128i *>(table.index[m8]);
 		_mm_storeu_si128(reinterpret_cast<__m128i *>(out), _mm_add_epi32(_mm_load_si128(entry), add));
 		_mm_storeu_si128(reinterpret_cast<__m128i *>(out + 4), _mm_add_epi32(_mm_load_si128(entry + 1), add));
+		out += table.count[m8];
+	}
+	return out;
+}
+#endif
+
+#if defined(DUCKDB_SINGLE_CODE_NEON)
+// The Advanced SIMD twin of the SSE2 helpers above: the same masks and the same output, bit for bit. The 32 compare
+// results (all-ones or zero per uint32_t lane) narrow to 32 bytes, each byte keeps its lane's bit within its group of 8,
+// and three pairwise adds sum each group of 8 bytes into one mask byte (the bits are distinct, so no carry).
+static inline uint32_t SingleCodeLaneMask(const uint32x4_t lanes[8]) {
+	const uint8x16_t lo = vcombine_u8(vmovn_u16(vcombine_u16(vmovn_u32(lanes[0]), vmovn_u32(lanes[1]))),
+	                                  vmovn_u16(vcombine_u16(vmovn_u32(lanes[2]), vmovn_u32(lanes[3]))));
+	const uint8x16_t hi = vcombine_u8(vmovn_u16(vcombine_u16(vmovn_u32(lanes[4]), vmovn_u32(lanes[5]))),
+	                                  vmovn_u16(vcombine_u16(vmovn_u32(lanes[6]), vmovn_u32(lanes[7]))));
+	static const uint8_t BIT_WEIGHTS[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+	const uint8x16_t weights = vld1q_u8(BIT_WEIGHTS);
+	uint8x16_t sum = vpaddq_u8(vandq_u8(lo, weights), vandq_u8(hi, weights));
+	sum = vpaddq_u8(sum, sum);
+	sum = vpaddq_u8(sum, sum);
+	return vgetq_lane_u32(vreinterpretq_u32_u8(sum), 0);
+}
+
+// ONE_FAILS (as the SSE2 form): lane i set iff code != c && (code != 0 || null_passes)
+static inline uint32_t SingleCodeFailsMask(const uint32_t *codes, const uint32x4_t vc, const uint32x4_t fails_zero) {
+	const uint32x4_t zero = vdupq_n_u32(0);
+	uint32x4_t fail[8];
+	for (uint32_t q = 0; q < 8; q++) {
+		const uint32x4_t v = vld1q_u32(codes + 4 * q);
+		fail[q] = vorrq_u32(vceqq_u32(v, vc), vandq_u32(vceqq_u32(v, zero), fails_zero));
+	}
+	return ~SingleCodeLaneMask(fail);
+}
+
+// ONE_PASSES (as the SSE2 form): lane i set iff code == c || (code == 0 && null_passes)
+static inline uint32_t SingleCodePassesMask(const uint32_t *codes, const uint32x4_t vc, const uint32x4_t passes_zero) {
+	const uint32x4_t zero = vdupq_n_u32(0);
+	uint32x4_t pass[8];
+	for (uint32_t q = 0; q < 8; q++) {
+		const uint32x4_t v = vld1q_u32(codes + 4 * q);
+		pass[q] = vorrq_u32(vceqq_u32(v, vc), vandq_u32(vceqq_u32(v, zero), passes_zero));
+	}
+	return SingleCodeLaneMask(pass);
+}
+
+// the survivors of one block (base: its first row) written at out; returns the output's new end
+static inline uint32_t *SingleCodeExtractBlock(const SingleCodeBlockTable &table, uint32_t mask, uint32_t base, uint32_t *out) {
+	for (uint32_t g = 0; g < 4; g++) {
+		const uint32_t m8 = (mask >> (8 * g)) & 0xFFu;
+		const uint32x4_t add = vdupq_n_u32(base + 8 * g);
+		vst1q_u32(out, vaddq_u32(vld1q_u32(table.index[m8]), add));
+		vst1q_u32(out + 4, vaddq_u32(vld1q_u32(table.index[m8] + 4), add));
 		out += table.count[m8];
 	}
 	return out;
@@ -1209,6 +1291,12 @@ static idx_t SingleCodeBlockSurvivors(CompressedStringScanState &scan_state, idx
 	const __m128i vc = _mm_set1_epi32(int(c));
 	// ONE_FAILS: all-ones iff the NULL slot fails; ONE_PASSES: all-ones iff it passes
 	const __m128i zero_term = _mm_set1_epi32(fails ? (null_passes ? 0 : -1) : (null_passes ? -1 : 0));
+#elif defined(DUCKDB_SINGLE_CODE_NEON)
+	const bool mask_scan = SingleCodeFilterBlockMaskEnabled();
+	const SingleCodeBlockTable &table = SingleCodeGetBlockTable();
+	const uint32x4_t vc = vdupq_n_u32(c);
+	// ONE_FAILS: all-ones iff the NULL slot fails; ONE_PASSES: all-ones iff it passes
+	const uint32x4_t zero_term = vdupq_n_u32(fails ? (null_passes ? 0u : ~0u) : (null_passes ? ~0u : 0u));
 #else
 	const bool mask_scan = false;
 #endif
@@ -1223,7 +1311,7 @@ static idx_t SingleCodeBlockSurvivors(CompressedStringScanState &scan_state, idx
 		}
 		BitpackingPrimitives::UnPackBlock<sel_t>(data_ptr_cast(slots), block_packed, width);
 		const auto base = UnsafeNumericCast<sel_t>(block * BLOCK);
-#if defined(__SSE2__)
+#if defined(__SSE2__) || defined(DUCKDB_SINGLE_CODE_NEON)
 		if (mask_scan) {
 			const uint32_t mask = fails ? SingleCodeFailsMask(slots, vc, zero_term) : SingleCodePassesMask(slots, vc, zero_term);
 			end = SingleCodeExtractBlock(table, mask, base, end);

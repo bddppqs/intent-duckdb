@@ -45,7 +45,9 @@
 // Concurrency: one search at a time runs a program's automata, under a flag
 // taken with an atomic exchange (acquire) and released with a store
 // (release); states and transitions are built only by that search. A search
-// that finds the flag taken runs the other engines.
+// that finds the flag taken runs the other engines. A thread-private program
+// (RE2::Options::set_tdfa_thread_private) is searched by one thread at a time
+// by its owner's contract, and its searches take no flag.
 
 #include <stdint.h>
 #include <string.h>
@@ -551,8 +553,9 @@ int TDFA::Search(const StringPiece& text, StringPiece* match, int nmatch) {
 
 // Programs whose instructions are all Fail, Nop, Capture (of a group),
 // ByteRange and Match. Call before any search; vector_scan: the scan of a run
-// takes 16-byte blocks where the state admits it.
-void Prog::EnableTDFA(bool vector_scan) {
+// takes 16-byte blocks where the state admits it; thread_private: searches take
+// no flag.
+void Prog::EnableTDFA(bool vector_scan, bool thread_private) {
   if (reversed_ || tdfa_admitted_)
     return;
   for (int id = 0; id < size_; id++) {
@@ -573,6 +576,7 @@ void Prog::EnableTDFA(bool vector_scan) {
   }
   tdfa_admitted_ = true;
   tdfa_vector_scan_ = vector_scan;
+  tdfa_thread_private_ = thread_private;
   tdfa_budget_ = std::min(kMaxBudget, dfa_mem_/4);
   dfa_mem_ -= tdfa_budget_;
 }
@@ -589,6 +593,8 @@ int Prog::SearchTDFA(const StringPiece& text, const StringPiece& context,
   if (anchor_end() && ctx.data()+ctx.size() != text.data()+text.size())
     return 0;
   const bool endmatch = kind == kFullMatch || anchor_end();
+  if (tdfa_thread_private_)
+    return SearchTDFAThreadPrivate(text, endmatch, match, nmatch);
   // One search at a time; another thread meanwhile runs another engine.
   if (tdfa_busy_.exchange(true, std::memory_order_acquire))
     return -1;
@@ -598,6 +604,19 @@ int Prog::SearchTDFA(const StringPiece& text, const StringPiece& context,
   const int r = t->Search(text, match, nmatch);
   tdfa_busy_.store(false, std::memory_order_release);
   return r;
+}
+
+// The search of a thread-private program: its owner's thread alone searches it,
+// so no flag is taken. Out of line, so that path has a symbol of its own.
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+int Prog::SearchTDFAThreadPrivate(const StringPiece& text, bool endmatch,
+                                  StringPiece* match, int nmatch) {
+  TDFA*& t = tdfa_[endmatch ? 1 : 0][nmatch];
+  if (t == NULL)
+    t = new TDFA(this, endmatch, nmatch, &tdfa_budget_);
+  return t->Search(text, match, nmatch);
 }
 
 void Prog::DeleteTDFAs() {

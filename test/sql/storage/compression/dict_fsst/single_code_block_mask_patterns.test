@@ -1,0 +1,94 @@
+# name: test/sql/storage/compression/dict_fsst/single_code_block_mask_patterns.test
+# description: The single-code block mask (SSE2 on x86-64, its Advanced SIMD twin on aarch64: kSingleCodeFilterBlockMask,
+#              kSingleCodeFilterBlockMaskNeon): a two-value DICT_FSST column whose every group of 8 rows takes each of the
+#              256 pass/fail patterns in turn, in vectors with and without NULL rows, under = and <> with the constant
+#              present and absent and with NULL rows passing or failing, equals the same filters over an uncompressed copy
+# group: [dict_fsst]
+
+require vector_size 2048
+
+load __TEST_DIR__/single_code_block_mask_patterns.db readwrite v1.5.0
+
+statement ok
+CREATE TABLE src AS SELECT i, CASE WHEN (i // 2048) % 3 = 1 AND i % 5 = 0 THEN NULL WHEN (((i // 8) % 256) >> (i % 8)) & 1 = 1 THEN 'aaaaaaaaaaaaaaaaaaaa' ELSE 'bbbbbbbbbbbbbbbbbbbb' END AS s FROM range(262144) t(i)
+
+# the compression is chosen at the checkpoint: t_dict under dict_fsst, then t_ref under uncompressed
+statement ok
+PRAGMA force_compression='dict_fsst'
+
+statement ok
+CREATE TABLE t_dict AS SELECT i, s FROM src ORDER BY i
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_compression='uncompressed'
+
+statement ok
+CREATE TABLE t_ref AS SELECT i, s FROM src ORDER BY i
+
+statement ok
+CHECKPOINT
+
+statement ok
+PRAGMA force_compression='auto'
+
+# the scans below read the checkpointed segments
+restart
+
+statement ok
+PRAGMA enable_verification
+
+query I
+SELECT bool_and(compression = 'DICT_FSST') FROM pragma_storage_info('t_dict') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+query I
+SELECT bool_and(compression = 'Uncompressed') FROM pragma_storage_info('t_ref') WHERE column_name = 's' AND segment_type = 'VARCHAR'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+foreach tbl t_dict t_ref
+
+# one code fails (<>), NULL rows fail
+query III nosort ne_a_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s <> 'aaaaaaaaaaaaaaaaaaaa'
+
+# one code passes (=)
+query III nosort eq_a_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s = 'aaaaaaaaaaaaaaaaaaaa'
+
+query III nosort ne_b_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s <> 'bbbbbbbbbbbbbbbbbbbb'
+
+query III nosort eq_b_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s = 'bbbbbbbbbbbbbbbbbbbb'
+
+# a constant absent from the dictionary
+query III nosort ne_absent_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s <> 'absent'
+
+query III nosort eq_absent_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s = 'absent'
+
+# NULL rows pass
+query III nosort ne_a_or_null_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s <> 'aaaaaaaaaaaaaaaaaaaa' OR s IS NULL
+
+query III nosort eq_a_or_null_${t}
+SELECT count(*), sum(i), sum((i * i) % 1000003) FROM ${tbl} WHERE s = 'aaaaaaaaaaaaaaaaaaaa' OR s IS NULL
+
+# the rows themselves, first and last of each pattern block, in order
+query II nosort rows_ne_a_${t}
+SELECT i, s FROM ${tbl} WHERE s <> 'aaaaaaaaaaaaaaaaaaaa' AND (i < 4096 OR i >= 258048) ORDER BY i
+
+endloop
+
+endloop

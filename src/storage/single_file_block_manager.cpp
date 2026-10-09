@@ -50,9 +50,10 @@ static constexpr idx_t ENCRYPTION_METADATA_LEN = 8;
 //===--------------------------------------------------------------------===//
 // A file created at this storage version stores every block as one variable-length extent: the block header (the
 // checksum of the uncompressed payload), then the payload as one zstd frame, or raw when the frame does not save at
-// least one page. Extents are page-aligned and appended at the end of the file; an extent map (block id -> offset,
-// stored length) is written as one raw extent before each database header, which records its position. The buffer
-// pool, the block ids and every segment format are unchanged: a block is decompressed when it is read from the file.
+// least one page. Extents are page-aligned (512-byte aligned at FORMAT_RIDERS_VERSION_NUMBER with kExtent512Alignment)
+// and appended at the end of the file; an extent map (block id -> offset, stored length) is written as one raw extent
+// before each database header, which records its position. The buffer pool, the block ids and every segment format are
+// unchanged: a block is decompressed when it is read from the file.
 //! A value outside upstream DuckDB's sequential storage-version range, so other readers refuse the file.
 static constexpr uint64_t BLOCK_COMPRESSION_VERSION_NUMBER = 0x40000001;
 //! The release successor of BLOCK_COMPRESSION_VERSION_NUMBER, written whenever a new file stores its blocks compressed:
@@ -70,19 +71,34 @@ static constexpr uint64_t PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER = 0x40000003;
 //! code (kDictionaryEntryLengths); a reader without them refuses it by its version, and this reader opens all four
 //! block-compressed versions
 static constexpr uint64_t DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER = 0x40000004;
+//! The successor of DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER, written whenever a new file stores its blocks compressed
+//! and kExtent512Alignment or kPatchedForBitpacking is on: the storage version whose extents start at multiples of
+//! EXTENT_512_ALIGNMENT (kExtent512Alignment) and whose bit-packing groups may be PATCHED_FOR (kPatchedForBitpacking);
+//! a reader without them refuses it by its version, and this reader opens all five block-compressed versions (the
+//! public number of the intent.8 release, assigned at its cut)
+static constexpr uint64_t FORMAT_RIDERS_VERSION_NUMBER = 0x40000005;
 //! Every block-compressed file version shares the layout
 static bool IsBlockCompressedVersion(uint64_t version_number) {
 	return version_number == BLOCK_COMPRESSION_VERSION_NUMBER || version_number == RELEASE_STORAGE_VERSION_NUMBER ||
 	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
-	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
+	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER || version_number == FORMAT_RIDERS_VERSION_NUMBER;
 }
 //! The release storage version or a successor: the file properties of the release version hold at each
 static bool IsReleaseStorageVersion(uint64_t version_number) {
 	return version_number == RELEASE_STORAGE_VERSION_NUMBER ||
 	       version_number == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
-	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
+	       version_number == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER || version_number == FORMAT_RIDERS_VERSION_NUMBER;
 }
+//! The page: the extent alignment of a block-compressed file below FORMAT_RIDERS_VERSION_NUMBER, and the least saving
+//! for which a block is stored as a frame rather than raw (in every compressed file)
 static constexpr idx_t BLOCK_EXTENT_ALIGNMENT = 4096;
+//! The extent alignment of a file at FORMAT_RIDERS_VERSION_NUMBER with kExtent512Alignment
+static constexpr idx_t EXTENT_512_ALIGNMENT = 512;
+//! The extent alignment of a block-compressed file at this version
+static idx_t ExtentAlignment(uint64_t version_number) {
+	return kExtent512Alignment && version_number == FORMAT_RIDERS_VERSION_NUMBER ? EXTENT_512_ALIGNMENT
+	                                                                            : BLOCK_EXTENT_ALIGNMENT;
+}
 //! The automatic block level (zstd_block_compression_level = 0): the high level with at least this many threads
 static constexpr int32_t BLOCK_COMPRESSION_HIGH_LEVEL_THREADS = 64;
 static constexpr int BLOCK_COMPRESSION_HIGH_LEVEL = 9;
@@ -116,7 +132,21 @@ BlockCompressionState &GetBlockCompressionState() {
 	thread_local BlockCompressionState state;
 	return state;
 }
+
+//! Whether the calling thread is inside a BulkAppendWriteScope
+bool &BulkAppendWriteActive() {
+	thread_local bool active = false;
+	return active;
+}
 } // namespace
+
+BulkAppendWriteScope::BulkAppendWriteScope() : previous(BulkAppendWriteActive()) {
+	BulkAppendWriteActive() = true;
+}
+
+BulkAppendWriteScope::~BulkAppendWriteScope() {
+	BulkAppendWriteActive() = previous;
+}
 
 // Early writeback
 //===--------------------------------------------------------------------===//
@@ -505,12 +535,19 @@ bool SingleFileBlockManager::WritesStringMinNonEmpty() const {
 bool SingleFileBlockManager::PersistedRowGroupIndex() const {
 	return kPersistedRowGroupIndex && block_compression && options.version_number.IsValid() &&
 	       (options.version_number.GetIndex() == PERSISTED_ROW_GROUP_INDEX_VERSION_NUMBER ||
-	        options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER);
+	        options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER ||
+	        options.version_number.GetIndex() == FORMAT_RIDERS_VERSION_NUMBER);
 }
 
 bool SingleFileBlockManager::DictionaryEntryLengths() const {
 	return kDictionaryEntryLengths && block_compression && options.version_number.IsValid() &&
-	       options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
+	       (options.version_number.GetIndex() == DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER ||
+	        options.version_number.GetIndex() == FORMAT_RIDERS_VERSION_NUMBER);
+}
+
+bool SingleFileBlockManager::PatchedForFile() const {
+	return kPatchedForBitpacking && block_compression && options.version_number.IsValid() &&
+	       options.version_number.GetIndex() == FORMAT_RIDERS_VERSION_NUMBER;
 }
 
 SingleFileBlockManager::~SingleFileBlockManager() {
@@ -701,8 +738,10 @@ void SingleFileBlockManager::CreateNewDatabase(QueryContext context) {
 	if (kBlockCompression && options.version_number.GetIndex() >= 68 && !encryption_enabled && !options.use_direct_io) {
 		// a new file at the latest storage version stores its blocks compressed
 		block_compression = true;
-		options.version_number = DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
+		options.version_number = kExtent512Alignment || kPatchedForBitpacking ? FORMAT_RIDERS_VERSION_NUMBER
+		                                                                      : DICTIONARY_ENTRY_LENGTHS_VERSION_NUMBER;
 		scaled_frame_of_reference = true;
+		extent_alignment = ExtentAlignment(options.version_number.GetIndex());
 		next_extent_offset = BLOCK_START;
 	}
 	db.GetStorageManager().SetStorageVersion(options.storage_version.GetIndex());
@@ -890,6 +929,7 @@ void SingleFileBlockManager::LoadExistingDatabase(QueryContext context) {
 	options.version_number = main_header.version_number;
 	block_compression = IsBlockCompressedVersion(main_header.version_number);
 	scaled_frame_of_reference = IsReleaseStorageVersion(main_header.version_number);
+	extent_alignment = ExtentAlignment(main_header.version_number);
 	if (block_compression && (main_header.IsEncrypted() || options.use_direct_io)) {
 		throw IOException("Cannot open database \"%s\": compressed blocks (storage version %llu) are not supported "
 		                  "together with encryption or direct IO",
@@ -1483,7 +1523,7 @@ void SingleFileBlockManager::Write(QueryContext context, FileBuffer &buffer, blo
 
 uint64_t SingleFileBlockManager::AllocateExtent(idx_t bytes) {
 	lock_guard<mutex> guard(extent_lock);
-	return AllocateExtentLocked(AlignValue<idx_t>(bytes, BLOCK_EXTENT_ALIGNMENT));
+	return AllocateExtentLocked(AlignValue<idx_t>(bytes, extent_alignment));
 }
 
 uint64_t SingleFileBlockManager::AllocateExtentLocked(idx_t size) {
@@ -1564,6 +1604,14 @@ void SingleFileBlockManager::WriteCompressedBlock(QueryContext context, FileBuff
 	auto bound = duckdb_zstd::ZSTD_compressBound(payload_size);
 	auto staging = state.Staging(header_size + bound);
 	auto level = NumericCast<int>(Settings::Get<ZstdBlockCompressionLevelSetting>(db.GetDatabase()));
+	if (BulkAppendWriteActive()) {
+		// a bulk append's own blocks: the bulk level when set, so the extra compression of a higher level is spent
+		// while the append runs, not in the commit's checkpoint
+		auto bulk_level = NumericCast<int>(Settings::Get<ZstdBulkWriteCompressionLevelSetting>(db.GetDatabase()));
+		if (bulk_level != 0) {
+			level = bulk_level;
+		}
+	}
 	if (level == 0) {
 		// automatic: the higher level pays for its compression time only when enough threads write in parallel
 		level = TaskScheduler::GetScheduler(db.GetDatabase()).NumberOfThreads() >= BLOCK_COMPRESSION_HIGH_LEVEL_THREADS
@@ -1592,7 +1640,7 @@ void SingleFileBlockManager::WriteCompressedBlock(QueryContext context, FileBuff
 	{
 		unique_lock<mutex> guard(extent_lock);
 		extent_cv.wait(guard, [&]() { return !extent_compacting; });
-		offset = AllocateExtentLocked(AlignValue<idx_t>(bytes, BLOCK_EXTENT_ALIGNMENT));
+		offset = AllocateExtentLocked(AlignValue<idx_t>(bytes, extent_alignment));
 		extent_io++;
 	}
 	try {
@@ -1725,7 +1773,7 @@ void SingleFileBlockManager::CompactAfterCommit(QueryContext context, const set<
 				continue;
 			}
 			live.push_back({extents[i].offset,
-			                AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, BLOCK_EXTENT_ALIGNMENT), i});
+			                AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, extent_alignment), i});
 		}
 		std::sort(live.begin(), live.end(), [](const LiveExtent &a, const LiveExtent &b) { return a.offset < b.offset; });
 		struct Hole {
@@ -1809,9 +1857,9 @@ void SingleFileBlockManager::RelocateExtentMapLow(QueryContext context, const se
 		lock_guard<mutex> guard(extent_lock);
 		// room for block_count entries: WriteExtentMap writes at most that many
 		auto map_size =
-		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + block_count * EXTENT_MAP_ENTRY_SIZE, BLOCK_EXTENT_ALIGNMENT);
+		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + block_count * EXTENT_MAP_ENTRY_SIZE, extent_alignment);
 		auto current_size =
-		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + extent_map_entries * EXTENT_MAP_ENTRY_SIZE, BLOCK_EXTENT_ALIGNMENT);
+		    AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + extent_map_entries * EXTENT_MAP_ENTRY_SIZE, extent_alignment);
 		if (extent_map_offset == 0 || extent_map_offset + current_size != next_extent_offset) {
 			// the map does not end the file: nothing it pins
 			return;
@@ -1863,12 +1911,12 @@ void SingleFileBlockManager::RebuildFreeExtents() {
 			continue;
 		}
 		held.emplace_back(extents[i].offset,
-		                  AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, BLOCK_EXTENT_ALIGNMENT));
+		                  AlignValue<idx_t>(GetBlockHeaderSize() + extents[i].length, extent_alignment));
 	}
 	if (extent_map_offset != 0) {
 		held.emplace_back(extent_map_offset, AlignValue<idx_t>(EXTENT_MAP_HEADER_SIZE + extent_map_entries *
 		                                                                                   EXTENT_MAP_ENTRY_SIZE,
-		                                                       BLOCK_EXTENT_ALIGNMENT));
+		                                                       extent_alignment));
 	}
 	std::sort(held.begin(), held.end());
 	vector<pair<uint64_t, idx_t>> ranges;
@@ -1892,7 +1940,7 @@ void SingleFileBlockManager::RebuildFreeExtents() {
 void SingleFileBlockManager::LoadExtentMap(QueryContext context, idx_t map_offset, idx_t map_entries) {
 	lock_guard<mutex> guard(extent_lock);
 	extents.clear();
-	auto file_end = AlignValue<idx_t>(MaxValue<idx_t>(handle->GetFileSize(), BLOCK_START), BLOCK_EXTENT_ALIGNMENT);
+	auto file_end = AlignValue<idx_t>(MaxValue<idx_t>(handle->GetFileSize(), BLOCK_START), extent_alignment);
 	if (map_offset == 0) {
 		// no checkpoint has written blocks yet
 		next_extent_offset = file_end;
@@ -1923,10 +1971,10 @@ void SingleFileBlockManager::LoadExtentMap(QueryContext context, idx_t map_offse
 	for (auto &extent : extents) {
 		if (extent.offset != 0) {
 			held.emplace_back(extent.offset,
-			                  AlignValue<idx_t>(GetBlockHeaderSize() + extent.length, BLOCK_EXTENT_ALIGNMENT));
+			                  AlignValue<idx_t>(GetBlockHeaderSize() + extent.length, extent_alignment));
 		}
 	}
-	held.emplace_back(map_offset, AlignValue<idx_t>(map_size, BLOCK_EXTENT_ALIGNMENT));
+	held.emplace_back(map_offset, AlignValue<idx_t>(map_size, extent_alignment));
 	std::sort(held.begin(), held.end());
 	vector<pair<uint64_t, idx_t>> ranges;
 	uint64_t position = BLOCK_START;

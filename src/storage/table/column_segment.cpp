@@ -1,6 +1,8 @@
 #include "duckdb/storage/table/column_segment.hpp"
 
 #include "duckdb/common/limits.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/types/null_value.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/main/config.hpp"
@@ -426,6 +428,179 @@ static void FilterSelectionSwitch(UnifiedVectorFormat &vdata, T predicate, Selec
 	sel.Initialize(new_sel);
 }
 
+//===--------------------------------------------------------------------===//
+// OR of equality comparisons, one pass
+//===--------------------------------------------------------------------===//
+// A pushed OR of k equality comparisons with constants on one integer column (an OR of equalities, or the keys a
+// first-keys aggregate pushes) evaluated in one pass over the selection instead of k: the constants go into a table
+// without collisions (a multiplicative hash; every empty slot holds the first constant, so a row equals its slot's
+// constant iff it equals some constant), and each row costs one hash, one load and one compare whatever k is. The
+// output is the per-child loop's exactly: the rows that pass, ordered by the first child they pass, in selection order
+// within a child.
+static constexpr idx_t OR_EQUALS_MIN_KEYS = 2;
+static constexpr idx_t OR_EQUALS_MAX_KEYS = 32;
+static constexpr idx_t OR_EQUALS_MAX_SLOT_BITS = 10;
+
+template <class T>
+struct OrEqualsKeyTable {
+	T key[idx_t(1) << OR_EQUALS_MAX_SLOT_BITS];
+	uint8_t child[idx_t(1) << OR_EQUALS_MAX_SLOT_BITS];
+	uint64_t multiplier;
+	idx_t shift;
+
+	inline idx_t Slot(T value) const {
+		using UNSIGNED = typename MakeUnsigned<T>::type;
+		return UnsafeNumericCast<idx_t>((uint64_t(UNSIGNED(value)) * multiplier) >> shift);
+	}
+
+	//! Places keys[0..count) without collisions (a repeated key keeps its first child); false if no multiplier of the
+	//! list does it at up to 2^OR_EQUALS_MAX_SLOT_BITS slots
+	bool Build(const T *keys, idx_t count) {
+		static constexpr uint64_t MULTIPLIERS[] = {0x9E3779B97F4A7C15ULL, 0xC2B2AE3D27D4EB4FULL, 0x165667B19E3779F9ULL,
+		                                           0xD6E8FEB86659FD93ULL, 0xFF51AFD7ED558CCDULL, 0xC4CEB9FE1A85EC53ULL,
+		                                           0x94D049BB133111EBULL, 0xBF58476D1CE4E5B9ULL};
+		static constexpr uint8_t EMPTY = 0xFF;
+		idx_t bits = 4;
+		while ((idx_t(1) << bits) < 4 * count) {
+			bits++;
+		}
+		for (; bits <= OR_EQUALS_MAX_SLOT_BITS; bits++) {
+			const idx_t slots = idx_t(1) << bits;
+			shift = 64 - bits;
+			for (auto m : MULTIPLIERS) {
+				multiplier = m;
+				memset(child, EMPTY, slots);
+				bool placed = true;
+				for (idx_t k = 0; k < count && placed; k++) {
+					const auto s = Slot(keys[k]);
+					if (child[s] == EMPTY) {
+						key[s] = keys[k];
+						child[s] = UnsafeNumericCast<uint8_t>(k);
+					} else if (key[s] != keys[k]) {
+						placed = false;
+					}
+				}
+				if (!placed) {
+					continue;
+				}
+				for (idx_t s = 0; s < slots; s++) {
+					if (child[s] == EMPTY) {
+						key[s] = keys[0];
+						child[s] = 0;
+					}
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+//! The rows that pass, in selection order, with the first child each passes; returns their count
+template <class T, bool HAS_NULL>
+static idx_t OrEqualsSelection(UnifiedVectorFormat &vdata, const OrEqualsKeyTable<T> &table, SelectionVector &sel,
+                               idx_t approved_tuple_count, SelectionVector &matched, uint8_t *first_child) {
+	auto &mask = vdata.validity;
+	auto vec = UnifiedVectorFormat::GetData<T>(vdata);
+	idx_t match_count = 0;
+	for (idx_t i = 0; i < approved_tuple_count; i++) {
+		const auto idx = sel.get_index(i);
+		const auto vector_idx = vdata.sel->get_index(idx);
+		const T value = vec[vector_idx];
+		const auto s = table.Slot(value);
+		const bool hit = (!HAS_NULL || mask.RowIsValid(vector_idx)) && table.key[s] == value;
+		matched.set_index(match_count, idx);
+		first_child[match_count] = table.child[s];
+		match_count += hit;
+	}
+	return match_count;
+}
+
+template <class T>
+static bool OrEqualsFilterSelection(UnifiedVectorFormat &vdata, const ConjunctionOrFilter &filter, SelectionVector &sel,
+                                    idx_t &approved_tuple_count) {
+	const idx_t key_count = filter.child_filters.size();
+	T keys[OR_EQUALS_MAX_KEYS];
+	for (idx_t k = 0; k < key_count; k++) {
+		keys[k] = filter.child_filters[k]->Cast<ConstantFilter>().constant.GetValueUnsafe<T>();
+	}
+	OrEqualsKeyTable<T> table;
+	if (!table.Build(keys, key_count)) {
+		return false;
+	}
+	SelectionVector matched(approved_tuple_count);
+	auto first_child = make_unsafe_uniq_array_uninitialized<uint8_t>(MaxValue<idx_t>(approved_tuple_count, 1));
+	idx_t match_count;
+	if (vdata.validity.AllValid()) {
+		match_count = OrEqualsSelection<T, false>(vdata, table, sel, approved_tuple_count, matched, first_child.get());
+	} else {
+		match_count = OrEqualsSelection<T, true>(vdata, table, sel, approved_tuple_count, matched, first_child.get());
+	}
+	// the per-child loop's order: grouped by the first child passed (a stable counting sort), selection order within;
+	// when every row passes the same first child that is the selection order already
+	bool one_child = true;
+	for (idx_t i = 1; i < match_count && one_child; i++) {
+		one_child = first_child[i] == first_child[0];
+	}
+	approved_tuple_count = match_count;
+	if (one_child) {
+		sel.Initialize(matched);
+		return true;
+	}
+	idx_t offsets[OR_EQUALS_MAX_KEYS + 1] = {0};
+	for (idx_t i = 0; i < match_count; i++) {
+		offsets[first_child[i] + 1]++;
+	}
+	for (idx_t k = 0; k < key_count; k++) {
+		offsets[k + 1] += offsets[k];
+	}
+	SelectionVector result_sel(match_count);
+	for (idx_t i = 0; i < match_count; i++) {
+		result_sel.set_index(offsets[first_child[i]]++, matched.get_index(i));
+	}
+	sel.Initialize(result_sel);
+	return true;
+}
+
+//! The one-pass form of an OR of equality comparisons with constants on an integer column; false (nothing done) for any
+//! other filter, type or count
+static bool TryOrEqualsFilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
+                                       const ConjunctionOrFilter &filter, idx_t &approved_tuple_count) {
+	const idx_t key_count = filter.child_filters.size();
+	if (!kOrEqualsFilterOnePass || key_count < OR_EQUALS_MIN_KEYS || key_count > OR_EQUALS_MAX_KEYS) {
+		return false;
+	}
+	for (auto &child : filter.child_filters) {
+		if (child->filter_type != TableFilterType::CONSTANT_COMPARISON) {
+			return false;
+		}
+		auto &constant_filter = child->Cast<ConstantFilter>();
+		if (constant_filter.comparison_type != ExpressionType::COMPARE_EQUAL || constant_filter.constant.IsNull()) {
+			return false;
+		}
+	}
+	switch (vector.GetType().InternalType()) {
+	case PhysicalType::INT8:
+		return OrEqualsFilterSelection<int8_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::INT16:
+		return OrEqualsFilterSelection<int16_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::INT32:
+		return OrEqualsFilterSelection<int32_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::INT64:
+		return OrEqualsFilterSelection<int64_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::UINT8:
+		return OrEqualsFilterSelection<uint8_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::UINT16:
+		return OrEqualsFilterSelection<uint16_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::UINT32:
+		return OrEqualsFilterSelection<uint32_t>(vdata, filter, sel, approved_tuple_count);
+	case PhysicalType::UINT64:
+		return OrEqualsFilterSelection<uint64_t>(vdata, filter, sel, approved_tuple_count);
+	default:
+		return false;
+	}
+}
+
 template <bool IS_NULL>
 static idx_t TemplatedNullSelection(UnifiedVectorFormat &vdata, SelectionVector &sel, idx_t &approved_tuple_count) {
 	auto &mask = vdata.validity;
@@ -462,11 +637,14 @@ idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, Unifi
 		return opt_filter.FilterSelection(sel, vector, vdata, filter_state, scan_count, approved_tuple_count);
 	}
 	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction_or = filter.Cast<ConjunctionOrFilter>();
+		if (TryOrEqualsFilterSelection(sel, vector, vdata, conjunction_or, approved_tuple_count)) {
+			return approved_tuple_count;
+		}
 		// similar to the CONJUNCTION_AND, but we need to take care of the SelectionVectors (OR all of them)
 		auto &state = filter_state.Cast<ConjunctionOrFilterState>();
 		idx_t count_total = 0;
 		SelectionVector result_sel(approved_tuple_count);
-		auto &conjunction_or = filter.Cast<ConjunctionOrFilter>();
 		for (idx_t child_idx = 0; child_idx < conjunction_or.child_filters.size(); child_idx++) {
 			auto &child_filter = *conjunction_or.child_filters[child_idx];
 			SelectionVector temp_sel;

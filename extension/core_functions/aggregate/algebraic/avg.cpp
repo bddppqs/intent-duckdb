@@ -2,6 +2,7 @@
 #include "core_functions/aggregate/sum_helpers.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
+#include "duckdb/common/tuning_defaults.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/planner/expression.hpp"
@@ -99,6 +100,40 @@ static T GetAverageDivident(uint64_t count, optional_ptr<FunctionData> bind_data
 	return divident;
 }
 
+//! An integer average's sum and count below this magnitude are exact doubles
+static constexpr uint64_t AVERAGE_EXACT_DOUBLE_LIMIT = uint64_t(1) << 53;
+
+//! Whether an integer average without a DECIMAL scale divides in double: its sum and its count are both exact doubles,
+//! so one IEEE division gives the correctly rounded quotient
+static bool AverageDividesInDouble(const AvgState<hugeint_t> &state, optional_ptr<FunctionData> bind_data) {
+	if (!kAverageDoubleFinalize || bind_data || state.count >= AVERAGE_EXACT_DOUBLE_LIMIT) {
+		return false;
+	}
+	// |sum| < 2^53: a non-negative sum in the lower word alone, or a negative one with the upper word all ones
+	auto &sum = state.value;
+	if (sum.upper == 0) {
+		return sum.lower < AVERAGE_EXACT_DOUBLE_LIMIT;
+	}
+	return sum.upper == -1 && sum.lower > NumericLimits<uint64_t>::Maximum() - AVERAGE_EXACT_DOUBLE_LIMIT + 1;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+// The two finalize divisions stay out of line, one symbol per path
+#define AVERAGE_DIVIDE_NOINLINE __attribute__((noinline))
+#else
+#define AVERAGE_DIVIDE_NOINLINE
+#endif
+
+//! The quotient of a sum and a count that are both exact doubles
+AVERAGE_DIVIDE_NOINLINE static double AverageDivideDouble(const hugeint_t &sum, uint64_t count) {
+	return Hugeint::Cast<double>(sum) / double(count);
+}
+
+//! The quotient in long double, for any sum and divident
+AVERAGE_DIVIDE_NOINLINE static long double AverageDivideLongDouble(const hugeint_t &sum, long double divident) {
+	return Hugeint::Cast<long double>(sum) / divident;
+}
+
 struct IntegerAverageOperation : public BaseSumOperation<AverageSetOperation, RegularAdd> {
 	template <class INPUT_TYPE, class STATE, class OP>
 	static void RunOperation(STATE &state, const INPUT_TYPE &input, idx_t count) {
@@ -126,9 +161,11 @@ struct IntegerAverageOperationHugeint : public BaseSumOperation<AverageSetOperat
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
+		} else if (AverageDividesInDouble(state, finalize_data.input.bind_data)) {
+			target = AverageDivideDouble(state.value, state.count);
 		} else {
 			long double divident = GetAverageDivident<long double>(state.count, finalize_data.input.bind_data);
-			target = Hugeint::Cast<long double>(state.value) / divident;
+			target = AverageDivideLongDouble(state.value, divident);
 		}
 	}
 };
@@ -152,9 +189,11 @@ struct HugeintAverageOperation : public BaseSumOperation<AverageSetOperation, Hu
 	static void Finalize(STATE &state, T &target, AggregateFinalizeData &finalize_data) {
 		if (state.count == 0) {
 			finalize_data.ReturnNull();
+		} else if (AverageDividesInDouble(state, finalize_data.input.bind_data)) {
+			target = AverageDivideDouble(state.value, state.count);
 		} else {
 			long double divident = GetAverageDivident<long double>(state.count, finalize_data.input.bind_data);
-			target = Hugeint::Cast<long double>(state.value) / divident;
+			target = AverageDivideLongDouble(state.value, divident);
 		}
 	}
 };

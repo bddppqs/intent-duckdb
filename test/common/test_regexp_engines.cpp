@@ -162,7 +162,7 @@ duckdb::vector<string> ClassRunInputs(const ClassRunCase &c) {
 	return inputs;
 }
 
-RE2::Options PatternOptions(const string &letters, bool tagged_dfa, int64_t max_mem = 0) {
+RE2::Options PatternOptions(const string &letters, bool tagged_dfa, int64_t max_mem = 0, bool thread_private = false) {
 	RE2::Options options;
 	options.set_log_errors(false);
 	for (auto letter : letters) {
@@ -173,6 +173,7 @@ RE2::Options PatternOptions(const string &letters, bool tagged_dfa, int64_t max_
 		}
 	}
 	options.set_tagged_dfa(tagged_dfa);
+	options.set_tdfa_thread_private(thread_private);
 	if (max_mem > 0) {
 		options.set_max_mem(max_mem);
 	}
@@ -208,11 +209,12 @@ string Results(const RE2 &re, const PatternCase &c, const string &input) {
 	return result;
 }
 
-idx_t CompareEngines(const duckdb::vector<string> &inputs, int64_t max_mem, idx_t &compiled) {
+idx_t CompareEngines(const duckdb::vector<string> &inputs, int64_t max_mem, idx_t &compiled,
+                     bool thread_private = false) {
 	idx_t mismatches = 0;
 	for (auto &c : Patterns()) {
 		RE2 reference(c.pattern, PatternOptions(c.options, false, max_mem));
-		RE2 tagged(c.pattern, PatternOptions(c.options, true, max_mem));
+		RE2 tagged(c.pattern, PatternOptions(c.options, true, max_mem, thread_private));
 		// a budget too small for the program fails both compilations alike
 		REQUIRE(reference.ok() == tagged.ok());
 		if (!reference.ok()) {
@@ -225,7 +227,8 @@ idx_t CompareEngines(const duckdb::vector<string> &inputs, int64_t max_mem, idx_
 				pattern_mismatches++;
 			}
 		}
-		INFO("pattern " << c.pattern << " options " << c.options << " max_mem " << max_mem);
+		INFO("pattern " << c.pattern << " options " << c.options << " max_mem " << max_mem << " thread_private "
+		                << thread_private);
 		CHECK(pattern_mismatches == 0);
 		mismatches += pattern_mismatches;
 	}
@@ -351,5 +354,98 @@ TEST_CASE("RE2's tagged DFA is shared safely by concurrent searches", "[regexp]"
 		}
 		INFO("pattern " << c.pattern);
 		REQUIRE(mismatches.load() == 0);
+	}
+}
+
+TEST_CASE("RE2's thread-private tagged DFA gives the same results as without its tagged DFA", "[regexp]") {
+	auto inputs = Inputs();
+	RE2 owned(Patterns()[0].pattern, PatternOptions("", true, 0, true));
+	REQUIRE(owned.options().tdfa_thread_private());
+	REQUIRE(!RE2(Patterns()[0].pattern).options().tdfa_thread_private());
+	// the default memory budget, and budgets the tagged DFA runs out of partway or before its first state
+	for (int64_t max_mem : {int64_t(0), int64_t(1) << 17, int64_t(1) << 16, int64_t(1) << 15}) {
+		idx_t compiled = 0;
+		REQUIRE(CompareEngines(inputs, max_mem, compiled, true) == 0);
+		INFO("max_mem " << max_mem << " compiled " << compiled);
+		REQUIRE(compiled >= (max_mem == 0 ? Patterns().size() : 20));
+	}
+}
+
+TEST_CASE("RE2's thread-private tagged DFAs, one per thread, search concurrently", "[regexp]") {
+	auto inputs = Inputs();
+	const idx_t thread_count = 64;
+	for (idx_t p = 0; p < 4; p++) {
+		auto &c = Patterns()[p];
+		RE2 reference(c.pattern, PatternOptions(c.options, false));
+		duckdb::vector<string> expected;
+		for (auto &input : inputs) {
+			expected.push_back(Results(reference, c, input));
+		}
+		std::atomic<idx_t> mismatches {0};
+		duckdb::vector<std::thread> threads;
+		for (idx_t t = 0; t < thread_count; t++) {
+			threads.emplace_back([&, t]() {
+				// each thread compiles and alone searches its own pattern, as a regular-expression function's local
+				// state does
+				RE2 owned(c.pattern, PatternOptions(c.options, true, 0, true));
+				for (idx_t pass = 0; pass < 2; pass++) {
+					for (idx_t i = 0; i < inputs.size(); i++) {
+						const idx_t k = (i + t * 61) % inputs.size();
+						if (Results(owned, c, inputs[k]) != expected[k]) {
+							mismatches++;
+						}
+					}
+				}
+			});
+		}
+		for (auto &thread : threads) {
+			thread.join();
+		}
+		INFO("pattern " << c.pattern);
+		REQUIRE(mismatches.load() == 0);
+	}
+}
+
+TEST_CASE("Regular-expression functions on several threads agree with RE2 without its tagged DFA", "[regexp]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	auto inputs = Inputs();
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE inputs (id INTEGER, s VARCHAR)"));
+	{
+		Appender appender(con, "inputs");
+		for (idx_t i = 0; i < inputs.size(); i++) {
+			appender.AppendRow(Value::INTEGER(NumericCast<int32_t>(i)), Value(inputs[i]));
+		}
+	}
+	// many row groups, so that several threads run the functions, each with the patterns of its own local state
+	const idx_t copies = 250;
+	REQUIRE_NO_FAIL(
+	    con.Query("CREATE TABLE copies AS SELECT id, s FROM inputs, range(" + std::to_string(copies) + ")"));
+	REQUIRE_NO_FAIL(con.Query("SET threads=8"));
+	for (idx_t p : {idx_t(0), idx_t(5)}) {
+		auto &c = Patterns()[p];
+		RE2 reference(c.pattern, PatternOptions(c.options, false));
+		REQUIRE(reference.ok());
+		REQUIRE(reference.NumberOfCapturingGroups() >= 1);
+		REQUIRE_NO_FAIL(
+		    con.Query("CREATE OR REPLACE TABLE expected (id INTEGER, replaced VARCHAR, extracted VARCHAR)"));
+		{
+			Appender appender(con, "expected");
+			for (idx_t i = 0; i < inputs.size(); i++) {
+				string replaced = inputs[i];
+				RE2::Replace(&replaced, reference, c.rewrite);
+				string extracted;
+				RE2::Extract(inputs[i], reference, "\\1", &extracted);
+				appender.AppendRow(Value::INTEGER(NumericCast<int32_t>(i)), Value(replaced), Value(extracted));
+			}
+		}
+		const string pattern = Value(c.pattern).ToSQLString();
+		auto result = con.Query("SELECT count(*), count(*) FILTER (WHERE regexp_replace(s, " + pattern + ", " +
+		                        Value(c.rewrite).ToSQLString() + ") <> replaced OR regexp_extract(s, " + pattern +
+		                        ", 1) <> extracted) FROM copies JOIN expected USING (id)");
+		REQUIRE_NO_FAIL(*result);
+		INFO("pattern " << c.pattern);
+		REQUIRE(result->GetValue(0, 0).GetValue<int64_t>() == int64_t(inputs.size() * copies));
+		REQUIRE(result->GetValue(1, 0).GetValue<int64_t>() == 0);
 	}
 }

@@ -1,0 +1,175 @@
+# name: test/sql/storage/column_partial_blocks_apart.test_slow
+# description: A bulk append into a block-compressed file writes every column's partially filled blocks apart
+# group: [storage]
+
+require skip_reload
+
+statement ok
+SET threads=4
+
+statement ok
+ATTACH '__TEST_DIR__/column_partial_blocks_apart.db' AS db (STORAGE_VERSION 'latest')
+
+# a file with the fixed block layout keeps sharing its partially filled blocks across columns
+statement ok
+ATTACH '__TEST_DIR__/column_partial_blocks_fixed.db' AS f
+
+statement ok
+CREATE TABLE db.t (id BIGINT, flag TINYINT, small INTEGER, mid INTEGER, wide BIGINT, s VARCHAR)
+
+statement ok
+CREATE TABLE db.u (id BIGINT, flag TINYINT, small INTEGER, mid INTEGER, wide BIGINT, s VARCHAR)
+
+statement ok
+CREATE TABLE f.o (id BIGINT, flag TINYINT, small INTEGER, mid INTEGER, wide BIGINT, s VARCHAR)
+
+statement ok
+CREATE TABLE db.m (id BIGINT, flag TINYINT, small INTEGER, mid INTEGER, wide BIGINT, s VARCHAR)
+
+statement ok
+CREATE TABLE db.n (id BIGINT, flag TINYINT, small INTEGER, mid INTEGER, wide BIGINT, s VARCHAR)
+
+# the blocks are written apart from a memory limit of 48 GiB on: the inserts below run under 64 GiB (a limit, not memory in
+# use), the shared-block cases under 2 GiB and 32 GiB
+statement ok
+SET memory_limit='64GiB'
+
+# an in-memory source, so that the inserts below scan it in parallel (a range() source appends through the
+# transaction-local collection instead); some NULLs, so that validity segments are written too
+statement ok
+CREATE TABLE src AS SELECT i AS id, (CASE WHEN i % 997 = 0 THEN 1 ELSE 0 END)::TINYINT AS flag,
+    (CASE WHEN i % 101 = 0 THEN NULL ELSE i % 7 END)::INTEGER AS small, (hash(i) % 100000)::INTEGER AS mid,
+    (hash(i) >> 1)::BIGINT AS wide, 'v' || (i % 5000)::VARCHAR AS s FROM range(3000000) r(i)
+
+# the ordered parallel insert (batch insert)
+statement ok
+INSERT INTO db.t SELECT * FROM src
+
+# the unordered parallel insert
+statement ok
+SET preserve_insertion_order=false
+
+statement ok
+INSERT INTO db.u SELECT * FROM src
+
+statement ok
+SET preserve_insertion_order=true
+
+statement ok
+INSERT INTO f.o SELECT * FROM src
+
+# under a memory limit of less than 4 GiB the block-compressed file keeps sharing its partially filled blocks
+statement ok
+SET memory_limit='2GiB'
+
+statement ok
+INSERT INTO db.m SELECT * FROM src
+
+statement ok
+SET memory_limit='32GiB'
+
+statement ok
+INSERT INTO db.n SELECT * FROM src
+
+statement ok
+RESET memory_limit
+
+# a small transaction-local append keeps working beside the bulk-appended blocks
+statement ok
+INSERT INTO db.t VALUES (3000000, 1, 1, 1, 1, 'x')
+
+loop i 0 2
+
+query IIIII
+SELECT count(*), sum(flag), sum(small), count(small), sum(id) FROM db.t
+----
+3000001	3011	8910889	2970298	4500001500000
+
+query IIIII
+SELECT count(*), sum(flag), sum(small), count(small), sum(id) FROM db.u
+----
+3000000	3010	8910888	2970297	4499998500000
+
+query I
+SELECT count(*) FROM db.t t JOIN src USING (id) WHERE t.wide <> src.wide OR t.flag <> src.flag
+    OR t.small IS DISTINCT FROM src.small OR t.mid <> src.mid OR t.s <> src.s
+----
+0
+
+query I
+SELECT count(*) FROM db.u u JOIN src USING (id) WHERE u.wide <> src.wide OR u.flag <> src.flag
+    OR u.small IS DISTINCT FROM src.small OR u.mid <> src.mid OR u.s <> src.s
+----
+0
+
+query I
+SELECT count(*) FROM f.o o JOIN src USING (id) WHERE o.wide <> src.wide OR o.flag <> src.flag
+    OR o.small IS DISTINCT FROM src.small OR o.mid <> src.mid OR o.s <> src.s
+----
+0
+
+# the fixed-layout file: blocks hold segments of two or more columns
+query I
+SELECT count(*) > 0 FROM (SELECT block_id FROM pragma_storage_info('f.o') WHERE block_id >= 0 GROUP BY block_id
+    HAVING count(DISTINCT column_name) > 1)
+----
+true
+
+query I
+SELECT count(*) FROM db.m m JOIN src USING (id) WHERE m.wide <> src.wide OR m.flag <> src.flag
+    OR m.small IS DISTINCT FROM src.small OR m.mid <> src.mid OR m.s <> src.s
+----
+0
+
+# the block-compressed file's table appended under the small memory limit: blocks hold segments of two or more columns
+query I
+SELECT count(*) > 0 FROM (SELECT block_id FROM pragma_storage_info('db.m') WHERE block_id >= 0 GROUP BY block_id
+    HAVING count(DISTINCT column_name) > 1)
+----
+true
+
+query I
+SELECT count(*) FROM db.n n JOIN src USING (id) WHERE n.wide <> src.wide OR n.flag <> src.flag
+    OR n.small IS DISTINCT FROM src.small OR n.mid <> src.mid OR n.s <> src.s
+----
+0
+
+# ... and under a 32 GiB memory limit
+query I
+SELECT count(*) > 0 FROM (SELECT block_id FROM pragma_storage_info('db.n') WHERE block_id >= 0 GROUP BY block_id
+    HAVING count(DISTINCT column_name) > 1)
+----
+true
+
+# the block-compressed file: no block holds segments of two columns
+query I
+SELECT count(*) FROM (SELECT block_id FROM pragma_storage_info('db.t') WHERE block_id >= 0 GROUP BY block_id
+    HAVING count(DISTINCT column_name) > 1)
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT block_id FROM pragma_storage_info('db.u') WHERE block_id >= 0 GROUP BY block_id
+    HAVING count(DISTINCT column_name) > 1)
+----
+0
+
+# a column's segments of one collection still share a block
+query I
+SELECT count(DISTINCT block_id) < count(*) FROM pragma_storage_info('db.u') WHERE block_id >= 0 AND column_name = 'small'
+----
+true
+
+statement ok
+DETACH db
+
+statement ok
+DETACH f
+
+statement ok
+ATTACH '__TEST_DIR__/column_partial_blocks_apart.db' AS db
+
+statement ok
+ATTACH '__TEST_DIR__/column_partial_blocks_fixed.db' AS f
+
+endloop

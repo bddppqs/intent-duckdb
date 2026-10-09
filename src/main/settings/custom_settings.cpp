@@ -1737,6 +1737,18 @@ void ZstdBlockCompressionLevelSetting::OnSet(SettingCallbackInfo &info, Value &i
 	}
 }
 
+//===----------------------------------------------------------------------===//
+// Zstd Bulk Write Compression Level
+//===----------------------------------------------------------------------===//
+void ZstdBulkWriteCompressionLevelSetting::OnSet(SettingCallbackInfo &info, Value &input) {
+	auto level = input.GetValue<uint64_t>();
+	if (level > NumericCast<uint64_t>(duckdb_zstd::ZSTD_maxCLevel())) {
+		throw InvalidInputException(
+		    "zstd_bulk_write_compression_level must be 0 (zstd_block_compression_level applies) or between 1 and %d",
+		    duckdb_zstd::ZSTD_maxCLevel());
+	}
+}
+
 void CurrentTransactionInvalidationPolicySetting::OnSet(SettingCallbackInfo &info, Value &input) {
 	if (!info.context) {
 		throw InvalidInputException(

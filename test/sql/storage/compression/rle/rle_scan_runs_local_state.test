@@ -1,0 +1,84 @@
+# name: test/sql/storage/compression/rle/rle_scan_runs_local_state.test
+# description: The RLE run scan with its position and run count in locals (kRleScanRunsLocalState): run-aware
+#              ungrouped and grouped aggregates over RLE columns of every integer width, with runs of 1 to 4 rows (the
+#              run buffer fills and flushes inside a scan call), runs that straddle vectors and row groups, and long
+#              runs, equal the same aggregates over an uncompressed copy, at 1 and 8 threads
+# group: [rle]
+
+load __TEST_DIR__/rle_scan_runs_local_state.db
+
+
+# 150,000 keys r, each repeated 1 to 4 times (r % 4 + 1 rows), so consecutive keys form runs of 1 to 4 rows; keys
+# 50,000-52,999 form one long run (about 7,500 rows) and keys from 140,000 on form runs of about 7,500 rows each
+statement ok
+CREATE TABLE src AS SELECT r, s, CASE WHEN r BETWEEN 50000 AND 52999 THEN 77 WHEN r >= 140000 THEN (r // 3000) % 121 ELSE (r * 7919) % 121 END AS x FROM range(150000) t(r), range(4) u(s) WHERE s <= r % 4 ORDER BY r, s
+
+foreach type TINYINT SMALLINT INTEGER BIGINT UTINYINT USMALLINT UINTEGER UBIGINT
+
+statement ok
+CREATE TABLE rle_${type}(v ${type} USING COMPRESSION 'rle')
+
+statement ok
+CREATE TABLE ref_${type}(v ${type} USING COMPRESSION 'uncompressed')
+
+statement ok
+INSERT INTO rle_${type} SELECT x::${type} FROM src ORDER BY r, s
+
+statement ok
+INSERT INTO ref_${type} SELECT x::${type} FROM src ORDER BY r, s
+
+endloop
+
+statement ok
+CHECKPOINT
+
+# the scans below read the checkpointed segments
+restart
+
+statement ok
+PRAGMA enable_verification
+
+# the RLE tables hold RLE segments
+query I
+SELECT bool_or(compression = 'RLE') FROM pragma_storage_info('rle_SMALLINT') WHERE segment_type = 'SMALLINT'
+----
+true
+
+query I
+SELECT bool_or(compression = 'RLE') FROM pragma_storage_info('rle_BIGINT') WHERE segment_type = 'BIGINT'
+----
+true
+
+loop t 0 2
+
+statement ok
+SET threads = CASE WHEN ${t} = 0 THEN 1 ELSE 8 END
+
+foreach type TINYINT SMALLINT INTEGER BIGINT UTINYINT USMALLINT UINTEGER UBIGINT
+
+query IIII nosort ungrouped_${type}_${t}
+SELECT SUM(v), COUNT(*), COUNT(v), AVG(v) FROM rle_${type}
+
+query IIII nosort ungrouped_${type}_${t}
+SELECT SUM(v), COUNT(*), COUNT(v), AVG(v) FROM ref_${type}
+
+query II nosort grouped_${type}_${t}
+SELECT v, COUNT(*) FROM rle_${type} GROUP BY v ORDER BY v
+
+query II nosort grouped_${type}_${t}
+SELECT v, COUNT(*) FROM ref_${type} GROUP BY v ORDER BY v
+
+endloop
+
+endloop
+
+# the totals themselves (the uncompressed copy is not the only witness)
+query III
+SELECT COUNT(*), SUM(x), SUM(x * (r % 7)) FROM src
+----
+375000	22322470	66973932
+
+query II
+SELECT SUM(v), COUNT(*) FROM rle_BIGINT
+----
+22322470	375000

@@ -1,0 +1,199 @@
+# name: test/sql/aggregate/aggregates/bounded_chunks_after_ungrouped_aggregate.test
+# description: The chunks after an ungrouped aggregate are sized to its one row, through projections; any other
+# operator, and every grouped aggregate, keeps full-size chunks (a chunk asked to hold more rows than it has room for
+# fails the D_ASSERT in DataChunk::SetCardinality, and is a heap overflow under ASan)
+# group: [aggregates]
+
+statement ok
+SET threads=4
+
+statement ok
+CREATE TABLE t AS SELECT i::INTEGER AS i, (i % 7)::INTEGER AS g, (i * 3 % 1000)::SMALLINT AS s,
+'v' || (i % 13)::VARCHAR AS str FROM range(10000) r(i);
+
+# a wide projection of sums
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT
+SUM(s), SUM(s + 1), SUM(s + 2), SUM(s + 3), SUM(s + 4), SUM(s + 5), SUM(s + 6), SUM(s + 7), SUM(s + 8), SUM(s + 9),
+SUM(s + 10), SUM(s + 11), SUM(s + 12), SUM(s + 13), SUM(s + 14), SUM(s + 15), SUM(s + 16), SUM(s + 17), SUM(s + 18), SUM(s + 19),
+SUM(s + 20), SUM(s + 21), SUM(s + 22), SUM(s + 23), SUM(s + 24), SUM(s + 25), SUM(s + 26), SUM(s + 27), SUM(s + 28), SUM(s + 29),
+SUM(s + 30), SUM(s + 31), SUM(s + 32), SUM(s + 33), SUM(s + 34), SUM(s + 35), SUM(s + 36), SUM(s + 37), SUM(s + 38), SUM(s + 39),
+COUNT(*), MIN(i), MAX(i)
+FROM t
+----
+4995000	5005000	5015000	5025000	5035000	5045000	5055000	5065000	5075000	5085000	5095000	5105000	5115000	5125000	5135000	5145000	5155000	5165000	5175000	5185000	5195000	5205000	5215000	5225000	5235000	5245000	5255000	5265000	5275000	5285000	5295000	5305000	5315000	5325000	5335000	5345000	5355000	5365000	5375000	5385000	10000	0	9999
+
+# expressions of every kind above the aggregate: arithmetic, a cast, a string, a CASE, a list and a struct
+query IIRTTTTT
+SELECT SUM(i) * 2, SUM(i) // 7, ROUND(AVG(i), 1), 'n=' || COUNT(*), CASE WHEN SUM(i) > 0 THEN 'pos' ELSE 'neg' END,
+[MIN(i), MAX(i)], {'c': COUNT(*), 'm': MAX(str)}, SUM(i) IS NULL FROM t
+----
+99990000	7142142	4999.5	n=10000	pos	[0, 9999]	{'c': 10000, 'm': v9}	false
+
+query TI
+SELECT MIN(str) || '-' || MAX(str), LENGTH(REPEAT(MAX(str), 1000)) FROM t
+----
+v0-v9	2000
+
+# a constant-folded projection
+query ITII
+SELECT 1 + 2, 'x', SUM(i), 42 FROM t
+----
+3	x	49995000	42
+
+query I
+SELECT 42 FROM (SELECT COUNT(*) FROM t)
+----
+42
+
+query II
+SELECT NULL, SUM(i) * 0 FROM t
+----
+NULL	0
+
+# a filter above the aggregate (and a projection after it), HAVING without GROUP BY
+query II
+SELECT * FROM (SELECT SUM(i) AS a, COUNT(*) AS c FROM t) WHERE a > 0
+----
+49995000	10000
+
+query II
+SELECT * FROM (SELECT SUM(i) AS a, COUNT(*) AS c FROM t) WHERE a < 0
+----
+
+query I
+SELECT x + 1 FROM (SELECT SUM(i) AS x FROM t) WHERE x > 0
+----
+49995001
+
+query I
+SELECT SUM(i) FROM t HAVING SUM(i) > 0
+----
+49995000
+
+query I
+SELECT SUM(i) FROM t HAVING COUNT(*) > 10000
+----
+
+# LIMIT and OFFSET
+query II
+SELECT SUM(i), SUM(i) + 1 FROM t LIMIT 1
+----
+49995000	49995001
+
+query II
+SELECT SUM(i), SUM(i) + 1 FROM t LIMIT 0
+----
+
+query II
+SELECT SUM(i), SUM(i) + 1 FROM t LIMIT 1 OFFSET 1
+----
+
+# UNION ALL of two aggregates, and UNION (a grouped aggregate above the bounded inputs)
+query III
+SELECT SUM(s), SUM(s + 1), COUNT(*) FROM t UNION ALL
+SELECT SUM(s + 2), SUM(s + 3), COUNT(*) FROM t WHERE g = 0 ORDER BY 1
+----
+716284	717713	1429
+4995000	5005000	10000
+
+query I
+SELECT COUNT(*) FROM t UNION SELECT COUNT(*) FROM t UNION SELECT MAX(i) FROM t ORDER BY 1
+----
+9999
+10000
+
+# operators that emit more rows than they read keep full-size chunks: UNNEST, a cross product, a lateral join
+query II
+SELECT COUNT(*), SUM(x) FROM (SELECT UNNEST(LIST(i)) AS x FROM t)
+----
+10000	49995000
+
+query I
+SELECT COUNT(*) FROM (SELECT UNNEST(range(COUNT(*))) FROM t)
+----
+10000
+
+query IIII
+SELECT COUNT(*), SUM(r), MIN(a), MAX(a) FROM (SELECT SUM(i) AS a FROM t) CROSS JOIN range(3000) x(r)
+----
+3000	4498500	49995000	49995000
+
+query II
+SELECT COUNT(*), MAX(x) FROM (SELECT COUNT(*) AS c FROM t) a, generate_series(1, a.c) gs(x)
+----
+10000	10000
+
+# a grouped aggregate keeps full-size chunks, also under a projection
+query IIII
+SELECT g, SUM(s), SUM(s + 1), COUNT(*) FROM t GROUP BY g ORDER BY g
+----
+0	713426	714855	1429
+1	713713	715142	1429
+2	714000	715429	1429
+3	714287	715716	1429
+4	713574	715002	1428
+5	712858	714286	1428
+6	713142	714570	1428
+
+query IIII
+SELECT COUNT(*), SUM(y), MIN(y), MAX(y) FROM (SELECT i * 2 + 1 AS y FROM t GROUP BY i)
+----
+10000	100000000	1	19999
+
+query I
+SELECT COUNT(*) FROM (SELECT i % 3000 AS k, COUNT(*) + 1 FROM t GROUP BY k)
+----
+3000
+
+# a scalar subquery, a CTE used twice, an empty input
+query I
+SELECT COUNT(*) FROM t WHERE i > (SELECT AVG(i) FROM t)
+----
+5000
+
+query I
+WITH a AS (SELECT SUM(i) AS x FROM t) SELECT a1.x + a2.x FROM a a1, a a2
+----
+99990000
+
+query IITI
+SELECT SUM(i), COUNT(*), MIN(str), SUM(i) + 1 FROM t WHERE i < 0
+----
+NULL	0	NULL	NULL
+
+# DISTINCT aggregates
+query III
+SELECT COUNT(DISTINCT g), SUM(DISTINCT g), COUNT(DISTINCT str) FROM t
+----
+7	21	13
+
+query III
+SELECT COUNT(DISTINCT i), COUNT(DISTINCT i) + 1, COUNT(DISTINCT i) * 2 FROM t
+----
+10000	10001	20000
+
+# one thread
+statement ok
+SET threads=1
+
+query IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+SELECT
+SUM(s), SUM(s + 1), SUM(s + 2), SUM(s + 3), SUM(s + 4), SUM(s + 5), SUM(s + 6), SUM(s + 7), SUM(s + 8), SUM(s + 9),
+SUM(s + 10), SUM(s + 11), SUM(s + 12), SUM(s + 13), SUM(s + 14), SUM(s + 15), SUM(s + 16), SUM(s + 17), SUM(s + 18), SUM(s + 19),
+SUM(s + 20), SUM(s + 21), SUM(s + 22), SUM(s + 23), SUM(s + 24), SUM(s + 25), SUM(s + 26), SUM(s + 27), SUM(s + 28), SUM(s + 29),
+SUM(s + 30), SUM(s + 31), SUM(s + 32), SUM(s + 33), SUM(s + 34), SUM(s + 35), SUM(s + 36), SUM(s + 37), SUM(s + 38), SUM(s + 39),
+COUNT(*), MIN(i), MAX(i)
+FROM t
+----
+4995000	5005000	5015000	5025000	5035000	5045000	5055000	5065000	5075000	5085000	5095000	5105000	5115000	5125000	5135000	5145000	5155000	5165000	5175000	5185000	5195000	5205000	5215000	5225000	5235000	5245000	5255000	5265000	5275000	5285000	5295000	5305000	5315000	5325000	5335000	5345000	5355000	5365000	5375000	5385000	10000	0	9999
+
+query II
+SELECT COUNT(*), SUM(x) FROM (SELECT UNNEST(LIST(i)) AS x FROM t)
+----
+10000	49995000
+
+query IIII
+SELECT COUNT(*), SUM(y), MIN(y), MAX(y) FROM (SELECT i * 2 + 1 AS y FROM t GROUP BY i)
+----
+10000	100000000	1	19999

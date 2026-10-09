@@ -460,9 +460,67 @@ void RLEScan(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, V
 //===--------------------------------------------------------------------===//
 // Scan runs
 //===--------------------------------------------------------------------===//
+// The run loop with the scan position and the sink's run count in locals: RunSink::values is a data_ptr_t, which may
+// alias every field the loop reads, so the per-run Push otherwise stores and reloads the state through memory each run.
+// The state is written back once at the end and before every flush (the sink sees exactly the per-run loop's buffer).
+template <class T>
+static void RLEScanRunsLocalState(RLEScanState<T> &scan_state, idx_t scan_count, RunSink &sink) {
+	const rle_count_t *const index_pointer = scan_state.index_pointer;
+	const T *const data_pointer = scan_state.data_pointer;
+	const idx_t max_entry_pos = scan_state.max_entry_pos;
+	idx_t entry_pos = scan_state.entry_pos;
+	idx_t position_in_entry = scan_state.position_in_entry;
+	idx_t remaining = scan_count;
+	while (remaining > 0) {
+		T *const values = reinterpret_cast<T *>(sink.values);
+		uint16_t *const counts = sink.counts;
+		const idx_t capacity = sink.capacity;
+		idx_t run_count = sink.run_count;
+		while (remaining > 0 && run_count < capacity) {
+			const idx_t run_length = index_pointer[entry_pos] - position_in_entry;
+			const T element = data_pointer[entry_pos];
+			if (DUCKDB_UNLIKELY(run_length > remaining)) {
+				D_ASSERT(remaining <= 65535);
+				values[run_count] = element;
+				counts[run_count] = static_cast<uint16_t>(remaining);
+				run_count++;
+				position_in_entry += remaining;
+				remaining = 0;
+				break;
+			}
+			D_ASSERT(run_length > 0 && run_length <= 65535);
+			values[run_count] = element;
+			counts[run_count] = static_cast<uint16_t>(run_length);
+			run_count++;
+			remaining -= run_length;
+			// ForwardToNextRun
+			entry_pos++;
+			if (entry_pos > max_entry_pos) {
+				scan_state.entry_pos = entry_pos;
+				scan_state.position_in_entry = position_in_entry;
+				sink.run_count = run_count;
+				throw IOException(
+				    "Corrupted RLE segment: index_pointer[entry_pos] would reach outside of the blocks memory");
+			}
+			position_in_entry = 0;
+		}
+		sink.run_count = run_count;
+		scan_state.entry_pos = entry_pos;
+		scan_state.position_in_entry = position_in_entry;
+		if (remaining > 0) {
+			// the buffer is full and a run follows: Push flushes before it stores
+			sink.Flush();
+		}
+	}
+}
+
 template <class T>
 void RLEScanRuns(ColumnSegment &segment, ColumnScanState &state, idx_t scan_count, RunSink &sink) {
 	auto &scan_state = state.scan_state->Cast<RLEScanState<T>>();
+	if (kRleScanRunsLocalState) {
+		RLEScanRunsLocalState<T>(scan_state, scan_count, sink);
+		return;
+	}
 	// the runs of the next scan_count rows, the first and last clipped; the state advances as RLEScanPartialInternal
 	idx_t remaining = scan_count;
 	while (remaining > 0) {

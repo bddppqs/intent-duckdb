@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/hyperloglog.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/execution/operator/aggregate/distinct_aggregate_data.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
@@ -88,9 +89,32 @@ static bool FusedDistinctTreeMergeEnabled() {
 	return kFusedDistinctTreeMerge;
 }
 
+//! A grouped DISTINCT shape with the stored hash and no sum word in its (g, x) entry counts each distinct (g, x) into
+//! the task's group table at its insert (FusedBuildTableGroups), and no sweep of the (g, x) table follows
+static bool FusedDistinctInsertTimeGroupsEnabled() {
+	return kFusedDistinctInsertTimeGroups;
+}
+
+//! The group tables' adds read the slot bits cached with the capacity (FusedGroupTable::bits)
+static bool FusedGroupTableCachedBitsEnabled() {
+	return kFusedGroupTableCachedBits;
+}
+
+//! A grouped DISTINCT shape merges its task tables over slot ranges of one output table, every task merging the ranges
+//! it claims (FusedSlotRangeMerge); otherwise as above
+static bool FusedSlotRangeMergeEnabled() {
+	return kFusedSlotRangeFinalMerge;
+}
+
 //! Each row's hash is computed once and stored in the row for the partition build
 static bool FusedStoredHashEnabled() {
 	return kFusedStoredHash;
+}
+
+//! The folds copy a kept 16-byte row at that compile-time width (FusedFoldRowsFixed, FusedFoldCountRowsFixed);
+//! otherwise every row width is copied at the width read at run time
+static bool FusedFixedWidthRowCopyEnabled() {
+	return kFusedFixedWidthRowCopy;
 }
 
 //! The partition build chains on the stored hash bits instead of open addressing
@@ -839,6 +863,10 @@ static void FusedArmMembers(FusedIntegerAggregate &fused) {
 		fused.hash_stored = true;
 		fused.chain = !fused.distinct && FusedStoredHashChainEnabled();
 	}
+	// the insert-time groups: a grouped DISTINCT shape whose (g, x) build reads the stored bits and whose (g, x) entry
+	// carries no sum word (a mixed shape's sums are the companion's)
+	fused.insert_groups = fused.distinct && !fused.distinct_set && fused.group_bytes > 0 && fused.hash_stored &&
+	                      fused.sum_columns.empty() && FusedDistinctInsertTimeGroupsEnabled();
 }
 
 void FusedIntegerAggregate::TryAttach(ClientContext &context, PhysicalHashAggregate &op,
@@ -1658,7 +1686,10 @@ static void FusedGatherRows(const FusedIntegerAggregate &fused, FusedAggregateLo
 //! of equal keys appends once; the first row always stays and no state crosses chunks. Compacts the row buffer in place
 //! and returns the rows kept. A folding row is its key words: no non-distinct input is in the compact row (a mixed
 //! shape's inputs are the companion's, read from the chunk).
-static idx_t FusedFoldRows(data_ptr_t rows, idx_t count, idx_t row_width, const FusedKeyShape &shape) {
+//! ROW_WIDTH is the row width at compile time (FusedFoldRowsFixed), or 0 for the width read at run time
+template <idx_t ROW_WIDTH>
+static idx_t FusedFoldRowsAt(data_ptr_t rows, idx_t count, idx_t row_width_p, const FusedKeyShape &shape) {
+	const idx_t row_width = ROW_WIDTH ? ROW_WIDTH : row_width_p;
 	if (count == 0) {
 		return 0;
 	}
@@ -1684,9 +1715,11 @@ static idx_t FusedFoldRows(data_ptr_t rows, idx_t count, idx_t row_width, const 
 
 //! The last-key fold's chunk pass (the DISTINCT class's fold, carrying a count): every row's count is set to 1, and a row whose key words equal the
 //! previous kept row's adds its count to that row and is skipped. Compacts the row buffer in place; returns the rows kept
-//! (a count stays at most STANDARD_VECTOR_SIZE here)
-static idx_t FusedFoldCountRows(data_ptr_t rows, idx_t count, idx_t row_width, idx_t count_offset,
-                                const FusedKeyShape &shape) {
+//! (a count stays at most STANDARD_VECTOR_SIZE here). ROW_WIDTH as FusedFoldRowsAt's
+template <idx_t ROW_WIDTH>
+static idx_t FusedFoldCountRowsAt(data_ptr_t rows, idx_t count, idx_t row_width_p, idx_t count_offset,
+                                  const FusedKeyShape &shape) {
+	const idx_t row_width = ROW_WIDTH ? ROW_WIDTH : row_width_p;
 	if (count == 0) {
 		return 0;
 	}
@@ -1713,6 +1746,37 @@ static idx_t FusedFoldCountRows(data_ptr_t rows, idx_t count, idx_t row_width, i
 		previous1 = key1;
 	}
 	return kept;
+}
+
+//! The folds' fixed-width copy (FusedFixedWidthRowCopyEnabled): a 16-byte row (the DISTINCT class's g and x in 9 to 12
+//! bytes with the stored hash) is copied at that compile-time width; the fixed-width passes stay out of line
+static constexpr idx_t FUSED_FIXED_ROW_WIDTH = 16;
+
+static FUSED_NOINLINE idx_t FusedFoldRowsFixed(data_ptr_t rows, idx_t count, const FusedKeyShape &shape) {
+	return FusedFoldRowsAt<FUSED_FIXED_ROW_WIDTH>(rows, count, FUSED_FIXED_ROW_WIDTH, shape);
+}
+
+static FUSED_NOINLINE idx_t FusedFoldCountRowsFixed(data_ptr_t rows, idx_t count, idx_t count_offset,
+                                                    const FusedKeyShape &shape) {
+	return FusedFoldCountRowsAt<FUSED_FIXED_ROW_WIDTH>(rows, count, FUSED_FIXED_ROW_WIDTH, count_offset, shape);
+}
+
+//! The DISTINCT class's fold at the shape's row width, chosen once per chunk: the fixed-width pass for a 16-byte row,
+//! the width read at run time for any other
+static idx_t FusedFoldRows(data_ptr_t rows, idx_t count, idx_t row_width, const FusedKeyShape &shape) {
+	if (FusedFixedWidthRowCopyEnabled() && row_width == FUSED_FIXED_ROW_WIDTH) {
+		return FusedFoldRowsFixed(rows, count, shape);
+	}
+	return FusedFoldRowsAt<0>(rows, count, row_width, shape);
+}
+
+//! The last-key fold's chunk pass at the shape's row width, chosen as FusedFoldRows chooses
+static idx_t FusedFoldCountRows(data_ptr_t rows, idx_t count, idx_t row_width, idx_t count_offset,
+                                const FusedKeyShape &shape) {
+	if (FusedFixedWidthRowCopyEnabled() && row_width == FUSED_FIXED_ROW_WIDTH) {
+		return FusedFoldCountRowsFixed(rows, count, count_offset, shape);
+	}
+	return FusedFoldCountRowsAt<0>(rows, count, row_width, count_offset, shape);
 }
 
 //===--------------------------------------------------------------------===//
@@ -2915,6 +2979,15 @@ bool FusedIntegerAggregate::Finalize(FusedAggregateGlobalState &gstate) const {
 //===--------------------------------------------------------------------===//
 // Phase 2: one table per partition, sized once, scanned once
 //===--------------------------------------------------------------------===//
+//! One slot range's merge (FusedMergeSlotRange): the groups it placed, the whole group-table entries and companion
+//! entries that would pass its end (the tail places them), and on a mixed shape its groups without a companion
+struct FusedSlotRangeResult {
+	idx_t occupancy = 0;
+	vector<uint64_t> overflow;
+	vector<uint64_t> companion_overflow;
+	idx_t missing = 0;
+};
+
 class FusedAggregateGlobalSourceState : public GlobalSourceState {
 public:
 	FusedAggregateGlobalSourceState(ClientContext &context, FusedAggregateGlobalState &sink_p)
@@ -2958,6 +3031,23 @@ public:
 	bool parked;
 	unique_ptr<FusedGroupTable> parked_groups;
 	unique_ptr<FusedGroupTable> parked_companion;
+	//! the slot-range merge (FusedSlotRangeMerge): a task hands its group table and its sketch in under range_tasks's
+	//! lock and merge_lock and blocks, unless it brings range_arrived up to tasks_started; that task decides
+	//! (range_decided) - range_count ranges of range_output, or the last task alone (range_alone) - and wakes the
+	//! blocked tasks; the tasks claim ranges by next_range, and the one that brings ranges_done up to range_count runs
+	//! the tail
+	StateWithBlockableTasks range_tasks;
+	idx_t range_arrived = 0;
+	bool range_decided = false;
+	bool range_alone = false;
+	HyperLogLog range_sketch;
+	vector<unique_ptr<FusedGroupTable>> range_tables;
+	vector<optional_ptr<FusedGroupTable>> range_companions;
+	unique_ptr<FusedGroupTable> range_output;
+	idx_t range_count = 0;
+	atomic<idx_t> next_range {0};
+	atomic<idx_t> ranges_done {0};
+	vector<FusedSlotRangeResult> range_results;
 
 	//! The set member's release (FusedReleaseSetLists): the non-empty partitions whose set build returned, a build that
 	//! threw, the next handed-over list a task frees, and the lists freed
@@ -2981,7 +3071,8 @@ public:
 	}
 
 	BufferManager &buffer_manager;
-	//! The task's table buffer (buffer-manager memory), reused across its partitions: all-zero between partitions
+	//! The task's table buffer (buffer-manager memory), reused across its partitions: all-zero between partitions, except
+	//! after insert-time builds (build_stamp != 0), whose count words hold their stamps
 	BufferHandle handle;
 	uint64_t *table;
 	idx_t buffer_entries;
@@ -3002,6 +3093,10 @@ public:
 	optional_ptr<FusedGroupTable> emit_table;
 	idx_t distinct_entries;
 	bool emit_done;
+	//! the stamp of the task's last insert-time (g, x) build (FusedBuildTableGroups), 0 before any
+	uint64_t build_stamp = 0;
+	//! whether the task has handed its group table in to the slot-range merge
+	bool range_handed = false;
 
 	//! the chained build: the task's directory (4-byte group ordinals, 0 = empty) and its append-only group array
 	//! ({group row, tag << 32 | next, count, sums}), buffer-manager memory reused across its partitions; the current
@@ -3536,11 +3631,17 @@ static void FusedAllocateGroupTable(BufferManager &buffer_manager, FusedGroupTab
 	table.entries = reinterpret_cast<uint64_t *>(table.handle.Ptr());
 	memset(table.entries, 0, bytes);
 	table.capacity = capacity;
+	table.bits = FusedTableBits(capacity);
 	table.occupancy = 0;
 }
 
 static inline idx_t FusedGroupSlotOf(hash_t hash, idx_t capacity) {
 	return hash >> (64 - FusedTableBits(capacity));
+}
+
+//! A group table's slot of a hash: the table's cached bits under kFusedGroupTableCachedBits, else FusedGroupSlotOf
+static inline idx_t FusedGroupTableSlotOf(hash_t hash, const FusedGroupTable &table) {
+	return FusedGroupTableCachedBitsEnabled() ? hash >> (64 - table.bits) : FusedGroupSlotOf(hash, table.capacity);
 }
 
 //! Finds or inserts group (g0, g1) and adds the deltas to its entry (distinct first, so an inserted entry is occupied
@@ -3557,7 +3658,7 @@ static void FusedGroupAdd(const FusedIntegerAggregate &fused, BufferManager &buf
 		table.occupancy = 1;
 	} else {
 		const auto mask = table.capacity - 1;
-		auto slot = FusedGroupSlotOf(FusedHashKey(g0, g1, key_words == 2), table.capacity);
+		auto slot = FusedGroupTableSlotOf(FusedHashKey(g0, g1, key_words == 2), table);
 		while (true) {
 			entry = table.entries + slot * words;
 			if (entry[key_words] == 0) {
@@ -3591,8 +3692,8 @@ static void FusedGroupAdd(const FusedIntegerAggregate &fused, BufferManager &buf
 		if (old_entry[key_words] == 0) {
 			continue;
 		}
-		auto target = FusedGroupSlotOf(FusedHashKey(old_entry[0], key_words == 2 ? old_entry[1] : 0, key_words == 2),
-		                               grown.capacity);
+		auto target =
+		    FusedGroupTableSlotOf(FusedHashKey(old_entry[0], key_words == 2 ? old_entry[1] : 0, key_words == 2), grown);
 		while (grown.entries[target * words + key_words] != 0) {
 			target = (target + 1) & mask;
 		}
@@ -3602,7 +3703,122 @@ static void FusedGroupAdd(const FusedIntegerAggregate &fused, BufferManager &buf
 	table.handle = std::move(grown.handle);
 	table.entries = grown.entries;
 	table.capacity = grown.capacity;
+	table.bits = grown.bits;
 	table.occupancy = grown.occupancy;
+}
+
+//! FusedGroupAdd(fused, buffer_manager, table, g0, g1, 1, 0, zeros) on a grouped table, inlined: finds or inserts g and
+//! adds 1 to its distinct; an insert that would pass half load takes FusedGroupAdd itself, which inserts and grows. The
+//! count and sum words stay as they are (the adds of 0)
+static inline void FusedGroupAddDistinct(const FusedIntegerAggregate &fused, BufferManager &buffer_manager,
+                                         FusedGroupTable &table, idx_t key_words, idx_t words, uint64_t g0, uint64_t g1,
+                                         const uint64_t *zeros) {
+	const auto mask = table.capacity - 1;
+	auto slot = FusedGroupTableSlotOf(FusedHashKey(g0, g1, key_words == 2), table);
+	while (true) {
+		auto entry = table.entries + slot * words;
+		if (entry[key_words] == 0) {
+			if ((table.occupancy + 1) * 2 > table.capacity) {
+				FusedGroupAdd(fused, buffer_manager, table, g0, g1, 1, 0, zeros);
+				return;
+			}
+			entry[0] = g0;
+			if (key_words == 2) {
+				entry[1] = g1;
+			}
+			table.occupancy++;
+			entry[key_words] = 1;
+			return;
+		}
+		if (entry[0] == g0 && (key_words == 1 || entry[1] == g1)) {
+			entry[key_words]++;
+			return;
+		}
+		slot = (slot + 1) & mask;
+	}
+}
+
+//! The insert-time groups' (g, x) build of partition p (insert_groups): FusedBuildTableStored's build, where an entry
+//! is occupied iff its count word holds this build's stamp (the buffer is never cleared between partitions) and each
+//! new (g, x) adds distinct 1 to g's entry of the task's group table, so no FusedFoldPartition follows; a repeated
+//! (g, x) adds nothing. A partition whose table would pass TABLE_MAXIMUM_CAPACITY (and so may need FusedGrowTable) is
+//! refused: false, nothing built, and it takes the counting build and FusedFoldPartition
+static FUSED_NOINLINE bool FusedBuildTableGroups(const FusedIntegerAggregate &fused, FusedAggregateGlobalState &gstate,
+                                                 FusedAggregateLocalSourceState &lstate, idx_t p) {
+	const auto rows = gstate.partition_rows[p];
+	if (2 * rows > FusedIntegerAggregate::TABLE_MAXIMUM_CAPACITY) {
+		return false;
+	}
+	const auto words = FusedEntryWords(fused);
+	const auto count_word = FusedKeyWords(fused);
+	// at least twice the rows, so the occupancy (at most the rows) never passes half load
+	const idx_t capacity = NextPowerOfTwo(MaxValue<idx_t>(FusedIntegerAggregate::TABLE_MINIMUM_CAPACITY, 2 * rows));
+	if (capacity > lstate.buffer_entries) {
+		lstate.handle.Destroy();
+		lstate.table = nullptr;
+		FusedAllocateTable(lstate, capacity, words);
+	}
+	lstate.capacity = capacity;
+	lstate.table_bits = FusedTableBits(capacity);
+	lstate.occupancy = 0;
+	const uint64_t stamp = ++lstate.build_stamp;
+	const auto shape = FusedGetKeyShape(fused.key_bytes);
+	const auto group_shape = FusedGetKeyShape(fused.group_bytes);
+	const auto row_width = fused.row_width;
+	const auto hash_offset = fused.hash_offset;
+	auto &groups = *lstate.groups;
+	const auto group_key_words = FusedGroupKeyWords(fused);
+	const auto group_words = FusedGroupWords(fused);
+	const uint64_t zeros[FusedIntegerAggregate::MAXIMUM_AGGREGATES] = {};
+	const auto mask = capacity - 1;
+	uint64_t key0[FusedIntegerAggregate::TABLE_BATCH];
+	uint64_t key1[FusedIntegerAggregate::TABLE_BATCH];
+	hash_t hash[FusedIntegerAggregate::TABLE_BATCH];
+	idx_t probes = 0;
+	for (auto &lists : gstate.handed_over) {
+		for (auto chunk = lists->heads[p]; chunk; chunk = FusedChunkNext(chunk)) {
+			const auto chunk_rows = FusedChunkRows(chunk);
+			const auto base = chunk + FusedIntegerAggregate::CHUNK_HEADER_BYTES;
+			for (idx_t batch_start = 0; batch_start < chunk_rows; batch_start += FusedIntegerAggregate::TABLE_BATCH) {
+				const auto batch = MinValue<idx_t>(FusedIntegerAggregate::TABLE_BATCH, chunk_rows - batch_start);
+				const auto batch_rows = base + batch_start * row_width;
+				for (idx_t j = 0; j < batch; j++) {
+					const auto row = batch_rows + j * row_width;
+					FusedLoadKey(row, shape, key0[j], key1[j]);
+					hash[j] = hash_t(Load<uint32_t>(row + hash_offset)) << FUSED_STORED_HASH_SHIFT;
+					FUSED_PREFETCH_WRITE(lstate.table + FusedSlotOf(hash[j], lstate.table_bits) * words);
+				}
+				for (idx_t j = 0; j < batch; j++) {
+					auto slot = FusedSlotOf(hash[j], lstate.table_bits);
+					while (true) {
+						probes++;
+						auto entry = lstate.table + slot * words;
+						if (entry[count_word] != stamp) {
+							entry[0] = key0[j];
+							if (shape.two_words) {
+								entry[1] = key1[j];
+							}
+							entry[count_word] = stamp;
+							lstate.occupancy++;
+							// g's bytes lead the entry's key words, read back as FusedFoldPartition reads them
+							uint64_t g0, g1;
+							FusedLoadKey(reinterpret_cast<const_data_ptr_t>(entry), group_shape, g0, g1);
+							FusedGroupAddDistinct(fused, lstate.buffer_manager, groups, group_key_words, group_words, g0,
+							                      g1, zeros);
+							break;
+						}
+						if (entry[0] == key0[j] && (!shape.two_words || entry[1] == key1[j])) {
+							break;
+						}
+						slot = (slot + 1) & mask;
+					}
+				}
+			}
+		}
+	}
+	gstate.table_probes += probes;
+	lstate.distinct_entries += lstate.occupancy;
+	return true;
 }
 
 //! Folds the task's (g, x) table of one partition into its group table: each occupied entry is one distinct (g, x),
@@ -3849,6 +4065,341 @@ static bool FusedTreeMerge(const FusedIntegerAggregate &fused, FusedAggregateGlo
 	}
 }
 
+//! Calls op(entry, home) for every occupied entry of `table` whose home slot in an output of output_capacity slots lies
+//! in [begin, end). Slots are the hash's top bits, so in `table` (a power of two) those homes lie in the window
+//! [begin * capacity / output_capacity, ceil(end * capacity / output_capacity)), and an entry sits at or after its home
+//! with every slot between occupied: the scan covers the window and goes on past its end (wrapping at the table's end)
+//! up to an empty slot, each slot at most once; an entry whose home lies outside the range is skipped
+template <class OP>
+static void FusedForEachRangeEntry(const FusedIntegerAggregate &fused, const FusedGroupTable &table,
+                                   idx_t output_capacity, idx_t begin, idx_t end, OP &&op) {
+	const auto key_words = FusedGroupKeyWords(fused);
+	const auto words = FusedGroupWords(fused);
+	const auto mask = table.capacity - 1;
+	const auto first = begin * table.capacity / output_capacity;
+	const auto last = (end * table.capacity + output_capacity - 1) / output_capacity;
+	for (idx_t i = 0; i < table.capacity; i++) {
+		const auto entry = table.entries + ((first + i) & mask) * words;
+		if (entry[key_words] == 0) {
+			if (first + i >= last) {
+				break;
+			}
+			continue;
+		}
+		const auto home = FusedGroupSlotOf(FusedHashKey(entry[0], key_words == 2 ? entry[1] : 0, key_words == 2),
+		                                   output_capacity);
+		if (home >= begin && home < end) {
+			op(entry, home);
+		}
+	}
+}
+
+//! One range of the slot-range merge: zeroes the output's slots [begin, end) and adds every handed-in group table's
+//! entries of the range (FusedForEachRangeEntry), each placed by linear probing from its home slot inside the range
+//! alone - a new group into the first empty slot, a present one by adding its distinct, count and sums - and kept in
+//! the range's overflow when its probe would pass `end`, so no two ranges write one slot; then, on a mixed shape, every
+//! companion's entries of the range alike, find-only (one whose probe meets an empty slot or `end` is kept for the
+//! tail), and counts the range's groups left without a companion (count 0: a companion entry counts at least one row)
+static FUSED_NOINLINE void FusedMergeSlotRange(const FusedIntegerAggregate &fused,
+                                               FusedAggregateGlobalSourceState &source, idx_t range) {
+	const auto key_words = FusedGroupKeyWords(fused);
+	const auto words = FusedGroupWords(fused);
+	const auto sum_count = FusedSumStates(fused);
+	auto &output = *source.range_output;
+	auto &result = source.range_results[range];
+	const auto begin = range * output.capacity / source.range_count;
+	const auto end = (range + 1) * output.capacity / source.range_count;
+	memset(output.entries + begin * words, 0, (end - begin) * words * sizeof(uint64_t));
+	for (auto &table : source.range_tables) {
+		if (table->occupancy == 0) {
+			continue;
+		}
+		FusedForEachRangeEntry(fused, *table, output.capacity, begin, end, [&](const uint64_t *entry, idx_t home) {
+			for (auto slot = home; slot < end; slot++) {
+				auto target = output.entries + slot * words;
+				if (target[key_words] == 0) {
+					memcpy(target, entry, words * sizeof(uint64_t));
+					result.occupancy++;
+					return;
+				}
+				if (target[0] == entry[0] && (key_words == 1 || target[1] == entry[1])) {
+					for (idx_t w = key_words; w < words; w++) {
+						target[w] += entry[w];
+					}
+					return;
+				}
+			}
+			result.overflow.insert(result.overflow.end(), entry, entry + words);
+		});
+	}
+	if (!fused.mixed) {
+		return;
+	}
+	for (auto &companion : source.range_companions) {
+		FusedForEachRangeEntry(fused, *companion, output.capacity, begin, end, [&](const uint64_t *entry, idx_t home) {
+			for (auto slot = home; slot < end; slot++) {
+				auto target = output.entries + slot * words;
+				if (target[key_words] == 0) {
+					break;
+				}
+				if (target[0] == entry[0] && (key_words == 1 || target[1] == entry[1])) {
+					target[key_words + 1] += entry[key_words + 1];
+					for (idx_t s = 0; s < sum_count; s++) {
+						target[key_words + 2 + s] += entry[key_words + 2 + s];
+					}
+					return;
+				}
+			}
+			result.companion_overflow.insert(result.companion_overflow.end(), entry, entry + words);
+		});
+	}
+	for (auto slot = begin; slot < end; slot++) {
+		auto target = output.entries + slot * words;
+		result.missing += target[key_words] != 0 && target[key_words + 1] == 0;
+	}
+}
+
+//! The group entry of (g0, g1) in `table` (with an empty slot), or null
+static uint64_t *FusedFindGroup(const FusedIntegerAggregate &fused, FusedGroupTable &table, uint64_t g0, uint64_t g1) {
+	const auto key_words = FusedGroupKeyWords(fused);
+	const auto words = FusedGroupWords(fused);
+	const auto mask = table.capacity - 1;
+	auto slot = FusedGroupSlotOf(FusedHashKey(g0, g1, key_words == 2), table.capacity);
+	while (table.entries[slot * words + key_words] != 0) {
+		auto candidate = table.entries + slot * words;
+		if (candidate[0] == g0 && (key_words == 1 || candidate[1] == g1)) {
+			return candidate;
+		}
+		slot = (slot + 1) & mask;
+	}
+	return nullptr;
+}
+
+//! The slot-range merge's tail, on the task that completes the last range: an output the sketch under-sized (its groups
+//! and overflow entries past half load) is first re-inserted into one that holds them at half load; the ranges'
+//! overflow group-table entries are added (FusedGroupAdd), then their companion entries, find-only (a companion group
+//! without its (g, x) group is an InternalException); on a mixed shape a group left without a companion is
+//! FusedMergeCombinedCompanion's InternalException, and the companions are freed. Hands the output to merged_tables and
+//! returns the companion entries merged (companion_groups: every group, on a mixed shape)
+static FUSED_NOINLINE idx_t FusedSlotRangeTail(const FusedIntegerAggregate &fused, FusedAggregateGlobalState &gstate,
+                                               FusedAggregateGlobalSourceState &source,
+                                               FusedAggregateLocalSourceState &lstate) {
+	auto &buffer_manager = lstate.buffer_manager;
+	const auto key_words = FusedGroupKeyWords(fused);
+	const auto words = FusedGroupWords(fused);
+	const auto sum_count = FusedSumStates(fused);
+	auto output = std::move(source.range_output);
+	idx_t needed = 0;
+	for (auto &result : source.range_results) {
+		output->occupancy += result.occupancy;
+		needed += result.occupancy + result.overflow.size() / words;
+	}
+	if (needed * 2 > output->capacity) {
+		auto grown = make_uniq<FusedGroupTable>();
+		FusedAllocateGroupTable(buffer_manager, *grown, NextPowerOfTwo(2 * needed), words);
+		for (idx_t slot = 0; slot < output->capacity; slot++) {
+			auto entry = output->entries + slot * words;
+			if (entry[key_words] != 0) {
+				FusedGroupAdd(fused, buffer_manager, *grown, entry[0], key_words == 2 ? entry[1] : 0, entry[key_words],
+				              entry[key_words + 1], entry + key_words + 2);
+			}
+		}
+		output = std::move(grown);
+	}
+	for (auto &result : source.range_results) {
+		for (idx_t i = 0; i < result.overflow.size(); i += words) {
+			auto entry = result.overflow.data() + i;
+			FusedGroupAdd(fused, buffer_manager, *output, entry[0], key_words == 2 ? entry[1] : 0, entry[key_words],
+			              entry[key_words + 1], entry + key_words + 2);
+		}
+	}
+	idx_t companion_groups = 0;
+	if (fused.mixed) {
+		idx_t missing = 0;
+		for (auto &result : source.range_results) {
+			missing += result.missing;
+			for (idx_t i = 0; i < result.companion_overflow.size(); i += words) {
+				auto entry = result.companion_overflow.data() + i;
+				auto target = FusedFindGroup(fused, *output, entry[0], key_words == 2 ? entry[1] : 0);
+				if (!target) {
+					throw InternalException("Fused integer aggregate: a companion group without its (g, x) group");
+				}
+				target[key_words + 1] += entry[key_words + 1];
+				for (idx_t s = 0; s < sum_count; s++) {
+					target[key_words + 2 + s] += entry[key_words + 2 + s];
+				}
+			}
+		}
+		// the overflow groups, after their companions
+		for (auto &result : source.range_results) {
+			for (idx_t i = 0; i < result.overflow.size(); i += words) {
+				auto entry = result.overflow.data() + i;
+				missing += FusedFindGroup(fused, *output, entry[0], key_words == 2 ? entry[1] : 0)[key_words + 1] == 0;
+			}
+		}
+		if (missing != 0) {
+			idx_t merged = 0;
+			for (idx_t slot = 0; slot < output->capacity; slot++) {
+				auto entry = output->entries + slot * words;
+				merged += entry[key_words] != 0 && entry[key_words + 1] != 0;
+			}
+			throw InternalException("Fused integer aggregate: %llu companion groups merged into %llu groups", merged,
+			                        output->occupancy);
+		}
+		companion_groups = output->occupancy;
+		source.range_companions.clear();
+		for (auto &lists : gstate.handed_over) {
+			lists->companion.reset();
+		}
+	}
+	source.range_tables.clear();
+	source.range_results.clear();
+	lstate.merged_tables.push_back(std::move(output));
+	return companion_groups;
+}
+
+//! The slot-range merge's degenerate sets (no or one non-empty group table, or a table the range form does not prove):
+//! the deciding task merges alone as the merge without the tree does (FusedMergeGroupTables, FusedMergeCompanions)
+static FUSED_NOINLINE FusedGroupTable &FusedSlotRangeAlone(const FusedIntegerAggregate &fused,
+                                                           FusedAggregateGlobalState &gstate,
+                                                           FusedAggregateGlobalSourceState &source,
+                                                           FusedAggregateLocalSourceState &lstate,
+                                                           idx_t &companion_groups, idx_t &tables) {
+	lstate.merged_tables = std::move(source.range_tables);
+	source.range_tables.clear();
+	auto &merged = FusedMergeGroupTables(fused, lstate.buffer_manager, lstate.merged_tables);
+	companion_groups = fused.mixed ? FusedMergeCompanions(fused, lstate.buffer_manager, gstate, merged) : 0;
+	tables = lstate.merged_tables.size();
+	return merged;
+}
+
+//! The slot-range merge's decision, under both locks: with two or more non-empty group tables and every non-empty group
+//! table and companion a power of two at most half full, the output's capacity is the largest group table's, or the
+//! power of two holding the sketch's group count plus a quarter (a 64-register HyperLogLog's error is about 13 %) at
+//! half load if larger, allocated here and zeroed by its ranges, and range_count the tasks handed in (at most one range
+//! per slot); otherwise range_alone
+static void FusedDecideSlotRanges(const FusedIntegerAggregate &fused, FusedAggregateGlobalState &gstate,
+                                  FusedAggregateGlobalSourceState &source, BufferManager &buffer_manager) {
+	source.range_decided = true;
+	idx_t nonempty = 0;
+	idx_t capacity = 0;
+	bool proven = true;
+	auto admit = [&](const FusedGroupTable &table) {
+		proven = proven && IsPowerOfTwo(table.capacity) && table.occupancy * 2 <= table.capacity;
+	};
+	for (auto &table : source.range_tables) {
+		if (table->occupancy != 0) {
+			admit(*table);
+			nonempty++;
+			capacity = MaxValue<idx_t>(capacity, table->capacity);
+		}
+	}
+	if (fused.mixed && nonempty >= 2) {
+		for (auto &lists : gstate.handed_over) {
+			if (lists->companion && lists->companion->occupancy != 0) {
+				admit(*lists->companion);
+				source.range_companions.push_back(lists->companion.get());
+			}
+		}
+	}
+	if (nonempty < 2 || !proven) {
+		source.range_alone = true;
+		source.range_companions.clear();
+		return;
+	}
+	const auto estimate = source.range_sketch.Count();
+	capacity = MaxValue<idx_t>(capacity, NextPowerOfTwo(2 * (estimate + estimate / 4)));
+	source.range_output = make_uniq<FusedGroupTable>();
+	auto &output = *source.range_output;
+	output.handle =
+	    buffer_manager.Allocate(MemoryTag::HASH_TABLE, capacity * FusedGroupWords(fused) * sizeof(uint64_t), true);
+	output.entries = reinterpret_cast<uint64_t *>(output.handle.Ptr());
+	output.capacity = capacity;
+	output.bits = FusedTableBits(capacity);
+	output.occupancy = 0;
+	source.range_count = MinValue<idx_t>(source.range_arrived, capacity);
+	source.range_results.resize(source.range_count);
+}
+
+//! The grouped DISTINCT class's merge over slot ranges of one output table. After its builds a task sketches its group
+//! table's groups (HyperLogLog) and hands both in under range_tasks's lock and merge_lock; one that does not bring
+//! range_arrived up to tasks_started blocks (BLOCKED; range_tasks wakes it). The one that does decides once
+//! (FusedDecideSlotRanges) and wakes the blocked tasks: on range_alone it merges alone (FusedSlotRangeAlone) and every
+//! other task finishes; otherwise every task claims ranges by next_range and merges them (FusedMergeSlotRange), and
+//! the one that completes the last range runs the tail (FusedSlotRangeTail). A task that hands in after the decision
+//! found no partition (the decision follows every counted task's finding none), so its empty table is dropped. Returns
+//! true for the task that emits, its merged table, companion entries merged and tables merged set; false with `result`
+//! otherwise
+static bool FusedSlotRangeMerge(const FusedIntegerAggregate &fused, FusedAggregateGlobalState &gstate,
+                                FusedAggregateGlobalSourceState &source, FusedAggregateLocalSourceState &lstate,
+                                InterruptState &interrupt_state, SourceResultType &result,
+                                optional_ptr<FusedGroupTable> &merged_table, idx_t &companion_groups, idx_t &tables) {
+	const auto key_words = FusedGroupKeyWords(fused);
+	const auto words = FusedGroupWords(fused);
+	HyperLogLog sketch;
+	if (!lstate.range_handed) {
+		auto &groups = *lstate.groups;
+		for (idx_t slot = 0; slot < groups.capacity; slot++) {
+			auto entry = groups.entries + slot * words;
+			if (entry[key_words] != 0) {
+				sketch.InsertElement(FusedHashKey(entry[0], key_words == 2 ? entry[1] : 0, key_words == 2));
+			}
+		}
+	}
+	bool decider = false;
+	{
+		auto guard = source.range_tasks.Lock();
+		if (!lstate.range_handed) {
+			lstate.range_handed = true;
+			bool last = false;
+			{
+				lock_guard<mutex> merge_guard(source.merge_lock);
+				source.distinct_entries += lstate.distinct_entries;
+				lstate.distinct_entries = 0;
+				last = !source.range_decided && ++source.range_arrived == source.tasks_started;
+			}
+			if (source.range_decided) {
+				lstate.groups.reset();
+			} else {
+				source.range_sketch.Merge(sketch);
+				source.range_tables.push_back(std::move(lstate.groups));
+				if (last) {
+					FusedDecideSlotRanges(fused, gstate, source, lstate.buffer_manager);
+					source.range_tasks.UnblockTasks(guard);
+					decider = true;
+				}
+			}
+		}
+		if (!source.range_decided) {
+			result = source.range_tasks.BlockSource(guard, interrupt_state);
+			return false;
+		}
+		if (source.range_alone && !decider) {
+			result = SourceResultType::FINISHED;
+			return false;
+		}
+	}
+	if (source.range_alone) {
+		merged_table = &FusedSlotRangeAlone(fused, gstate, source, lstate, companion_groups, tables);
+		return true;
+	}
+	while (true) {
+		const idx_t range = source.next_range++;
+		if (range >= source.range_count) {
+			result = SourceResultType::FINISHED;
+			return false;
+		}
+		FusedMergeSlotRange(fused, source, range);
+		if (++source.ranges_done == source.range_count) {
+			break;
+		}
+	}
+	tables = source.range_tables.size();
+	companion_groups = FusedSlotRangeTail(fused, gstate, source, lstate);
+	merged_table = lstate.merged_tables.back().get();
+	return true;
+}
+
 //! A VARCHAR key written from the group entries' gids as the map's strings (copied into the output vector)
 static void FusedEmitGidKey(Vector &vector, uint64_t *const *entries, idx_t count, idx_t offset,
                             FusedAggregateGlobalState &gstate) {
@@ -3966,6 +4517,14 @@ static SourceResultType FusedDistinctGetData(const FusedIntegerAggregate &fused,
 				break;
 			}
 			source.claimed++;
+			if (fused.insert_groups && FusedBuildTableGroups(fused, gstate, lstate, p)) {
+				continue;
+			}
+			if (lstate.build_stamp != 0) {
+				// a refused partition after insert-time builds: the buffer is cleared for the counting build
+				memset(lstate.table, 0, lstate.buffer_entries * FusedEntryWords(fused) * sizeof(uint64_t));
+				lstate.build_stamp = 0;
+			}
 			if (fused.hash_stored) {
 				FusedBuildTableStored(fused, gstate, lstate, p);
 			} else {
@@ -3976,7 +4535,13 @@ static SourceResultType FusedDistinctGetData(const FusedIntegerAggregate &fused,
 		optional_ptr<FusedGroupTable> merged_table;
 		idx_t companion_groups = 0;
 		idx_t tables_merged = 0;
-		if (key_words > 0 && FusedDistinctTreeMergeEnabled()) {
+		if (key_words > 0 && FusedSlotRangeMergeEnabled()) {
+			SourceResultType result;
+			if (!FusedSlotRangeMerge(fused, gstate, source, lstate, input.interrupt_state, result, merged_table,
+			                         companion_groups, tables_merged)) {
+				return result;
+			}
+		} else if (key_words > 0 && FusedDistinctTreeMergeEnabled()) {
 			unique_ptr<FusedGroupTable> companion;
 			if (!FusedTreeMerge(fused, gstate, source, lstate, companion, tables_merged)) {
 				return SourceResultType::FINISHED;
@@ -4566,6 +5131,10 @@ string FusedIntegerAggregate::ParamsString(optional_ptr<FusedAggregateGlobalStat
 		// the source top-k: the rows each phase-2 task keeps, and the order
 		result += " topk=" + to_string(topk_n) + (topk_desc ? " topk_order=desc" : " topk_order=asc");
 	}
+	if (insert_groups) {
+		// phase 2 counts each distinct (g, x) into its group at the (g, x) insert
+		result += " groups=insert";
+	}
 	result += fused_atomic_reserve ? " reserve=ldadd" : " reserve=cas";
 	if (gstate) {
 		result += " input_rows=" + to_string(gstate->input_rows.load());
@@ -4631,6 +5200,8 @@ InsertionOrderPreservingMap<string> FusedIntegerAggregate::ExtraSourceParams(Glo
 	                                   (mixed ? " companion_groups=" + to_string(source.companion_groups) : string()) +
 	                                   " tasks_started=" + to_string(source.tasks_started) +
 	                                   " tasks_merged=" + to_string(source.tasks_merged) +
+	                                   (FusedSlotRangeMergeEnabled() ? " ranges=" + to_string(source.range_count)
+	                                                                 : string()) +
 	                                   (distinct_set && FusedSetSourceReleaseEnabled()
 	                                        ? " released=" + to_string(source.released.load()) + "/" +
 	                                              to_string(source.sink.handed_over.size())
